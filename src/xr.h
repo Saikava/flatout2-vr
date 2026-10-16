@@ -1,0 +1,67 @@
+#pragma once
+// OpenXR output. The game's Direct3D 9 runs on DXVK (d3d9.dll from DXVK in the game folder); the
+// OpenXR session uses DXVK's own Vulkan device and queue, and eye images rendered by the game into
+// D3D9 textures are copied into OpenXR swapchains on that queue (DXVK interop).
+#include <cstdint>
+
+struct IDirect3DDevice9;
+struct IDirect3DTexture9;
+
+namespace xr {
+
+// Eye pose relative to the recenter origin, in game axes (x right, y up, z forward, meters).
+struct EyePose
+{
+    float right[3], up[3], forward[3], position[3];
+};
+
+// Tangents of the eye's field of view: left and down are negative.
+struct EyeFov
+{
+    float left, right, up, down;
+};
+
+// Before the game creates Direct3D: OpenXR instance and headset. False when there is no headset;
+// the game then runs without VR.
+bool InitInstance();
+bool Available();  // InitInstance succeeded
+// The game's device was created: start the session (needs DXVK).
+void OnDevice(IDirect3DDevice9* dev);
+void PollEvents();
+bool Running();
+
+// Eye render size (recommended size times RenderScale).
+void EyeSize(unsigned* w, unsigned* h);
+
+// Per frame: WaitFrame waits for the headset's next frame and opens it (nothing to do when one is
+// open). The game loop calls it before the game advances, so the game follows the headset's
+// timing. BeginFrame opens a frame if none is open and locates the eyes; it returns true when eye
+// images should be rendered. An open frame must be finished with SubmitEyes, SubmitScreen or
+// EndFrameEmpty.
+bool WaitFrame();
+bool BeginFrame();
+bool FrameOpen();
+bool ShouldRender();  // the open frame will be shown (the session is visible)
+// The open frame: when it will be shown and the headset's frame period, in seconds.
+double DisplayTime();
+double DisplayPeriod();
+EyePose Pose(int eye);
+EyeFov Fov(int eye);
+// The eyes, and optionally the game's HUD (premultiplied alpha) on a panel in front of the recenter
+// origin.
+void SubmitEyes(IDirect3DTexture9* left, IDirect3DTexture9* right, IDirect3DTexture9* hud = nullptr, unsigned hudW = 0, unsigned hudH = 0);
+void SubmitScreen(IDirect3DTexture9* screen, unsigned w, unsigned h);
+void EndFrameEmpty();
+
+// The current head position and direction become "straight ahead" on the next frame.
+void Recenter();
+
+// Where the time of handing images to the runtime goes (seconds, summed since the last call).
+struct SubmitTimes
+{
+    double flush = 0, acquire = 0, wait = 0, fence = 0, submit = 0, endFrame = 0;
+    int count = 0;
+};
+SubmitTimes TakeSubmitTimes();
+
+}  // namespace xr

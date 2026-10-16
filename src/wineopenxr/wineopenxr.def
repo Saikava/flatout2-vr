@@ -1,0 +1,5 @@
+LIBRARY wineopenxr
+EXPORTS
+  __wineopenxr_GetVulkanInstanceExtensions = GetVulkanInstanceExtensions
+  __wineopenxr_GetVulkanDeviceExtensions = GetVulkanDeviceExtensions
+  fo2vr_SetVulkanExtensions = SetVulkanExtensions

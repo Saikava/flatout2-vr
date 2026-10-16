@@ -1,0 +1,858 @@
+#include "xr.h"
+
+#include "dxvk_interop.h"
+#include "util.h"
+
+#include <windows.h>
+#include <d3d9.h>
+
+#define XR_USE_PLATFORM_WIN32
+#define XR_USE_GRAPHICS_API_VULKAN
+#include <openxr/openxr.h>
+#include <openxr/openxr_platform.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <string>
+#include <vector>
+
+namespace xr {
+namespace {
+
+XrInstance g_instance = XR_NULL_HANDLE;
+XrSystemId g_system = XR_NULL_SYSTEM_ID;
+XrSession g_session = XR_NULL_HANDLE;
+XrSpace g_local = XR_NULL_HANDLE;
+bool g_running;
+
+// DXVK's Vulkan objects.
+ID3D9VkInteropDevice* g_interop;
+VkInstance g_vkInstance;
+VkPhysicalDevice g_vkPhys;
+VkDevice g_vkDevice;
+VkQueue g_queue;
+uint32_t g_queueFamily, g_queueIndex;
+
+struct VkFns
+{
+    PFN_vkGetInstanceProcAddr GetInstanceProcAddr;
+    PFN_vkGetDeviceProcAddr GetDeviceProcAddr;
+    PFN_vkCreateCommandPool CreateCommandPool;
+    PFN_vkAllocateCommandBuffers AllocateCommandBuffers;
+    PFN_vkBeginCommandBuffer BeginCommandBuffer;
+    PFN_vkEndCommandBuffer EndCommandBuffer;
+    PFN_vkResetCommandBuffer ResetCommandBuffer;
+    PFN_vkCmdPipelineBarrier CmdPipelineBarrier;
+    PFN_vkCmdCopyImage CmdCopyImage;
+    PFN_vkCmdBlitImage CmdBlitImage;
+    PFN_vkQueueSubmit QueueSubmit;
+    PFN_vkCreateFence CreateFence;
+    PFN_vkWaitForFences WaitForFences;
+    PFN_vkResetFences ResetFences;
+} vk;
+
+struct Slot
+{
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    VkFence fence = VK_NULL_HANDLE;
+};
+Slot g_slots[3];
+int g_slot;
+VkCommandPool g_pool;
+
+struct Swapchain
+{
+    XrSwapchain handle = XR_NULL_HANDLE;
+    std::vector<VkImage> images;
+    uint32_t w = 0, h = 0;
+};
+Swapchain g_eyeSc[2], g_screenSc, g_hudSc;
+int64_t g_format;
+uint32_t g_eyeW, g_eyeH;
+
+XrFrameState g_frameState;
+bool g_frameOpen;
+XrView g_views[2];
+bool g_viewsValid;
+
+// Recenter origin (OpenXR LOCAL space): position and yaw.
+bool g_recenterPending = true;
+float g_originPos[3];
+float g_originYaw;
+
+bool g_loggedImage;
+SubmitTimes g_times;
+
+// No tracking (headset asleep, or no frame located yet): eyes straight ahead with a Quest 3-like
+// field of view, for test renders.
+void DefaultViews()
+{
+    for (int i = 0; i < 2; i++)
+    {
+        g_views[i] = { XR_TYPE_VIEW };
+        g_views[i].pose.orientation.w = 1.0f;
+        g_views[i].pose.position = { i == 0 ? -0.032f : 0.032f, 0.0f, 0.0f };
+        g_views[i].fov = i == 0 ? XrFovf{ -0.94f, 0.70f, 0.77f, -0.96f } : XrFovf{ -0.70f, 0.94f, 0.77f, -0.96f };
+    }
+}
+
+bool Check(XrResult r, const char* what)
+{
+    if (XR_SUCCEEDED(r)) return true;
+    char name[XR_MAX_RESULT_STRING_SIZE] = "";
+    if (g_instance) xrResultToString(g_instance, r, name);
+    Log("xr: %s failed: %d %s", what, (int)r, name);
+    return false;
+}
+
+// The runtime may use DXVK's queue inside these calls; DXVK must not submit meanwhile.
+struct QueueLock
+{
+    QueueLock() { g_interop->LockSubmissionQueue(); }
+    ~QueueLock() { g_interop->ReleaseSubmissionQueue(); }
+};
+
+void Rotate(const XrQuaternionf& q, const float v[3], float out[3])
+{
+    float tx = 2.0f * (q.y * v[2] - q.z * v[1]);
+    float ty = 2.0f * (q.z * v[0] - q.x * v[2]);
+    float tz = 2.0f * (q.x * v[1] - q.y * v[0]);
+    out[0] = v[0] + q.w * tx + (q.y * tz - q.z * ty);
+    out[1] = v[1] + q.w * ty + (q.z * tx - q.x * tz);
+    out[2] = v[2] + q.w * tz + (q.x * ty - q.y * tx);
+}
+
+// Rotates about +y by -g_originYaw, then converts OpenXR axes (right-handed, -z forward) to the
+// game's (left-handed, +z forward).
+void ToGame(const float v[3], float out[3])
+{
+    float c = cosf(-g_originYaw), s = sinf(-g_originYaw);
+    out[0] = v[0] * c + v[2] * s;
+    out[1] = v[1];
+    out[2] = -(-v[0] * s + v[2] * c);
+}
+
+void ApplyRecenter()
+{
+    const XrPosef& p0 = g_views[0].pose;
+    const XrPosef& p1 = g_views[1].pose;
+    g_originPos[0] = 0.5f * (p0.position.x + p1.position.x);
+    g_originPos[1] = 0.5f * (p0.position.y + p1.position.y);
+    g_originPos[2] = 0.5f * (p0.position.z + p1.position.z);
+    const float fwd[3] = { 0, 0, -1 };  // OpenXR forward
+    float f[3];
+    Rotate(p0.orientation, fwd, f);
+    g_originYaw = atan2f(-f[0], -f[2]);
+    Log("xr: recentered at %.2f %.2f %.2f, yaw %.1f deg", g_originPos[0], g_originPos[1], g_originPos[2], g_originYaw * 57.29578f);
+}
+
+template <class T>
+bool LoadDeviceFn(T& fn, const char* name)
+{
+    fn = (T)vk.GetDeviceProcAddr(g_vkDevice, name);
+    if (!fn) Log("xr: Vulkan function %s missing", name);
+    return fn != nullptr;
+}
+
+bool LoadVulkan()
+{
+    HMODULE lib = GetModuleHandleW(L"vulkan-1.dll");
+    if (!lib) lib = LoadLibraryW(L"vulkan-1.dll");
+    if (!lib) return false;
+    vk.GetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)GetProcAddress(lib, "vkGetInstanceProcAddr");
+    if (!vk.GetInstanceProcAddr) return false;
+    vk.GetDeviceProcAddr = (PFN_vkGetDeviceProcAddr)vk.GetInstanceProcAddr(g_vkInstance, "vkGetDeviceProcAddr");
+    if (!vk.GetDeviceProcAddr) return false;
+    bool ok = LoadDeviceFn(vk.CreateCommandPool, "vkCreateCommandPool");
+    ok &= LoadDeviceFn(vk.AllocateCommandBuffers, "vkAllocateCommandBuffers");
+    ok &= LoadDeviceFn(vk.BeginCommandBuffer, "vkBeginCommandBuffer");
+    ok &= LoadDeviceFn(vk.EndCommandBuffer, "vkEndCommandBuffer");
+    ok &= LoadDeviceFn(vk.ResetCommandBuffer, "vkResetCommandBuffer");
+    ok &= LoadDeviceFn(vk.CmdPipelineBarrier, "vkCmdPipelineBarrier");
+    ok &= LoadDeviceFn(vk.CmdCopyImage, "vkCmdCopyImage");
+    ok &= LoadDeviceFn(vk.CmdBlitImage, "vkCmdBlitImage");
+    ok &= LoadDeviceFn(vk.QueueSubmit, "vkQueueSubmit");
+    ok &= LoadDeviceFn(vk.CreateFence, "vkCreateFence");
+    ok &= LoadDeviceFn(vk.WaitForFences, "vkWaitForFences");
+    ok &= LoadDeviceFn(vk.ResetFences, "vkResetFences");
+    return ok;
+}
+
+bool CreateCommandObjects()
+{
+    VkCommandPoolCreateInfo pi = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+    pi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    pi.queueFamilyIndex = g_queueFamily;
+    if (vk.CreateCommandPool(g_vkDevice, &pi, nullptr, &g_pool) != VK_SUCCESS) return false;
+    for (Slot& s : g_slots)
+    {
+        VkCommandBufferAllocateInfo ai = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+        ai.commandPool = g_pool;
+        ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        ai.commandBufferCount = 1;
+        VkFenceCreateInfo fi = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+        fi.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+        if (vk.AllocateCommandBuffers(g_vkDevice, &ai, &s.cmd) != VK_SUCCESS) return false;
+        if (vk.CreateFence(g_vkDevice, &fi, nullptr, &s.fence) != VK_SUCCESS) return false;
+    }
+    return true;
+}
+
+bool CreateSwapchain(Swapchain& sc, uint32_t w, uint32_t h, const char* name)
+{
+    XrSwapchainCreateInfo ci = { XR_TYPE_SWAPCHAIN_CREATE_INFO };
+    ci.usageFlags = XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT | XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
+    ci.format = g_format;
+    ci.sampleCount = 1;
+    ci.width = w;
+    ci.height = h;
+    ci.faceCount = 1;
+    ci.arraySize = 1;
+    ci.mipCount = 1;
+    if (!Check(xrCreateSwapchain(g_session, &ci, &sc.handle), "xrCreateSwapchain")) return false;
+    uint32_t n = 0;
+    xrEnumerateSwapchainImages(sc.handle, 0, &n, nullptr);
+    std::vector<XrSwapchainImageVulkanKHR> images(n, { XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR });
+    xrEnumerateSwapchainImages(sc.handle, n, &n, (XrSwapchainImageBaseHeader*)images.data());
+    for (auto& i : images) sc.images.push_back(i.image);
+    sc.w = w;
+    sc.h = h;
+    Log("xr: %s swapchain %ux%u, %u images", name, w, h, n);
+    return true;
+}
+
+void ImageBarrier(VkCommandBuffer cmd, VkImage image, VkImageLayout from, VkImageLayout to, VkAccessFlags srcAccess, VkAccessFlags dstAccess,
+                  VkPipelineStageFlags srcStage, VkPipelineStageFlags dstStage, const VkImageSubresourceRange& range)
+{
+    VkImageMemoryBarrier b = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+    b.srcAccessMask = srcAccess;
+    b.dstAccessMask = dstAccess;
+    b.oldLayout = from;
+    b.newLayout = to;
+    b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = image;
+    b.subresourceRange = range;
+    vk.CmdPipelineBarrier(cmd, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &b);
+}
+
+bool SameChannelOrder(VkFormat a, int64_t b)
+{
+    auto bgra = [](int64_t f) { return f == VK_FORMAT_B8G8R8A8_UNORM || f == VK_FORMAT_B8G8R8A8_SRGB; };
+    auto rgba = [](int64_t f) { return f == VK_FORMAT_R8G8B8A8_UNORM || f == VK_FORMAT_R8G8B8A8_SRGB; };
+    return (bgra(a) && bgra(b)) || (rgba(a) && rgba(b));
+}
+
+// Copies D3D9 textures into newly acquired images of the given swapchains on DXVK's queue.
+bool CopyToSwapchains(IDirect3DTexture9* const* textures, Swapchain* const* chains, int count)
+{
+    struct Src
+    {
+        VkImage image = VK_NULL_HANDLE;
+        VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        VkImageCreateInfo info = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+    } src[3];
+    for (int i = 0; i < count; i++)
+    {
+        ID3D9VkInteropTexture* it = nullptr;
+        if (FAILED(textures[i]->QueryInterface(__uuidof(ID3D9VkInteropTexture), (void**)&it)))
+        {
+            Log("xr: texture without Vulkan image");
+            return false;
+        }
+        HRESULT hr = it->GetVulkanImageInfo(&src[i].image, &src[i].layout, &src[i].info);
+        it->Release();
+        if (FAILED(hr)) return false;
+        if (!g_loggedImage)
+        {
+            g_loggedImage = true;
+            Log("xr: D3D9 texture image %ux%u format %d layout %d -> swapchain format %lld", src[i].info.extent.width,
+                src[i].info.extent.height, (int)src[i].info.format, (int)src[i].layout, (long long)g_format);
+        }
+    }
+
+    // DXVK has to hand the eye rendering to the queue before our copy is queued behind it.
+    double t0 = NowSeconds();
+    g_interop->FlushRenderingCommands();
+    double t1 = NowSeconds();
+    g_times.flush += t1 - t0;
+
+    uint32_t index[3];
+    for (int i = 0; i < count; i++)
+    {
+        XrSwapchainImageAcquireInfo ai = { XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
+        XrResult r;
+        double a0 = NowSeconds();
+        {
+            QueueLock lock;
+            r = xrAcquireSwapchainImage(chains[i]->handle, &ai, &index[i]);
+        }
+        double a1 = NowSeconds();
+        g_times.acquire += a1 - a0;
+        if (!Check(r, "xrAcquireSwapchainImage")) return false;
+        XrSwapchainImageWaitInfo wi = { XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
+        wi.timeout = XR_INFINITE_DURATION;
+        Check(xrWaitSwapchainImage(chains[i]->handle, &wi), "xrWaitSwapchainImage");
+        g_times.wait += NowSeconds() - a1;
+    }
+
+    g_slot = (g_slot + 1) % 3;
+    Slot& s = g_slots[g_slot];
+    double f0 = NowSeconds();
+    vk.WaitForFences(g_vkDevice, 1, &s.fence, VK_TRUE, 1000000000ull);
+    double f1 = NowSeconds();
+    g_times.fence += f1 - f0;
+    vk.ResetFences(g_vkDevice, 1, &s.fence);
+    vk.ResetCommandBuffer(s.cmd, 0);
+    VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vk.BeginCommandBuffer(s.cmd, &bi);
+    const VkImageSubresourceRange color = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    for (int i = 0; i < count; i++)
+    {
+        VkImage dst = chains[i]->images[index[i]];
+        ImageBarrier(s.cmd, src[i].image, src[i].layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT,
+                     VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, color);
+        ImageBarrier(s.cmd, dst, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
+                     VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, color);
+        uint32_t w = std::min(src[i].info.extent.width, chains[i]->w);
+        uint32_t h = std::min(src[i].info.extent.height, chains[i]->h);
+        if (SameChannelOrder(src[i].info.format, g_format))
+        {
+            VkImageCopy region = {};
+            region.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+            region.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+            region.extent = { w, h, 1 };
+            vk.CmdCopyImage(s.cmd, src[i].image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+        }
+        else
+        {
+            VkImageBlit region = {};
+            region.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+            region.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+            region.srcOffsets[1] = { (int32_t)w, (int32_t)h, 1 };
+            region.dstOffsets[1] = { (int32_t)w, (int32_t)h, 1 };
+            vk.CmdBlitImage(s.cmd, src[i].image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region,
+                            VK_FILTER_NEAREST);
+        }
+        // Give the image back to DXVK in its layout, and the swapchain image to the runtime as a colour attachment.
+        ImageBarrier(s.cmd, src[i].image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, src[i].layout, VK_ACCESS_TRANSFER_READ_BIT,
+                     VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                     color);
+        ImageBarrier(s.cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+                     VK_ACCESS_MEMORY_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, color);
+    }
+    vk.EndCommandBuffer(s.cmd);
+
+    VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &s.cmd;
+    VkResult vr;
+    {
+        QueueLock lock;
+        vr = vk.QueueSubmit(g_queue, 1, &si, s.fence);
+        for (int i = 0; i < count; i++)
+        {
+            XrSwapchainImageReleaseInfo ri = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+            xrReleaseSwapchainImage(chains[i]->handle, &ri);
+        }
+    }
+    g_times.submit += NowSeconds() - f1;
+    g_times.count++;
+    if (vr != VK_SUCCESS) Log("xr: vkQueueSubmit failed %d", (int)vr);
+    return vr == VK_SUCCESS;
+}
+
+std::vector<std::string> SplitList(const std::string& s)
+{
+    std::vector<std::string> out;
+    size_t i = 0;
+    while (i < s.size())
+    {
+        size_t j = s.find(' ', i);
+        if (j == std::string::npos) j = s.size();
+        if (j > i) out.push_back(s.substr(i, j - i));
+        i = j + 1;
+    }
+    return out;
+}
+
+// xrGetVulkanInstanceExtensionsKHR or xrGetVulkanDeviceExtensionsKHR (same signature).
+std::vector<std::string> RuntimeVulkanExtensions(const char* function)
+{
+    PFN_xrGetVulkanInstanceExtensionsKHR fn = nullptr;
+    xrGetInstanceProcAddr(g_instance, function, (PFN_xrVoidFunction*)&fn);
+    uint32_t n = 0;
+    if (!fn || !Check(fn(g_instance, g_system, 0, &n, nullptr), function) || n == 0) return {};
+    std::string s(n, '\0');
+    if (!Check(fn(g_instance, g_system, n, &n, s.data()), function)) return {};
+    s.resize(strlen(s.c_str()));
+    return SplitList(s);
+}
+
+// Extensions the runtime asks for that this machine's Vulkan does not have would make DXVK's
+// vkCreateInstance / vkCreateDevice fail, so they are left out (the session then fails instead of
+// the game).
+void FilterSupported(std::vector<std::string>& instanceExts, std::vector<std::string>& deviceExts)
+{
+    HMODULE lib = LoadLibraryW(L"vulkan-1.dll");
+    auto gipa = lib ? (PFN_vkGetInstanceProcAddr)GetProcAddress(lib, "vkGetInstanceProcAddr") : nullptr;
+    if (!gipa)
+    {
+        instanceExts.clear();
+        deviceExts.clear();
+        return;
+    }
+    auto enumInst = (PFN_vkEnumerateInstanceExtensionProperties)gipa(nullptr, "vkEnumerateInstanceExtensionProperties");
+    auto createInst = (PFN_vkCreateInstance)gipa(nullptr, "vkCreateInstance");
+    std::vector<std::string> have;
+    uint32_t n = 0;
+    if (enumInst && enumInst(nullptr, &n, nullptr) == VK_SUCCESS)
+    {
+        std::vector<VkExtensionProperties> props(n);
+        enumInst(nullptr, &n, props.data());
+        for (auto& p : props) have.push_back(p.extensionName);
+    }
+    auto keep = [&](std::vector<std::string>& list, const char* what) {
+        std::vector<std::string> kept;
+        for (auto& e : list)
+            if (std::find(have.begin(), have.end(), e) != have.end())
+                kept.push_back(e);
+            else
+                Log("xr: %s extension %s is not supported here - left out", what, e.c_str());
+        list = kept;
+    };
+    keep(instanceExts, "Vulkan instance");
+
+    // Device extensions: supported by any of the GPUs.
+    have.clear();
+    VkApplicationInfo app = { VK_STRUCTURE_TYPE_APPLICATION_INFO };
+    app.apiVersion = VK_API_VERSION_1_1;
+    VkInstanceCreateInfo ci = { VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
+    ci.pApplicationInfo = &app;
+    VkInstance inst = VK_NULL_HANDLE;
+    if (createInst && createInst(&ci, nullptr, &inst) == VK_SUCCESS)
+    {
+        auto enumPhys = (PFN_vkEnumeratePhysicalDevices)gipa(inst, "vkEnumeratePhysicalDevices");
+        auto enumDev = (PFN_vkEnumerateDeviceExtensionProperties)gipa(inst, "vkEnumerateDeviceExtensionProperties");
+        auto destroy = (PFN_vkDestroyInstance)gipa(inst, "vkDestroyInstance");
+        uint32_t count = 0;
+        if (enumPhys && enumDev && enumPhys(inst, &count, nullptr) == VK_SUCCESS)
+        {
+            std::vector<VkPhysicalDevice> phys(count);
+            enumPhys(inst, &count, phys.data());
+            for (VkPhysicalDevice pd : phys)
+            {
+                n = 0;
+                enumDev(pd, nullptr, &n, nullptr);
+                std::vector<VkExtensionProperties> props(n);
+                enumDev(pd, nullptr, &n, props.data());
+                for (auto& p : props) have.push_back(p.extensionName);
+            }
+        }
+        if (destroy) destroy(inst, nullptr);
+    }
+    keep(deviceExts, "Vulkan device");
+}
+
+// DXVK creates its Vulkan instance and device with the extensions listed by wineopenxr.dll
+// (src/wineopenxr), which must be loaded before Direct3DCreate9.
+void PrepareDxvkExtensions()
+{
+    std::vector<std::string> inst = RuntimeVulkanExtensions("xrGetVulkanInstanceExtensionsKHR");
+    std::vector<std::string> dev = RuntimeVulkanExtensions("xrGetVulkanDeviceExtensionsKHR");
+    FilterSupported(inst, dev);
+    std::string instList, devList;
+    for (auto& e : inst) instList += (instList.empty() ? "" : " ") + e;
+    for (auto& e : dev) devList += (devList.empty() ? "" : " ") + e;
+    Log("xr: Vulkan instance extensions for the runtime: %s", instList.c_str());
+    Log("xr: Vulkan device extensions for the runtime: %s", devList.c_str());
+
+    std::wstring path = ModuleDir() + L"wineopenxr.dll";
+    HMODULE shim = LoadLibraryW(path.c_str());
+    using SetFn = void (*)(const char*, const char*);
+    auto set = shim ? (SetFn)GetProcAddress(shim, "fo2vr_SetVulkanExtensions") : nullptr;
+    if (!set)
+    {
+        Log("xr: cannot load %ls (error %u) - DXVK will lack the runtime's Vulkan extensions", path.c_str(), (unsigned)GetLastError());
+        return;
+    }
+    set(instList.c_str(), devList.c_str());
+}
+
+void EndFrame(const XrCompositionLayerBaseHeader* layer, const XrCompositionLayerBaseHeader* overlay = nullptr)
+{
+    const XrCompositionLayerBaseHeader* layers[2] = { layer, overlay };
+    XrFrameEndInfo ei = { XR_TYPE_FRAME_END_INFO };
+    ei.displayTime = g_frameState.predictedDisplayTime;
+    ei.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+    ei.layerCount = layer ? (overlay ? 2 : 1) : 0;
+    ei.layers = layer ? layers : nullptr;
+    XrResult r;
+    double t0 = NowSeconds();
+    {
+        QueueLock lock;
+        r = xrEndFrame(g_session, &ei);
+    }
+    if (layer) g_times.endFrame += NowSeconds() - t0;
+    Check(r, "xrEndFrame");
+    g_frameOpen = false;
+}
+
+}  // namespace
+
+bool InitInstance()
+{
+    // Runtime choice: the loader reads XR_RUNTIME_JSON when it is loaded.
+    std::wstring runtime = g_cfg.vrRuntime;
+    if (_wcsicmp(runtime.c_str(), L"steamvr") == 0)
+    {
+        wchar_t steam[MAX_PATH] = L"";
+        DWORD size = sizeof(steam);
+        if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Valve\\Steam", L"SteamPath", RRF_RT_REG_SZ, nullptr, steam, &size) == ERROR_SUCCESS)
+            runtime = std::wstring(steam) + L"/steamapps/common/SteamVR/steamxr_win32.json";
+        else
+            runtime = L"C:\\Program Files (x86)\\Steam\\steamapps\\common\\SteamVR\\steamxr_win32.json";
+    }
+    if (_wcsicmp(runtime.c_str(), L"default") != 0 && !runtime.empty())
+    {
+        SetEnvironmentVariableW(L"XR_RUNTIME_JSON", runtime.c_str());
+        Log("xr: runtime %ls", runtime.c_str());
+    }
+    std::wstring loader = ModuleDir() + L"openxr_loader.dll";
+    if (!LoadLibraryW(loader.c_str()))
+    {
+        Log("xr: cannot load %ls (error %u)", loader.c_str(), (unsigned)GetLastError());
+        return false;
+    }
+    const char* exts[] = { XR_KHR_VULKAN_ENABLE_EXTENSION_NAME };
+    XrInstanceCreateInfo ci = { XR_TYPE_INSTANCE_CREATE_INFO };
+    strcpy(ci.applicationInfo.applicationName, "FlatOut 2 VR");
+    ci.applicationInfo.applicationVersion = 1;
+    strcpy(ci.applicationInfo.engineName, "FO2VR");
+    ci.applicationInfo.apiVersion = XR_API_VERSION_1_0;
+    ci.enabledExtensionCount = 1;
+    ci.enabledExtensionNames = exts;
+    if (!Check(xrCreateInstance(&ci, &g_instance), "xrCreateInstance")) return false;
+    XrInstanceProperties ip = { XR_TYPE_INSTANCE_PROPERTIES };
+    xrGetInstanceProperties(g_instance, &ip);
+    Log("xr: runtime %s %u.%u.%u", ip.runtimeName, XR_VERSION_MAJOR(ip.runtimeVersion), XR_VERSION_MINOR(ip.runtimeVersion),
+        XR_VERSION_PATCH(ip.runtimeVersion));
+
+    XrSystemGetInfo si = { XR_TYPE_SYSTEM_GET_INFO };
+    si.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
+    // SteamVR reports the headset a few seconds after it starts.
+    XrResult sr = XR_ERROR_FORM_FACTOR_UNAVAILABLE;
+    for (int i = 0; i < 40 && sr == XR_ERROR_FORM_FACTOR_UNAVAILABLE; i++)
+    {
+        sr = xrGetSystem(g_instance, &si, &g_system);
+        if (sr == XR_ERROR_FORM_FACTOR_UNAVAILABLE) Sleep(250);
+    }
+    if (!Check(sr, "xrGetSystem (is the headset connected?)"))
+    {
+        xrDestroyInstance(g_instance);
+        g_instance = XR_NULL_HANDLE;
+        return false;
+    }
+    XrSystemProperties sp = { XR_TYPE_SYSTEM_PROPERTIES };
+    xrGetSystemProperties(g_instance, g_system, &sp);
+    XrViewConfigurationView views[2] = { { XR_TYPE_VIEW_CONFIGURATION_VIEW }, { XR_TYPE_VIEW_CONFIGURATION_VIEW } };
+    uint32_t n = 2;
+    xrEnumerateViewConfigurationViews(g_instance, g_system, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, 2, &n, views);
+    float scale = g_cfg.vrRenderScale > 0.1f ? g_cfg.vrRenderScale : 1.0f;
+    g_eyeW = std::min((uint32_t)(views[0].recommendedImageRectWidth * scale + 0.5f), views[0].maxImageRectWidth);
+    g_eyeH = std::min((uint32_t)(views[0].recommendedImageRectHeight * scale + 0.5f), views[0].maxImageRectHeight);
+    Log("xr: headset \"%s\", recommended %ux%u per eye, rendering %ux%u", sp.systemName, views[0].recommendedImageRectWidth,
+        views[0].recommendedImageRectHeight, g_eyeW, g_eyeH);
+    PrepareDxvkExtensions();
+    return true;
+}
+
+bool Available() { return g_instance != XR_NULL_HANDLE; }
+
+void OnDevice(IDirect3DDevice9* dev)
+{
+    if (g_session || !g_instance) return;
+    if (FAILED(dev->QueryInterface(__uuidof(ID3D9VkInteropDevice), (void**)&g_interop)))
+    {
+        g_interop = nullptr;
+        Log("xr: the game does not run on DXVK - no VR (put DXVK's 32-bit d3d9.dll into the game folder)");
+        return;
+    }
+    g_interop->GetVulkanHandles(&g_vkInstance, &g_vkPhys, &g_vkDevice);
+    g_interop->GetSubmissionQueue(&g_queue, &g_queueIndex, &g_queueFamily);
+    Log("xr: DXVK device: instance %p, physical device %p, device %p, queue family %u index %u", (void*)g_vkInstance, (void*)g_vkPhys,
+        (void*)g_vkDevice, g_queueFamily, g_queueIndex);
+    if (!LoadVulkan() || !CreateCommandObjects())
+    {
+        Log("xr: Vulkan setup failed - no VR");
+        return;
+    }
+
+    // Required before xrCreateSession.
+    PFN_xrGetVulkanGraphicsRequirementsKHR getReq = nullptr;
+    PFN_xrGetVulkanGraphicsDeviceKHR getDev = nullptr;
+    xrGetInstanceProcAddr(g_instance, "xrGetVulkanGraphicsRequirementsKHR", (PFN_xrVoidFunction*)&getReq);
+    xrGetInstanceProcAddr(g_instance, "xrGetVulkanGraphicsDeviceKHR", (PFN_xrVoidFunction*)&getDev);
+    XrGraphicsRequirementsVulkanKHR req = { XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN_KHR };
+    if (getReq) Check(getReq(g_instance, g_system, &req), "xrGetVulkanGraphicsRequirementsKHR");
+    VkPhysicalDevice want = VK_NULL_HANDLE;
+    if (getDev) Check(getDev(g_instance, g_system, g_vkInstance, &want), "xrGetVulkanGraphicsDeviceKHR");
+    Log("xr: runtime wants physical device %p (DXVK uses %p)%s", (void*)want, (void*)g_vkPhys, want == g_vkPhys ? "" : " - MISMATCH");
+
+    XrGraphicsBindingVulkanKHR binding = { XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR };
+    binding.instance = g_vkInstance;
+    binding.physicalDevice = g_vkPhys;
+    binding.device = g_vkDevice;
+    binding.queueFamilyIndex = g_queueFamily;
+    binding.queueIndex = g_queueIndex;
+    XrSessionCreateInfo sci = { XR_TYPE_SESSION_CREATE_INFO };
+    sci.next = &binding;
+    sci.systemId = g_system;
+    XrResult r;
+    {
+        QueueLock lock;
+        r = xrCreateSession(g_instance, &sci, &g_session);
+    }
+    if (!Check(r, "xrCreateSession"))
+    {
+        g_session = XR_NULL_HANDLE;
+        return;
+    }
+
+    XrReferenceSpaceCreateInfo rs = { XR_TYPE_REFERENCE_SPACE_CREATE_INFO };
+    rs.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
+    rs.poseInReferenceSpace.orientation.w = 1.0f;
+    Check(xrCreateReferenceSpace(g_session, &rs, &g_local), "xrCreateReferenceSpace");
+
+    uint32_t n = 0;
+    xrEnumerateSwapchainFormats(g_session, 0, &n, nullptr);
+    std::vector<int64_t> formats(n);
+    xrEnumerateSwapchainFormats(g_session, n, &n, formats.data());
+    std::string list;
+    for (int64_t f : formats) list += std::to_string(f) + " ";
+    Log("xr: swapchain formats: %s", list.c_str());
+    // The game writes sRGB-encoded colours into B8G8R8A8 textures; copying them as they are into an
+    // _SRGB swapchain shows them unchanged.
+    g_format = 0;
+    for (int64_t pref : { (int64_t)VK_FORMAT_B8G8R8A8_SRGB, (int64_t)VK_FORMAT_R8G8B8A8_SRGB })
+        for (int64_t f : formats)
+            if (!g_format && f == pref) g_format = f;
+    if (!g_format)
+    {
+        Log("xr: runtime offers no 8-bit sRGB swapchain format - no VR");
+        return;
+    }
+    DefaultViews();
+    CreateSwapchain(g_eyeSc[0], g_eyeW, g_eyeH, "left eye");
+    CreateSwapchain(g_eyeSc[1], g_eyeW, g_eyeH, "right eye");
+    Log("xr: session created");
+}
+
+void PollEvents()
+{
+    if (!g_session) return;
+    XrEventDataBuffer ev = { XR_TYPE_EVENT_DATA_BUFFER };
+    while (xrPollEvent(g_instance, &ev) == XR_SUCCESS)
+    {
+        if (ev.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED)
+        {
+            auto* e = (XrEventDataSessionStateChanged*)&ev;
+            Log("xr: session state %d", (int)e->state);
+            if (e->state == XR_SESSION_STATE_READY)
+            {
+                XrSessionBeginInfo bi = { XR_TYPE_SESSION_BEGIN_INFO };
+                bi.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+                g_running = Check(xrBeginSession(g_session, &bi), "xrBeginSession");
+            }
+            else if (e->state == XR_SESSION_STATE_STOPPING)
+            {
+                g_running = false;
+                Check(xrEndSession(g_session), "xrEndSession");
+            }
+            else if (e->state == XR_SESSION_STATE_EXITING || e->state == XR_SESSION_STATE_LOSS_PENDING)
+                g_running = false;
+        }
+        else if (ev.type == XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING)
+        {
+            Log("xr: reference space changed (headset recentered)");
+            g_recenterPending = true;
+        }
+        ev = { XR_TYPE_EVENT_DATA_BUFFER };
+    }
+}
+
+bool Running() { return g_running; }
+
+void EyeSize(unsigned* w, unsigned* h)
+{
+    *w = g_eyeW;
+    *h = g_eyeH;
+}
+
+bool WaitFrame()
+{
+    if (!g_running) return false;
+    if (g_frameOpen) return true;
+    XrFrameWaitInfo wi = { XR_TYPE_FRAME_WAIT_INFO };
+    g_frameState = { XR_TYPE_FRAME_STATE };
+    if (!Check(xrWaitFrame(g_session, &wi, &g_frameState), "xrWaitFrame")) return false;
+    XrFrameBeginInfo bi = { XR_TYPE_FRAME_BEGIN_INFO };
+    XrResult r;
+    {
+        QueueLock lock;
+        r = xrBeginFrame(g_session, &bi);
+    }
+    if (!Check(r, "xrBeginFrame")) return false;
+    g_frameOpen = true;
+    return true;
+}
+
+bool ShouldRender() { return g_frameOpen && g_frameState.shouldRender; }
+double DisplayTime() { return (double)g_frameState.predictedDisplayTime * 1e-9; }
+double DisplayPeriod() { return (double)g_frameState.predictedDisplayPeriod * 1e-9; }
+
+bool BeginFrame()
+{
+    if (!WaitFrame()) return false;
+
+    XrViewLocateInfo li = { XR_TYPE_VIEW_LOCATE_INFO };
+    li.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+    li.displayTime = g_frameState.predictedDisplayTime;
+    li.space = g_local;
+    XrViewState vs = { XR_TYPE_VIEW_STATE };
+    g_views[0] = g_views[1] = { XR_TYPE_VIEW };
+    uint32_t n = 2;
+    g_viewsValid = XR_SUCCEEDED(xrLocateViews(g_session, &li, &vs, 2, &n, g_views)) && n == 2 &&
+                   (vs.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) != 0;
+    if (!g_viewsValid) DefaultViews();
+    if (g_viewsValid && g_recenterPending)
+    {
+        g_recenterPending = false;
+        ApplyRecenter();
+    }
+    return g_frameState.shouldRender && g_viewsValid;
+}
+
+bool FrameOpen() { return g_frameOpen; }
+
+EyePose Pose(int eye)
+{
+    const XrPosef& p = g_views[eye].pose;
+    const float x[3] = { 1, 0, 0 }, y[3] = { 0, 1, 0 }, fwd[3] = { 0, 0, -1 };
+    float r[3], u[3], f[3];
+    Rotate(p.orientation, x, r);
+    Rotate(p.orientation, y, u);
+    Rotate(p.orientation, fwd, f);
+    float pos[3] = { p.position.x - g_originPos[0], p.position.y - g_originPos[1], p.position.z - g_originPos[2] };
+    EyePose out;
+    ToGame(r, out.right);
+    ToGame(u, out.up);
+    ToGame(f, out.forward);
+    ToGame(pos, out.position);
+    return out;
+}
+
+EyeFov Fov(int eye)
+{
+    const XrFovf& f = g_views[eye].fov;
+    return { tanf(f.angleLeft), tanf(f.angleRight), tanf(f.angleUp), tanf(f.angleDown) };
+}
+
+// A quad facing the recenter origin's straight-ahead direction, `distance` in front of it and
+// `height` above it.
+XrPosef PanelPose(float distance, float height)
+{
+    XrPosef p;
+    float c = cosf(g_originYaw * 0.5f), s = sinf(g_originYaw * 0.5f);
+    p.orientation = { 0, s, 0, c };
+    p.position = { g_originPos[0] - sinf(g_originYaw) * distance, g_originPos[1] + height, g_originPos[2] - cosf(g_originYaw) * distance };
+    return p;
+}
+
+void SubmitEyes(IDirect3DTexture9* left, IDirect3DTexture9* right, IDirect3DTexture9* hud, unsigned hudW, unsigned hudH)
+{
+    if (!g_frameOpen) return;
+    if (hud && g_hudSc.handle && (g_hudSc.w != hudW || g_hudSc.h != hudH))
+    {
+        xrDestroySwapchain(g_hudSc.handle);
+        g_hudSc = Swapchain();
+    }
+    if (hud && !g_hudSc.handle && !CreateSwapchain(g_hudSc, hudW, hudH, "HUD")) hud = nullptr;
+    IDirect3DTexture9* tex[3] = { left, right, hud };
+    Swapchain* chains[3] = { &g_eyeSc[0], &g_eyeSc[1], &g_hudSc };
+    if (!g_eyeSc[0].handle || !CopyToSwapchains(tex, chains, hud ? 3 : 2))
+    {
+        EndFrame(nullptr);
+        return;
+    }
+    XrCompositionLayerProjectionView pv[2] = { { XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW }, { XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW } };
+    for (int i = 0; i < 2; i++)
+    {
+        pv[i].pose = g_views[i].pose;
+        pv[i].fov = g_views[i].fov;
+        pv[i].subImage.swapchain = g_eyeSc[i].handle;
+        pv[i].subImage.imageRect = { { 0, 0 }, { (int32_t)g_eyeW, (int32_t)g_eyeH } };
+    }
+    XrCompositionLayerProjection layer = { XR_TYPE_COMPOSITION_LAYER_PROJECTION };
+    layer.space = g_local;
+    layer.viewCount = 2;
+    layer.views = pv;
+    // The HUD texture holds premultiplied colour over a transparent background.
+    XrCompositionLayerQuad quad = { XR_TYPE_COMPOSITION_LAYER_QUAD };
+    quad.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+    quad.space = g_local;
+    quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+    quad.subImage.swapchain = g_hudSc.handle;
+    quad.subImage.imageRect = { { 0, 0 }, { (int32_t)hudW, (int32_t)hudH } };
+    quad.pose = PanelPose(g_cfg.vrHudDistance, g_cfg.vrHudHeight);
+    quad.size = { g_cfg.vrHudWidth, g_cfg.vrHudWidth * (float)hudH / (float)hudW };
+    EndFrame((const XrCompositionLayerBaseHeader*)&layer, hud ? (const XrCompositionLayerBaseHeader*)&quad : nullptr);
+}
+
+void SubmitScreen(IDirect3DTexture9* screen, unsigned w, unsigned h)
+{
+    if (!g_frameOpen) return;
+    if (g_screenSc.handle && (g_screenSc.w != w || g_screenSc.h != h))
+    {
+        xrDestroySwapchain(g_screenSc.handle);
+        g_screenSc = Swapchain();
+    }
+    if (!g_screenSc.handle && !CreateSwapchain(g_screenSc, w, h, "screen"))
+    {
+        EndFrame(nullptr);
+        return;
+    }
+    Swapchain* chains[1] = { &g_screenSc };
+    if (!CopyToSwapchains(&screen, chains, 1))
+    {
+        EndFrame(nullptr);
+        return;
+    }
+    // A flat screen in front of the recenter origin.
+    XrCompositionLayerQuad quad = { XR_TYPE_COMPOSITION_LAYER_QUAD };
+    quad.space = g_local;
+    quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+    quad.subImage.swapchain = g_screenSc.handle;
+    quad.subImage.imageRect = { { 0, 0 }, { (int32_t)w, (int32_t)h } };
+    quad.pose = PanelPose(g_cfg.vrScreenDistance, 0.0f);
+    quad.size = { g_cfg.vrScreenWidth, g_cfg.vrScreenWidth * (float)h / (float)w };
+    EndFrame((const XrCompositionLayerBaseHeader*)&quad);
+}
+
+void EndFrameEmpty()
+{
+    if (g_frameOpen) EndFrame(nullptr);
+}
+
+void Recenter() { g_recenterPending = true; }
+
+SubmitTimes TakeSubmitTimes()
+{
+    SubmitTimes t = g_times;
+    g_times = SubmitTimes();
+    return t;
+}
+
+}  // namespace xr
