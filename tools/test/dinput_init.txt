@@ -1,0 +1,140 @@
+00561260  5e                   pop esi
+00561261  89431c               mov dword ptr [ebx + 0x1c], eax
+00561264  5b                   pop ebx
+00561265  c3                   ret 
+00561266  cc                   int3 
+00561267  cc                   int3 
+00561268  cc                   int3 
+00561269  cc                   int3 
+0056126A  cc                   int3 
+0056126B  cc                   int3 
+0056126C  cc                   int3 
+0056126D  cc                   int3 
+0056126E  cc                   int3 
+0056126F  cc                   int3 
+00561270  6800bc6700           push 0x67bc00
+00561275  ff15cc216500         call dword ptr [0x6521cc]
+0056127B  68ecbb6700           push 0x67bbec
+00561280  50                   push eax
+00561281  a344a78d00           mov dword ptr [0x8da744], eax
+00561286  ff15c8216500         call dword ptr [0x6521c8]
+0056128C  6a00                 push 0
+0056128E  684ca78d00           push 0x8da74c
+00561293  68e4136600           push 0x6613e4
+00561298  6800080000           push 0x800
+0056129D  6a00                 push 0
+0056129F  a348a78d00           mov dword ptr [0x8da748], eax
+005612A4  ff15c4216500         call dword ptr [0x6521c4]
+005612AA  50                   push eax
+005612AB  ff1548a78d00         call dword ptr [0x8da748]
+005612B1  33c9                 xor ecx, ecx
+005612B3  85c0                 test eax, eax
+005612B5  0f9dc1               setge cl
+005612B8  49                   dec ecx
+005612B9  23c1                 and eax, ecx
+005612BB  c3                   ret 
+005612BC  cc                   int3 
+005612BD  cc                   int3 
+005612BE  cc                   int3 
+005612BF  cc                   int3 
+005612C0  a14ca78d00           mov eax, dword ptr [0x8da74c]
+005612C5  8b08                 mov ecx, dword ptr [eax]
+005612C7  83ec2c               sub esp, 0x2c
+005612CA  6a01                 push 1
+005612CC  56                   push esi
+005612CD  68c0145600           push 0x5614c0
+005612D2  6a04                 push 4
+005612D4  50                   push eax
+005612D5  ff5110               call dword ptr [ecx + 0x10]
+005612D8  85c0                 test eax, eax
+005612DA  0f8cc2000000         jl 0x5613a2
+005612E0  66a16c818d00         mov ax, word ptr [0x8d816c]
+005612E6  668b0d68818d00       mov cx, word ptr [0x8d8168]
+005612ED  668b1564818d00       mov dx, word ptr [0x8d8164]
+005612F4  888648240000         mov byte ptr [esi + 0x2448], al
+005612FA  88a649240000         mov byte ptr [esi + 0x2449], ah
+00561300  a178818d00           mov eax, dword ptr [0x8d8178]
+00561305  85c0                 test eax, eax
+00561307  888e4a240000         mov byte ptr [esi + 0x244a], cl
+0056130D  88964c240000         mov byte ptr [esi + 0x244c], dl
+00561313  88ae4b240000         mov byte ptr [esi + 0x244b], ch
+00561319  88b64d240000         mov byte ptr [esi + 0x244d], dh
+0056131F  747f                 je 0x5613a0
+00561321  8b10                 mov edx, dword ptr [eax]
+00561323  6a03                 push 3
+00561325  6870818d00           push 0x8d8170
+0056132A  68e0145600           push 0x5614e0
+0056132F  50                   push eax
+00561330  898650240000         mov dword ptr [esi + 0x2450], eax
+00561336  ff5210               call dword ptr [edx + 0x10]
+00561339  85c0                 test eax, eax
+0056133B  7c65                 jl 0x5613a2
+0056133D  a170818d00           mov eax, dword ptr [0x8d8170]
+00561342  57                   push edi
+00561343  898658240000         mov dword ptr [esi + 0x2458], eax
+00561349  33c0                 xor eax, eax
+0056134B  b90b000000           mov ecx, 0xb
+00561350  8d7c2404             lea edi, [esp + 4]
+00561354  f3ab                 rep stosd dword ptr es:[edi], eax
+00561356  a178818d00           mov eax, dword ptr [0x8d8178]
+0056135B  8d542404             lea edx, [esp + 4]
+0056135F  52                   push edx
+00561360  c74424082c000000     mov dword ptr [esp + 8], 0x2c
+00561368  8b08                 mov ecx, dword ptr [eax]
+0056136A  50                   push eax
+0056136B  ff510c               call dword ptr [ecx + 0xc]
+0056136E  a17c818d00           mov eax, dword ptr [0x8d817c]
+00561373  85c0                 test eax, eax
+00561375  5f                   pop edi
+00561376  7428                 je 0x5613a0
+00561378  8b08                 mov ecx, dword ptr [eax]
+0056137A  6a03                 push 3
+0056137C  6874818d00           push 0x8d8174
+00561381  68e0145600           push 0x5614e0
+00561386  50                   push eax
+00561387  898654240000         mov dword ptr [esi + 0x2454], eax
+0056138D  ff5110               call dword ptr [ecx + 0x10]
+00561390  85c0                 test eax, eax
+00561392  7c0e                 jl 0x5613a2
+00561394  8b1574818d00         mov edx, dword ptr [0x8d8174]
+0056139A  89965c240000         mov dword ptr [esi + 0x245c], edx
+005613A0  33c0                 xor eax, eax
+005613A2  83c42c               add esp, 0x2c
+005613A5  c3                   ret 
+005613A6  cc                   int3 
+005613A7  cc                   int3 
+005613A8  cc                   int3 
+005613A9  cc                   int3 
+005613AA  cc                   int3 
+005613AB  cc                   int3 
+005613AC  cc                   int3 
+005613AD  cc                   int3 
+005613AE  cc                   int3 
+005613AF  cc                   int3 
+005613B0  83ec14               sub esp, 0x14
+005613B3  55                   push ebp
+005613B4  56                   push esi
+005613B5  57                   push edi
+005613B6  8bf8                 mov edi, eax
+005613B8  c744240c14000000     mov dword ptr [esp + 0xc], 0x14
+005613C0  c744241010000000     mov dword ptr [esp + 0x10], 0x10
+005613C8  c744241400000000     mov dword ptr [esp + 0x14], 0
+005613D0  c744241800000000     mov dword ptr [esp + 0x18], 0
+005613D8  c744241c00000000     mov dword ptr [esp + 0x1c], 0
+005613E0  33f6                 xor esi, esi
+005613E2  8b04b578818d00       mov eax, dword ptr [esi*4 + 0x8d8178]
+005613E9  85c0                 test eax, eax
+005613EB  7414                 je 0x561401
+005613ED  46                   inc esi
+005613EE  83fe02               cmp esi, 2
+005613F1  7cef                 jl 0x5613e2
+005613F3  5f                   pop edi
+005613F4  5e                   pop esi
+005613F5  b801000000           mov eax, 1
+005613FA  5d                   pop ebp
+005613FB  83c414               add esp, 0x14
+005613FE  c20400               ret 4
+00561401  a14ca78d00           mov eax, dword ptr [0x8da74c]
+00561406  8b08                 mov ecx, dword ptr [eax]
+00561408  6a00                 push 0
+0056140A  8d2cb578818d00       lea ebp, [esi*4 + 0x8d8178]
