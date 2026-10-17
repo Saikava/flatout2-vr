@@ -279,6 +279,26 @@ struct FramePeriod
     }
 } g_period;
 
+// The runtime's own period, when it can be believed: it has stayed the same for a while and is a
+// standard rate (within 0.5%, which SteamVR's rounded 6.55 and 9.83 ms are not). Virtual Desktop
+// reports the refresh exactly, but its frame starts come unevenly (at 144 Hz most intervals are
+// some 6.6 ms and the rest longer), so the estimate from the starts said 151 Hz there, and the
+// frame clocks took the longer intervals for missed frames and stepped the world twice.
+struct RuntimePeriod
+{
+    double last = 0;
+    int same = 0;  // frames it has stayed the same
+
+    // The period to use, or 0.
+    double Add(double reported)
+    {
+        same = fabs(reported - last) < 1e-6 ? same + 1 : 0;
+        last = reported;
+        double e = SnapPeriod(reported);
+        return same >= 60 && fabs(e / reported - 1.0) < 0.005 ? e : 0;
+    }
+} g_runtimePeriod;
+
 // Which headset frame each game frame is shown in. SteamVR's predicted display times are rounded to
 // steps of 3.28 ms and now and then jump a whole frame ahead and come back on the next frame
 // (one interval of two periods, then one of none) while the headset shows every frame. Counting
@@ -363,7 +383,8 @@ struct Pacing
 {
     bool active = false;
     double lastStart = 0;
-    double step = 0;      // physics step (real seconds); follows g_period within 0.1%
+    double step = 0;      // physics step (real seconds); follows the period within 0.1%
+    bool runtimePeriod = false;  // the period is the runtime's, not g_period's
     double carryMs = 0;   // simulated milliseconds owed to the game clock
     double carryReal = 0;
     // stats
@@ -399,9 +420,11 @@ int HeadsetGate(BYTE* gf, double displayTime, double reported)
     double now = NowSeconds();
     if (g_pace.lastStart > 0) g_period.Add(now - g_pace.lastStart, now);
     g_pace.lastStart = now;
-    // Until the intervals tell (the first frames of the first race): 90 Hz. The runtime's own
-    // period is rounded like its display times (6.55 or 9.83 ms at 120 Hz).
-    double period = g_period.value > 0 ? g_period.value : 1.0 / 90;
+    // Until the intervals tell (the first frames of the first race): 90 Hz. SteamVR's own period is
+    // rounded like its display times (6.55 or 9.83 ms at 120 Hz).
+    double period = g_runtimePeriod.Add(reported);
+    g_pace.runtimePeriod = period > 0;
+    if (period <= 0) period = g_period.value > 0 ? g_period.value : 1.0 / 90;
     if (g_pace.step <= 0 || fabs(period - g_pace.step) > 0.001 * g_pace.step) g_pace.step = period;
     int frames = CountFrames(displayTime, now, g_pace.step);
     if (g_cfg.testFrameTimes) DumpFrameTime(displayTime, now, reported, frames, g_period.value);
@@ -640,9 +663,11 @@ static int __cdecl FrameGate(BYTE* gameFlow)
         if (now - g_pace.lastLog >= g_cfg.logIntervalSeconds)
         {
             double span = now - g_pace.lastLog;
-            Log("pacing: %.1f fps, step %.3f ms (%.2f Hz), headset period %.3f ms, %d headset frames missed, waited %.2f ms/frame | "
-                "runtime's period %.2f..%.2f ms, off the frame clocks: display times %+.2f..%+.2f ms, frame starts %+.2f..%+.2f ms",
-                g_pace.frames / span, 1000.0 * g_pace.step, 1.0 / g_pace.step, 1000.0 * g_period.value, g_pace.missed,
+            Log("pacing: %.1f fps, step %.3f ms (%.2f Hz, %s), period from the frame starts %.3f ms, %d headset frames missed, "
+                "waited %.2f ms/frame | runtime's period %.2f..%.2f ms, off the frame clocks: display times %+.2f..%+.2f ms, "
+                "frame starts %+.2f..%+.2f ms",
+                g_pace.frames / span, 1000.0 * g_pace.step, 1.0 / g_pace.step, g_pace.runtimePeriod ? "runtime's" : "frame starts",
+                1000.0 * g_period.value, g_pace.missed,
                 1000.0 * g_pace.wait / g_pace.frames,
                 1000.0 * g_pace.minReported, 1000.0 * g_pace.maxReported, 1000.0 * g_clock.minOff, 1000.0 * g_clock.maxOff,
                 1000.0 * g_wallClock.minOff, 1000.0 * g_wallClock.maxOff);
