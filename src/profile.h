@@ -35,6 +35,10 @@ void StartSampling();
 void ResetTotals();
 void LogTotals(const char* what);
 
+// The game code that led here: the first three return addresses into the game found on the stack
+// from `stack` up (0 where none).
+void GameCallers(const void* stack, unsigned ret[3]);
+
 // While on: every draw call is logged with the game code that led to it (return addresses found
 // on the stack), its size and the textures and shaders bound.
 void TraceDraws(bool on);

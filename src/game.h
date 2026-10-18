@@ -40,6 +40,14 @@ constexpr uintptr_t kSetCamera = 0x5A6F50;
 constexpr uintptr_t kSlotSetFrustum = kDeviceD3dVtbl + 0xB0;
 constexpr uintptr_t kSetFrustum = 0x5A7130;
 
+// Screen sprites: queued and drawn in batches as vertices in the back buffer's pixel space (x from 0
+// to its width, y to its height), whatever the render target. __thiscall(const void*), ret 4:
+// 0x5AB510 takes a rectangle {x0, y0, x1, y1, u0, v0, u1, v1, colour}, 0x5AB4C0 four ready vertices.
+constexpr uintptr_t kSlotSpriteRect = kDeviceD3dVtbl + 0xD8;
+constexpr uintptr_t kSpriteRect = 0x5AB510;
+constexpr uintptr_t kSlotSpriteQuad = kDeviceD3dVtbl + 0xD4;
+constexpr uintptr_t kSpriteQuad = 0x5AB4C0;
+
 // DeviceD3d fields: back buffer size (int). The post-processing in RenderViews draws its passes
 // into the bound render target as pre-transformed quads of this size (and RenderViews ends with
 // SetViewport(0, 0, w, h)), so an eye rendered into a target of another size must set it.
@@ -50,6 +58,12 @@ constexpr int kDevHeight = 0xC;
 // eax and the flare object in edi; projects the sun with the camera's symmetric field of view.
 constexpr uintptr_t kLensFlareCall = 0x4CBBDA;
 constexpr uintptr_t kLensFlare = 0x596980;
+
+// The sun's glow: the sky pass (0x592470) calls 0x596540 with the camera in esi and the track's flare
+// in ebx. It projects the sun with the camera's own frustum (kCamFrustum) and draws the glow there as
+// a flat sprite, sized by the camera's field of view (kCamFov).
+constexpr uintptr_t kSunGlowCall = 0x592509;
+constexpr uintptr_t kSunGlow = 0x596540;
 
 // Screen-space crash sparks and debris ("HUD particles", flying at the camera): drawn after the race
 // frame (RenderRace) by 0x4C4430, the particle object in eax, called at 0x45F78B.
@@ -107,6 +121,35 @@ constexpr uintptr_t kTrailFill = 0x59F848;
 // The screen's shape (float width, height: 4 and 3, or 16 and 9), from which RenderViews takes the
 // cameras' aspect ratio (DeviceD3d's getter 0x5AAD10, slot 9).
 constexpr uintptr_t kScreenShape = 0x69BE18;
+
+// The renderer's screen textures (up to 4 render targets of 512x512, each a wrapper with its
+// IDirect3DTexture9 at kTexD3D). Its post-processing (DeviceD3d slot 0x150, 0x5AA390, called by
+// RenderViews per view at 0x4CBB2C) copies the view just rendered into the first one and blurs from
+// it (bloom). The stunt stadium's video screens ("screenmaterial") show that first one: the view of
+// the last post-processed render.
+constexpr int kDevScreenTex = 0x478;
+// A texture wrapper: its size (int) and its IDirect3DTexture9.
+constexpr int kTexWidth = 0x38;
+constexpr int kTexHeight = 0x3C;
+constexpr int kTexD3D = 0x50;
+
+// The post-processing object (DeviceD3d field). Its colour filter (0x5A9C10, run by the
+// post-processing when the track's look has ColorFilter on) copies the rendered view into the first
+// of two render textures the size of the back buffer (wrappers at kPostFilterTex), filters it through
+// the second and draws the result back over the view.
+constexpr int kDevPost = 0x488;
+constexpr int kPostFilterTex = 0x24;  // two texture wrappers
+
+// The speed blur: the post-processing smears the bloom in passes (0x5A8C60) zooming out from a point
+// of the screen (Data.Effect.PostProcess.RadialBlurZoomCenter, float x, y; 0.5, 0.5 by default, the
+// tracks' looks set it), with a strength of RadialBlurStrength times each view's speed factor
+// (kRadialBlurSpeed[view], 0..1: it grows with the car's speed and more with nitro, smoothed; 0x470100
+// keeps it on the player at +0x6C0 and 0x478FC0 hands it to the renderer every frame).
+constexpr uintptr_t kRadialBlurCenter = 0x8E83C4;
+constexpr uintptr_t kRadialBlurPasses = 0x8E83B8;  // int
+constexpr uintptr_t kRadialBlurStrength = 0x8E83CC;
+constexpr uintptr_t kRadialBlurSpeed = 0x8DA468;  // float[4]
+constexpr uintptr_t kColorFilterOn = 0x8E83D0;    // Data.Effect.PostProcess.ColorFilter (int)
 
 // Last viewport passed to SetViewport (x, y, w, h); the engine restores viewports from here.
 constexpr uintptr_t kViewportX = 0x8DA2CC;

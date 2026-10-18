@@ -570,6 +570,13 @@ void SweepEyeSamples()
     g_sweptSamples = end;
 }
 
+void GameCallers(const void* stack, unsigned ret[3])
+{
+    uint32_t r[3] = {};
+    ScanStack((uint32_t)(uintptr_t)stack, r);
+    for (int i = 0; i < 3; i++) ret[i] = r[i];
+}
+
 void TraceDraws(bool on)
 {
     g_traceDraws = on;

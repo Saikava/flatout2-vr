@@ -383,6 +383,55 @@ std::string Describe(IDirect3DSurface9* s)
     return buf;
 }
 
+// What the game does in an eye besides drawing the scene into it: screen sprites (placed in the
+// back buffer's 2D space, like the sun's glow), render target switches and copies between surfaces
+// (render to texture, like the bloom copy the stadium screens show). Such things may come out
+// different in each eye. Each new place in the game's code is logged once (at most 256), with the
+// three nearest game return addresses.
+// True for a place not logged yet; ret gets the game code that led here.
+bool NewEyeCall(const char* what, const void* stack, unsigned ret[3])
+{
+    if (!g_vrEye.active) return false;
+    prof::GameCallers(stack, ret);
+    static unsigned seen[256];
+    static int count;
+    unsigned key = ret[0] * 31u + ret[1] * 7u + (unsigned)(uintptr_t)what;
+    for (int i = 0; i < count; i++)
+        if (seen[i] == key) return false;
+    if (count == 256) return false;
+    seen[count++] = key;
+    return true;
+}
+
+void LogEyeCall(const char* what, const unsigned ret[3], const std::string& detail = std::string())
+{
+    Log("eyes: %s from %08X < %08X < %08X%s%s", what, ret[0], ret[1], ret[2], detail.empty() ? "" : ": ", detail.c_str());
+}
+
+using SpriteFn = void(__thiscall*)(void* self, const void* data);
+const auto oSpriteRect = (SpriteFn)fo2::kSpriteRect;
+const auto oSpriteQuad = (SpriteFn)fo2::kSpriteQuad;
+
+void __fastcall SpriteRectHook(void* self, void*, const void* rect)
+{
+    unsigned ret[3];
+    if (NewEyeCall("screen sprite", _AddressOfReturnAddress(), ret))
+    {
+        const float* r = (const float*)rect;
+        char buf[96];
+        snprintf(buf, sizeof(buf), "%.0f %.0f %.0f %.0f", r[0], r[1], r[2], r[3]);
+        LogEyeCall("screen sprite", ret, buf);
+    }
+    oSpriteRect(self, rect);
+}
+
+void __fastcall SpriteQuadHook(void* self, void*, const void* vertices)
+{
+    unsigned ret[3];
+    if (NewEyeCall("screen sprite quad", _AddressOfReturnAddress(), ret)) LogEyeCall("screen sprite quad", ret);
+    oSpriteQuad(self, vertices);
+}
+
 void TraceLine(const char* fmt, ...)
 {
     if (g_trace != Trace::Running || g_traceLines >= 2000) return;
@@ -424,6 +473,10 @@ void LogCamera(BYTE* ctx, BYTE** cams, const float* fovScale)
     if (!cam) return;
     Log("  camera near %.3f far %.1f hfov %.2f deg aspect %.4f", *(float*)(cam + fo2::kCamNear), *(float*)(cam + fo2::kCamFar),
         *(float*)(cam + fo2::kCamFov) * 57.29578f, *(float*)(cam + fo2::kCamAspect));
+    const float* center = (const float*)fo2::kRadialBlurCenter;
+    Log("  post: colour filter %d, speed blur %d passes from %.2f %.2f, strength %.2f x speed %.2f", *(const int*)fo2::kColorFilterOn,
+        *(const int*)fo2::kRadialBlurPasses, center[0], center[1], *(const float*)fo2::kRadialBlurStrength,
+        *(const float*)fo2::kRadialBlurSpeed);
 }
 
 // ---- engine hooks ---------------------------------------------------------------------------
@@ -494,6 +547,69 @@ void __fastcall SetFrustumHook(void* self, void*, const float* fr)
         }
     }
     oSetFrustum(self, fr);
+}
+
+// The sun's glow (the moon's on night tracks) is placed with the camera's frustum, which in an eye is
+// the widened symmetric one: the glow would sit left of the sun in the left eye, right of it in the
+// right eye and lower in both, two glows that do not fuse and shimmer. While an eye renders, the glow
+// gets the eye's frustum and horizontal field of view (its size follows that). It is a screen sprite,
+// drawn in the back buffer's pixel space (see game.h), so it is also given the back buffer's size as
+// the viewport and screen size; the screen shape stays the eye's, which keeps the sprite round.
+static uintptr_t g_sunGlowFn = fo2::kSunGlow;
+
+// (camera, flare)
+static __declspec(naked) void __stdcall CallSunGlow(BYTE*, void*)
+{
+    __asm {
+        push esi
+        push ebx
+        mov esi, [esp + 12]
+        mov ebx, [esp + 16]
+        call dword ptr [g_sunGlowFn]
+        pop ebx
+        pop esi
+        ret 8
+    }
+}
+
+static void __stdcall SunGlow(BYTE* cam, void* flare)
+{
+    if (!g_vrEye.active)
+    {
+        CallSunGlow(cam, flare);
+        return;
+    }
+    float* fr = (float*)(cam + fo2::kCamFrustum);
+    float* fov = (float*)(cam + fo2::kCamFov);
+    float saved[4] = { fr[0], fr[1], fr[2], fr[3] }, savedFov = *fov;
+    float n = fr[4];
+    fr[0] = n * g_vrEye.fov.left;
+    fr[1] = n * g_vrEye.fov.right;
+    fr[2] = n * g_vrEye.fov.down;
+    fr[3] = n * g_vrEye.fov.up;
+    *fov = atanf(g_vrEye.fov.right) - atanf(g_vrEye.fov.left);
+    int* vp = (int*)fo2::kViewportX;
+    int* size = (int*)(*(BYTE**)fo2::kDeviceD3d + fo2::kDevWidth);
+    int savedVp[4] = { vp[0], vp[1], vp[2], vp[3] }, savedSize[2] = { size[0], size[1] };
+    vp[0] = vp[1] = 0;
+    vp[2] = size[0] = (int)g_screenW;
+    vp[3] = size[1] = (int)g_screenH;
+    CallSunGlow(cam, flare);
+    memcpy(fr, saved, sizeof(saved));
+    *fov = savedFov;
+    memcpy(vp, savedVp, sizeof(savedVp));
+    size[0] = savedSize[0];
+    size[1] = savedSize[1];
+}
+
+static __declspec(naked) void SunGlowHook()
+{
+    __asm {
+        push ebx
+        push esi
+        call SunGlow
+        ret
+    }
 }
 
 // ---- device hooks ---------------------------------------------------------------------------
@@ -587,8 +703,107 @@ HRESULT __stdcall SetRenderStateHook(IDirect3DDevice9* dev, D3DRENDERSTATETYPE s
     return oSetRenderState(dev, state, value);
 }
 
+// The stadium screens show the renderer's first screen texture, which its post-processing fills with
+// a reduced copy of the view it has just rendered (see game.h). Rendered per eye, the left eye's
+// screens would show the right eye's view of the frame before and the right eye's the left eye's of
+// this frame: two pictures framed differently that do not fuse. The texture is saved as the left eye
+// finds it and put back before the right eye renders, so both eyes show the same picture.
+IDirect3DTexture9* g_screenTexCopy;
+
+void CopyGameScreenTexture(IDirect3DDevice9* dev, bool save)
+{
+    BYTE* engine = *(BYTE**)fo2::kDeviceD3d;
+    BYTE* wrapper = engine ? *(BYTE**)(engine + fo2::kDevScreenTex) : nullptr;
+    IDirect3DTexture9* game = wrapper ? *(IDirect3DTexture9**)(wrapper + fo2::kTexD3D) : nullptr;
+    D3DSURFACE_DESC d;
+    if (!game || FAILED(game->GetLevelDesc(0, &d))) return;
+    if (g_screenTexCopy)
+    {
+        D3DSURFACE_DESC c;
+        g_screenTexCopy->GetLevelDesc(0, &c);
+        if (c.Width != d.Width || c.Height != d.Height || c.Format != d.Format)
+        {
+            g_screenTexCopy->Release();
+            g_screenTexCopy = nullptr;
+        }
+    }
+    if (!g_screenTexCopy &&
+        (!save || FAILED(dev->CreateTexture(d.Width, d.Height, 1, D3DUSAGE_RENDERTARGET, d.Format, D3DPOOL_DEFAULT, &g_screenTexCopy, nullptr))))
+        return;
+    IDirect3DSurface9 *gameSurface = nullptr, *copySurface = nullptr;
+    if (SUCCEEDED(game->GetSurfaceLevel(0, &gameSurface)) && SUCCEEDED(g_screenTexCopy->GetSurfaceLevel(0, &copySurface)))
+    {
+        if (save)
+            oStretchRect(dev, gameSurface, nullptr, copySurface, nullptr, D3DTEXF_NONE);
+        else
+            oStretchRect(dev, copySurface, nullptr, gameSurface, nullptr, D3DTEXF_NONE);
+    }
+    if (gameSurface) gameSurface->Release();
+    if (copySurface) copySurface->Release();
+}
+
+// The colour filter works on two render textures the size of the back buffer (see game.h): an eye's
+// picture (3072x3264) went through 3840x2160 and back and lost a third of its rows. While the eyes
+// render, the filter's texture wrappers hold textures of the eye's size instead.
+struct FilterTextures
+{
+    IDirect3DTexture9* tex[2] = {};
+    BYTE* wrapper[2] = {};
+    int savedSize[2][2] = {};
+    IDirect3DTexture9* savedTex[2] = {};
+    bool swapped = false;
+} g_filter;
+
+void UseEyeFilterTextures(IDirect3DDevice9* dev)
+{
+    BYTE* engine = *(BYTE**)fo2::kDeviceD3d;
+    BYTE* post = engine ? *(BYTE**)(engine + fo2::kDevPost) : nullptr;
+    if (!post) return;
+    BYTE** wrappers = (BYTE**)(post + fo2::kPostFilterTex);
+    for (int i = 0; i < 2; i++)
+    {
+        IDirect3DTexture9* game = wrappers[i] ? *(IDirect3DTexture9**)(wrappers[i] + fo2::kTexD3D) : nullptr;
+        D3DSURFACE_DESC d;
+        if (!game || FAILED(game->GetLevelDesc(0, &d))) return;
+        if (!g_filter.tex[i] &&
+            FAILED(dev->CreateTexture(g_vrt.w, g_vrt.h, 1, D3DUSAGE_RENDERTARGET, d.Format, D3DPOOL_DEFAULT, &g_filter.tex[i], nullptr)))
+            return;
+    }
+    for (int i = 0; i < 2; i++)
+    {
+        BYTE* w = g_filter.wrapper[i] = wrappers[i];
+        g_filter.savedSize[i][0] = *(int*)(w + fo2::kTexWidth);
+        g_filter.savedSize[i][1] = *(int*)(w + fo2::kTexHeight);
+        g_filter.savedTex[i] = *(IDirect3DTexture9**)(w + fo2::kTexD3D);
+        *(int*)(w + fo2::kTexWidth) = (int)g_vrt.w;
+        *(int*)(w + fo2::kTexHeight) = (int)g_vrt.h;
+        *(IDirect3DTexture9**)(w + fo2::kTexD3D) = g_filter.tex[i];
+    }
+    g_filter.swapped = true;
+}
+
+void RestoreFilterTextures()
+{
+    if (!g_filter.swapped) return;
+    for (int i = 0; i < 2; i++)
+    {
+        BYTE* w = g_filter.wrapper[i];
+        *(int*)(w + fo2::kTexWidth) = g_filter.savedSize[i][0];
+        *(int*)(w + fo2::kTexHeight) = g_filter.savedSize[i][1];
+        *(IDirect3DTexture9**)(w + fo2::kTexD3D) = g_filter.savedTex[i];
+    }
+    g_filter.swapped = false;
+}
+
 void ReleaseVrTargets()
 {
+    if (g_screenTexCopy) g_screenTexCopy->Release();
+    g_screenTexCopy = nullptr;
+    for (IDirect3DTexture9*& t : g_filter.tex)
+    {
+        if (t) t->Release();
+        t = nullptr;
+    }
     for (int i = 0; i < 2; i++)
     {
         if (g_vrt.rt[i]) g_vrt.rt[i]->Release();
@@ -717,12 +932,16 @@ HRESULT __stdcall StretchRectHook(IDirect3DDevice9* dev, IDirect3DSurface9* src,
                                   const RECT* dr, D3DTEXTUREFILTERTYPE f)
 {
     if (g_trace == Trace::Running) TraceLine("StretchRect %s -> %s", Describe(src).c_str(), Describe(dst).c_str());
+    unsigned ret[3];
+    if (NewEyeCall("StretchRect", _AddressOfReturnAddress(), ret)) LogEyeCall("StretchRect", ret, Describe(src) + " -> " + Describe(dst));
     return oStretchRect(dev, src, sr, dst, dr, f);
 }
 
 HRESULT __stdcall SetRenderTargetHook(IDirect3DDevice9* dev, DWORD index, IDirect3DSurface9* s)
 {
     if (g_trace == Trace::Running) TraceLine("SetRenderTarget %u %s", (unsigned)index, Describe(s).c_str());
+    unsigned ret[3];
+    if (NewEyeCall("SetRenderTarget", _AddressOfReturnAddress(), ret)) LogEyeCall("SetRenderTarget", ret, Describe(s));
     if (g_hud.active && index == 0 && s && s == g_hud.gameRT) s = g_hud.rt;
     return oSetRenderTarget(dev, index, s);
 }
@@ -1216,6 +1435,16 @@ bool RenderVrEyes(IDirect3DDevice9* dev, BYTE* ctx, BYTE** cams, float* fovScale
         grass[1] *= g_cfg.vrGrassDistance;
     }
     g_skipLensFlare = true;
+    UseEyeFilterTextures(dev);
+    // The speed blur zooms the bloom out from the middle of the screen, which is the game camera's
+    // straight ahead on a monitor but a different direction in each eye (some 15 degrees to either
+    // side), so the streaks would not match; in the headset real motion shows the speed anyway, and the
+    // blur only smears the picture. It is off in the eyes: their speed factor is 0 (the game sets it
+    // anew every frame; the blur's settings themselves are only filled in at its first use).
+    float* blurSpeed = (float*)fo2::kRadialBlurSpeed;
+    float savedBlurSpeed[4];
+    memcpy(savedBlurSpeed, blurSpeed, sizeof(savedBlurSpeed));
+    memset(blurSpeed, 0, sizeof(savedBlurSpeed));
     for (int eye = 0; eye < 2; eye++)
     {
         float e[16];
@@ -1226,6 +1455,7 @@ bool RenderVrEyes(IDirect3DDevice9* dev, BYTE* ctx, BYTE** cams, float* fovScale
         memcpy(camM2, e, sizeof(e));
         for (int i = 0; i < fo2::kCamViewCount; i++) memcpy(camViews + 16 * i, ev, sizeof(ev));
         *camFov = 2.0f * atanf(cover);
+        CopyGameScreenTexture(dev, eye == 0);
         SetFullViewportGlobals();
         dev->SetRenderTarget(0, g_vrt.rt[eye]);
         dev->SetDepthStencilSurface(g_vrt.ds[eye]);
@@ -1246,6 +1476,8 @@ bool RenderVrEyes(IDirect3DDevice9* dev, BYTE* ctx, BYTE** cams, float* fovScale
     }
     share::EndEyes();
     g_skipLensFlare = false;
+    RestoreFilterTextures();
+    memcpy(blurSpeed, savedBlurSpeed, sizeof(savedBlurSpeed));
     g_gpu.EyesDone();
     screenSize[0] = savedScreen[0];
     screenSize[1] = savedScreen[1];
@@ -1391,6 +1623,9 @@ bool InstallRenderHooks()
 {
     if (!PatchCall(fo2::kRenderViewsCall, fo2::kRenderViews, (const void*)&RenderViewsHook)) return false;
     bool ok = PatchCall(fo2::kLensFlareCall, fo2::kLensFlare, (const void*)&LensFlareHook);
+    ok &= PatchCall(fo2::kSunGlowCall, fo2::kSunGlow, (const void*)&SunGlowHook);
+    ok &= PatchPointer(fo2::kSlotSpriteRect, fo2::kSpriteRect, (const void*)&SpriteRectHook);
+    ok &= PatchPointer(fo2::kSlotSpriteQuad, fo2::kSpriteQuad, (const void*)&SpriteQuadHook);
     ok &= PatchCall(fo2::kHudParticlesCall, fo2::kHudParticles, (const void*)&HudParticlesHook);
     if (!prof::HookParticles()) Log("profiler: particle call differs - not timed");
     if (!PatchTrailFill()) Log("particles: trail fill differs - not patched");
