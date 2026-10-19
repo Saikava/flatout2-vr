@@ -152,6 +152,8 @@ bool g_screenFailLogged;
 struct VrEye
 {
     bool active = false;
+    int index = 0;         // 0 left, 1 right
+    bool cockpit = false;  // seen from the driver's seat (CockpitEye)
     float coverTan = 0;  // tan(fov/2) the camera was given so the engine's culling covers the eye
     xr::EyeFov fov = {};
     // The game camera's own view on the monitor: horizontal field of view (radians) and the tangents
@@ -160,6 +162,8 @@ struct VrEye
     // The monitor the lens flare is drawn on (see LensFlare): tangents of its half angles.
     float flareTanH = 0, flareTanV = 0;
 } g_vrEye;
+float g_sunShare = 1.0f;  // the cockpit: the sun's share seen past the car (MeasureSun)
+float g_cockpitNear;      // and its last near clipping plane (CockpitNear)
 // VR races: the game draws its HUD (everything after RenderViews until Present: HUD, pause menu,
 // the HUD's own particles) into this target instead of the back buffer, over transparent black, so
 // that it can go to the headset on its own panel and be laid over the monitor's picture. The colours
@@ -407,12 +411,22 @@ DWORD FadeOver(DWORD a, DWORD b)
 }
 
 // While on, screen sprites are moved from one picture of the back buffer's pixel space into another
-// (see LensFlare): x' = x * scale[0] + offset[0], y' = y * scale[1] + offset[1].
+// (see LensFlare): x' = x * scale[0] + offset[0], y' = y * scale[1] + offset[1]; and their colours
+// (alpha too) are dimmed by `fade`.
 struct SpriteMap
 {
     bool on = false;
     float scale[2] = { 1, 1 }, offset[2] = {};
+    float fade = 1;
 } g_spriteMap;
+
+DWORD FadeColour(DWORD c, float f)
+{
+    if (f >= 1.0f) return c;
+    DWORD out = 0;
+    for (int shift = 0; shift < 32; shift += 8) out |= (DWORD)lroundf(((c >> shift) & 0xFF) * f) << shift;
+    return out;
+}
 
 void __fastcall SpriteRectHook(void* self, void*, const void* rect)
 {
@@ -440,6 +454,8 @@ void __fastcall SpriteRectHook(void* self, void*, const void* rect)
         float r[9];  // x0, y0, x1, y1, u0, v0, u1, v1, colour
         memcpy(r, rect, sizeof(r));
         for (int i = 0; i < 4; i++) r[i] = r[i] * g_spriteMap.scale[i & 1] + g_spriteMap.offset[i & 1];
+        DWORD& colour = *(DWORD*)&r[8];
+        colour = FadeColour(colour, g_spriteMap.fade);
         oSpriteRect(self, r);
         return;
     }
@@ -455,7 +471,11 @@ void __fastcall SpriteQuadHook(void* self, void*, const void* vertices)
         float v[4][6];  // x, y, z, colour, u, v
         memcpy(v, vertices, sizeof(v));
         for (auto& p : v)
+        {
             for (int i = 0; i < 2; i++) p[i] = p[i] * g_spriteMap.scale[i] + g_spriteMap.offset[i];
+            DWORD& colour = *(DWORD*)&p[3];
+            colour = FadeColour(colour, g_spriteMap.fade);
+        }
         oSpriteQuad(self, v);
         return;
     }
@@ -503,6 +523,19 @@ void LogCamera(BYTE* ctx, BYTE** cams, const float* fovScale)
     if (!cam) return;
     Log("  camera near %.3f far %.1f hfov %.2f deg aspect %.4f", *(float*)(cam + fo2::kCamNear), *(float*)(cam + fo2::kCamFar),
         *(float*)(cam + fo2::kCamFov) * 57.29578f, *(float*)(cam + fo2::kCamAspect));
+    BYTE* player = *(BYTE**)fo2::kLocalPlayer;
+    BYTE* car = player ? *(BYTE**)(player + fo2::kPlayerCar) : nullptr;
+    if (car)
+    {
+        // The camera's place in the car's axes.
+        const float* c = (const float*)(car + fo2::kCarMatrix);
+        const float* m = (const float*)(cam + fo2::kCamMatrix);
+        float d[3] = { m[12] - c[12], m[13] - c[13], m[14] - c[14] }, p[3];
+        for (int i = 0; i < 3; i++) p[i] = d[0] * c[4 * i] + d[1] * c[4 * i + 1] + d[2] * c[4 * i + 2];
+        Log("  camera in the player's car at %.3f %.3f %.3f (right, up, forward), car view mode %d", p[0], p[1], p[2],
+            *(const int*)(car + fo2::kCarViewMode));
+        if (g_vrEye.cockpit) Log("  cockpit: the sun's share past the car %.2f, near clipping plane %.3f m", g_sunShare, g_cockpitNear);
+    }
     const float* center = (const float*)fo2::kRadialBlurCenter;
     Log("  post: colour filter %d, speed blur %d passes from %.2f %.2f, strength %.2f x speed %.2f", *(const int*)fo2::kColorFilterOn,
         *(const int*)fo2::kRadialBlurPasses, center[0], center[1], *(const float*)fo2::kRadialBlurStrength,
@@ -543,6 +576,7 @@ void __fastcall SetCameraHook(void* self, void*, const float* m)
               g_vrEye.active ? " [eye]" : "", _ReturnAddress(), m[0], m[1], m[2], m[8], m[9], m[10], m[12], m[13], m[14]);
     oSetCamera(self, m);
 }
+
 
 void __fastcall SetFrustumHook(void* self, void*, const float* fr)
 {
@@ -666,6 +700,118 @@ static __declspec(naked) void __stdcall CallLensFlare(BYTE*, void*)
     }
 }
 
+// In the cockpit the flare would shine through the roof: the sun's own test leaves the cars out. While
+// the left eye draws its flare, two occlusion queries count the samples of a small square at the sun,
+// at the far end of the depth range: those the eye's picture lets through, and all of them. The flare
+// is dimmed by their share (both eyes alike, a frame or two late, as the queries come back).
+struct SunQuery
+{
+    IDirect3DQuery9* q[2] = {};  // through the picture, all
+    bool issued = false;
+};
+SunQuery g_sunQueries[3];
+bool g_sunLogged;
+
+void ReleaseSunQueries()
+{
+    for (SunQuery& s : g_sunQueries)
+    {
+        for (IDirect3DQuery9*& q : s.q)
+        {
+            if (q) q->Release();
+            q = nullptr;
+        }
+        s.issued = false;
+    }
+}
+
+void DrawSunSquare(IDirect3DDevice9* dev, float x, float y, float half, D3DCMPFUNC test)
+{
+    struct V { float x, y, z, rhw; };
+    const float z = 0.99999f;
+    const V quad[4] = { { x - half, y - half, z, 1 }, { x + half, y - half, z, 1 }, { x - half, y + half, z, 1 }, { x + half, y + half, z, 1 } };
+    dev->SetRenderState(D3DRS_ZFUNC, test);
+    dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, sizeof(V));
+}
+
+void MeasureSun(BYTE* cam, const void* flare)
+{
+    IDirect3DDevice9* dev = *(IDirect3DDevice9**)fo2::kD3DDevice;
+    for (SunQuery& s : g_sunQueries)
+    {
+        DWORD n[2];
+        if (!s.issued || s.q[0]->GetData(&n[0], sizeof(DWORD), 0) != S_OK || s.q[1]->GetData(&n[1], sizeof(DWORD), 0) != S_OK)
+            continue;
+        s.issued = false;
+        if (n[1] > 0) g_sunShare = std::min(1.0f, (float)n[0] / (float)n[1]);
+        if (!g_sunLogged)
+        {
+            g_sunLogged = true;
+            Log("cockpit: sun query %u of %u samples through", (unsigned)n[0], (unsigned)n[1]);
+        }
+    }
+    SunQuery* free = nullptr;
+    for (SunQuery& s : g_sunQueries)
+        if (!s.issued) free = &s;
+    if (!free) return;
+    if (!free->q[0] && (FAILED(dev->CreateQuery(D3DQUERYTYPE_OCCLUSION, &free->q[0])) || FAILED(dev->CreateQuery(D3DQUERYTYPE_OCCLUSION, &free->q[1]))))
+    {
+        ReleaseSunQueries();
+        return;
+    }
+    // The sun in the eye's picture.
+    const float* m = (const float*)(cam + fo2::kCamMatrix);
+    const float* s = (const float*)((const BYTE*)flare + fo2::kFlareSun);
+    float x = s[0] * m[0] + s[1] * m[1] + s[2] * m[2];
+    float y = s[0] * m[4] + s[1] * m[5] + s[2] * m[6];
+    float z = s[0] * m[8] + s[1] * m[9] + s[2] * m[10];
+    if (z <= 0.0f) return;
+    const xr::EyeFov& f = g_vrEye.fov;
+    float W = (float)g_vrt.w, H = (float)g_vrt.h;
+    float px = (x / z - f.left) / (f.right - f.left) * W;
+    float py = (f.up - y / z) / (f.up - f.down) * H;
+    float half = 0.01f / (f.right - f.left) * W;  // some 0.6 degrees, a little more than the sun
+    if (px < -half || px > W + half || py < -half || py > H + half) return;
+
+    // The eye's own target and depth (the flare may come after the post-processing, which leaves the
+    // depth unbound), put back afterwards; the state block keeps the rest.
+    IDirect3DStateBlock9* saved = nullptr;
+    if (FAILED(dev->CreateStateBlock(D3DSBT_ALL, &saved))) return;
+    IDirect3DSurface9 *oldRT = nullptr, *oldDS = nullptr;
+    dev->GetRenderTarget(0, &oldRT);
+    dev->GetDepthStencilSurface(&oldDS);
+    dev->SetRenderTarget(0, g_vrt.rt[0]);
+    dev->SetDepthStencilSurface(g_vrt.ds[0]);
+    D3DVIEWPORT9 vp = { 0, 0, g_vrt.w, g_vrt.h, 0.0f, 1.0f };
+    dev->SetViewport(&vp);
+    dev->SetVertexShader(nullptr);
+    dev->SetPixelShader(nullptr);
+    dev->SetFVF(D3DFVF_XYZRHW);
+    dev->SetTexture(0, nullptr);
+    dev->SetRenderState(D3DRS_ZENABLE, D3DZB_TRUE);
+    dev->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+    dev->SetRenderState(D3DRS_STENCILENABLE, FALSE);
+    dev->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+    dev->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+    dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    dev->SetRenderState(D3DRS_FILLMODE, D3DFILL_SOLID);
+    dev->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
+    dev->SetRenderState(D3DRS_COLORWRITEENABLE, 0);
+    free->q[0]->Issue(D3DISSUE_BEGIN);
+    DrawSunSquare(dev, px, py, half, D3DCMP_LESSEQUAL);
+    free->q[0]->Issue(D3DISSUE_END);
+    free->q[1]->Issue(D3DISSUE_BEGIN);
+    DrawSunSquare(dev, px, py, half, D3DCMP_ALWAYS);
+    free->q[1]->Issue(D3DISSUE_END);
+    free->issued = true;
+    dev->SetRenderTarget(0, oldRT);
+    dev->SetDepthStencilSurface(oldDS);
+    if (oldRT) oldRT->Release();
+    if (oldDS) oldDS->Release();
+    saved->Apply();
+    saved->Release();
+}
+
 static void __stdcall LensFlare(BYTE* cam, void* flare)
 {
     if (!g_vrEye.active)
@@ -673,6 +819,8 @@ static void __stdcall LensFlare(BYTE* cam, void* flare)
         CallLensFlare(cam, flare);
         return;
     }
+    if (g_vrEye.cockpit && g_vrEye.index == 0) MeasureSun(cam, flare);
+    g_spriteMap.fade = g_vrEye.cockpit ? g_sunShare : 1.0f;
     float tanH = g_vrEye.flareTanH, tanV = g_vrEye.flareTanV;
     float* fr = (float*)(cam + fo2::kCamFrustum);
     float* fov = (float*)(cam + fo2::kCamFov);
@@ -914,6 +1062,7 @@ void RestoreFilterTextures()
 
 void ReleaseVrTargets()
 {
+    ReleaseSunQueries();
     if (g_screenTexCopy) g_screenTexCopy->Release();
     g_screenTexCopy = nullptr;
     for (IDirect3DTexture9*& t : g_filter.tex)
@@ -1102,6 +1251,225 @@ bool KeyPressed(int vk, bool& wasDown)
     return pressed;
 }
 
+// [VR] CameraOffset moves the eyes against the car, to set the view from the car just so (say the
+// bonnet camera a little lower and further back for a video). In a race the camera keys move it while
+// they are held: slowly at first, for fine steps, and faster the longer they are held. When they are
+// let go the offset is written to the ini, so the next game starts with it.
+double g_cameraLast, g_cameraHeld;
+bool g_cameraMoved, g_cameraResetWasDown;
+
+void CameraKeys(double now)
+{
+    double dt = std::min(now - g_cameraLast, 0.1);
+    g_cameraLast = now;
+    float* o = g_cfg.vrCameraOffset;
+    bool race = InRace();  // outside races the offset is not seen
+    if (KeyPressed(g_cfg.keyCameraReset, g_cameraResetWasDown) && race)
+    {
+        o[0] = o[1] = o[2] = 0.0f;
+        g_cameraMoved = true;
+    }
+    // Right/left, up/down, forward/back: the axes of the offset, each key pair one way and the other.
+    const int keys[6] = { g_cfg.keyCameraRight, g_cfg.keyCameraLeft, g_cfg.keyCameraUp,
+                          g_cfg.keyCameraDown, g_cfg.keyCameraForward, g_cfg.keyCameraBack };
+    float dir[3] = {};
+    bool held = false;
+    for (int i = 0; i < 6; i++)
+        if (race && keys[i] && HotkeysAllowed() && (GetAsyncKeyState(keys[i]) & 0x8000))
+        {
+            dir[i / 2] += i % 2 ? -1.0f : 1.0f;
+            held = true;
+        }
+    if (held)
+    {
+        // 3 cm a second, and 6 cm a second faster with every second held, up to 25 cm a second.
+        g_cameraHeld += dt;
+        float step = (float)(dt * std::min(0.03 + 0.06 * g_cameraHeld, 0.25));
+        for (int i = 0; i < 3; i++) o[i] += dir[i] * step;
+        g_cameraMoved = true;
+        return;
+    }
+    g_cameraHeld = 0;
+    if (g_cameraMoved)
+    {
+        g_cameraMoved = false;
+        SaveCameraOffset();
+        Log("camera keys: CameraOffset=%.3f %.3f %.3f (right, up, forward)", o[0], o[1], o[2]);
+    }
+}
+
+// [VR] Cockpit: the camera inside the car leaves the player's driver, steering wheel and windows out
+// (see game.h). In the headset the car is shown whole, as from the cameras outside.
+static uintptr_t g_setCarViewFn = fo2::kSetCarView;
+bool g_cockpitView;  // the player's car is seen from inside (its camera chose mode 0)
+
+// The cockpit's eyes: at the driver's face, the front of its head a little below the middle (metres from
+// the middle of the head's box, in the model's axes). There the head is out of sight however one leans:
+// forwards it stays behind, backwards one is inside it, whose faces are seen from behind and left out.
+// The driver's own eyes are some 3 cm behind and 7 cm higher, which in the headset seems too high. The
+// game's camera inside the car is some 40 cm off: in front of the face, above it and towards the middle.
+constexpr float kEyeFromHead[3] = { 0.0f, -0.03f, 0.115f };
+// Where kEyeFromHead puts the male driver's eyes, from the driver's place (in the car's axes): for a
+// head that is not posed (yet).
+constexpr float kDriverEye[3] = { 0.0f, 0.60f, -0.01f };
+
+// The eyes from the driver's place in the car's axes, worked out once a car from its driver's head as the
+// driving animation poses it (the male and the female drivers are made differently), and then kept: the
+// head nods with the animation, the eyes stay put.
+BYTE* g_eyeCar;
+float g_eyeFromSeat[3];
+
+bool HeadEyeFromSeat(BYTE* car, float* out)
+{
+    BYTE* rag = car + fo2::kCarRagdoll;
+    const BYTE* head = *(BYTE**)(rag + fo2::kRagdollSegments);
+    if (!head) return false;
+    const float* m = (const float*)(rag + fo2::kRagdollMatrices) + 16 * fo2::kRagdollHeadBone;
+    const float* c = (const float*)(car + fo2::kCarMatrix);
+    const float* seat = (const float*)(car + fo2::kCarDriverLoc);
+    const float* box = (const float*)(head + fo2::kSegmentBoxMiddle);
+    float p[3], w[3];
+    for (int i = 0; i < 3; i++) p[i] = box[i] + kEyeFromHead[i];
+    for (int i = 0; i < 3; i++) w[i] = p[0] * m[i] + p[1] * m[4 + i] + p[2] * m[8 + i] + m[12 + i] - c[12 + i];
+    for (int i = 0; i < 3; i++) out[i] = w[0] * c[4 * i] + w[1] * c[4 * i + 1] + w[2] * c[4 * i + 2] - seat[i];
+    return fabsf(out[0]) < 0.3f && out[1] > 0.3f && out[1] < 1.0f && fabsf(out[2]) < 0.4f;  // else not posed yet
+}
+
+void DriverEyeFromSeat(BYTE* car, float* out)
+{
+    if (car != g_eyeCar && HeadEyeFromSeat(car, g_eyeFromSeat))
+    {
+        g_eyeCar = car;
+        Log("cockpit: the eyes %.3f %.3f %.3f from the driver's place", g_eyeFromSeat[0], g_eyeFromSeat[1], g_eyeFromSeat[2]);
+    }
+    memcpy(out, car == g_eyeCar ? g_eyeFromSeat : kDriverEye, sizeof(g_eyeFromSeat));
+}
+
+// When the eyes look from inside the player's car, the camera's placement moves to the driver's eyes,
+// fixed in the car (the driver's own node flies off with it when it is thrown out). Which camera the view
+// has comes out while the view renders (CarViewMode): this is the last frame's, so a cut from the camera
+// inside to one outside is told by the distance.
+bool CockpitEye(float* anchor)
+{
+    if (!g_cockpitView || !g_cfg.vrCockpit) return false;
+    BYTE* player = *(BYTE**)fo2::kLocalPlayer;
+    BYTE* car = player ? *(BYTE**)(player + fo2::kPlayerCar) : nullptr;
+    if (!car) return false;
+    const float* m = (const float*)(car + fo2::kCarMatrix);
+    const float* seat = (const float*)(car + fo2::kCarDriverLoc);
+    float eyeFromSeat[3];
+    DriverEyeFromSeat(car, eyeFromSeat);
+    float p[3] = { seat[0] + eyeFromSeat[0], seat[1] + eyeFromSeat[1], seat[2] + eyeFromSeat[2] };
+    float eye[3], d2 = 0;
+    for (int i = 0; i < 3; i++)
+    {
+        eye[i] = m[12 + i] + p[0] * m[i] + p[1] * m[4 + i] + p[2] * m[8 + i];
+        d2 += (eye[i] - anchor[12 + i]) * (eye[i] - anchor[12 + i]);
+    }
+    if (d2 > 1.0f) return false;
+    memcpy(anchor + 12, eye, sizeof(eye));
+    return true;
+}
+
+// The drivers' hands follow the steering through the driving animation's frames, one step every 0.02 of
+// the steering's travel (see game.h, kSampleAnim): turning slowly the hands stop and jump. The two frames
+// either side are sampled and the bones' matrices blended between them by how far the steering is
+// past the first.
+static uintptr_t g_sampleAnimFn = fo2::kSampleAnim;
+
+// (animation, node, t, matrices, mode in edx)
+static __declspec(naked) void __stdcall CallSampleAnim(void*, void*, float, float*, int)
+{
+    __asm {
+        mov edx, [esp + 20]
+        push dword ptr [esp + 16]
+        push dword ptr [esp + 16]
+        push dword ptr [esp + 16]
+        push dword ptr [esp + 16]
+        call dword ptr [g_sampleAnimFn]
+        ret 20
+    }
+}
+
+// a's rows moved towards b's by w, each scaled back to the length it has between the two.
+void BlendMatrix(float* a, const float* b, float w)
+{
+    for (int r = 0; r < 4; r++)
+    {
+        float* x = a + 4 * r;
+        const float* y = b + 4 * r;
+        float la = sqrtf(x[0] * x[0] + x[1] * x[1] + x[2] * x[2]), lb = sqrtf(y[0] * y[0] + y[1] * y[1] + y[2] * y[2]);
+        for (int i = 0; i < 4; i++) x[i] += (y[i] - x[i]) * w;
+        if (r == 3) continue;
+        float l = sqrtf(x[0] * x[0] + x[1] * x[1] + x[2] * x[2]);
+        if (l > 1e-6f)
+            for (int i = 0; i < 3; i++) x[i] *= (la + (lb - la) * w) / l;
+    }
+}
+
+static void __stdcall SampleAnimSmooth(BYTE* anim, void* node, float t, float* out, int mode)
+{
+    int bones = *(int*)(anim + fo2::kAnimBones);
+    int span = *(int*)(anim + fo2::kAnimEnd) - *(int*)(anim + fo2::kAnimStart);
+    int step = *(int*)(anim + fo2::kAnimFrameTime);
+    if (mode != 0 || bones <= 0 || bones > 32 || span <= 1 || step <= 0)
+    {
+        CallSampleAnim(anim, node, t, out, mode);
+        return;
+    }
+    // The frame the game would take and the next one, each sampled in the middle of its time.
+    float f = std::clamp(t, 0.0f, 1.0f) * (float)(span - 1) / (float)step;
+    int last = (span - 1) / step;
+    int f0 = std::min((int)f, last), f1 = std::min(f0 + 1, last);
+    float w = f - (float)f0;
+    auto at = [&](int k) { return std::min(1.0f, ((float)k * step + 0.5f * step) / (float)(span - 1)); };
+    if (f1 == f0 || w < 0.01f)
+    {
+        CallSampleAnim(anim, node, at(f0), out, mode);
+        return;
+    }
+    float next[32 * 16];
+    CallSampleAnim(anim, node, at(f1), next, mode);
+    CallSampleAnim(anim, node, at(f0), out, mode);  // last, as the game leaves it
+    for (int i = 0; i < bones; i++) BlendMatrix(out + 16 * i, next + 16 * i, w);
+}
+
+// At kSampleAnimCall, instead of kSampleAnim.
+static __declspec(naked) void SampleAnimHook()
+{
+    __asm {
+        push edx
+        push dword ptr [esp + 20]
+        push dword ptr [esp + 20]
+        push dword ptr [esp + 20]
+        push dword ptr [esp + 20]
+        call SampleAnimSmooth
+        ret 16
+    }
+}
+
+static int __stdcall CarViewMode(int mode, BYTE* car)
+{
+    BYTE* player = *(BYTE**)fo2::kLocalPlayer;
+    if (!player || car != *(BYTE**)(player + fo2::kPlayerCar)) return mode;
+    g_cockpitView = mode == 0;
+    bool cockpit = g_cockpitView && g_cfg.vrCockpit && xr::Running();
+    return cockpit ? 1 : mode;
+}
+
+// At kCarViewCall, instead of kSetCarView (car in ecx, mode in eax).
+static __declspec(naked) void CarViewHook()
+{
+    __asm {
+        push ecx
+        push ecx
+        push eax
+        call CarViewMode
+        pop ecx
+        jmp dword ptr [g_setCarViewFn]
+    }
+}
+
 // [VR] Hud=2: the HUD panel is left out while the race runs, and comes back for its start (the
 // countdown), the pause menu and the results. The race state stays "racing" in the pause menu; that
 // the game is paused shows in the physics instead: a running race steps the world in every frame, a
@@ -1264,6 +1632,7 @@ int __fastcall EnginePresentHook(void* self, void*)
     // VR: whatever the race path did not submit this frame is shown on the flat screen.
     xr::PollEvents();
     if (KeyPressed(g_cfg.keyRecenter, g_recenterKeyWasDown)) xr::Recenter();
+    CameraKeys(now);
     if (xr::Running() && !g_vrFrameDone)
     {
         double w0 = NowSeconds();
@@ -1408,10 +1777,20 @@ void EyeBlurCenter(const float center[2], const xr::EyePose& p, const xr::EyeFov
     out[1] = std::clamp((f.up - y / z) / (f.up - f.down), -100.0f, 100.0f);
 }
 
-// Test: the head moved by [Test] HeadOffset and turned about the vertical axis (the background
-// mode's "head" command).
-void ApplyTestHead(xr::EyePose& p)
+// The eyes moved by [VR] CameraOffset, and for tests the head by [Test] HeadOffset, tilted up and
+// turned about the vertical axis (the background mode's "head" command).
+void ApplyHeadOffsets(xr::EyePose& p)
 {
+    if (g_cfg.testHeadPitchDeg != 0.0f)
+    {
+        float a = g_cfg.testHeadPitchDeg * 0.017453293f, c = cosf(a), s = sinf(a);
+        for (float* v : { p.right, p.up, p.forward, p.position })
+        {
+            float y = v[1], z = v[2];
+            v[1] = y * c + z * s;
+            v[2] = -y * s + z * c;
+        }
+    }
     if (g_cfg.testHeadYawDeg != 0.0f)
     {
         float a = g_cfg.testHeadYawDeg * 0.017453293f, c = cosf(a), s = sinf(a);
@@ -1422,7 +1801,7 @@ void ApplyTestHead(xr::EyePose& p)
             v[2] = -x * s + z * c;
         }
     }
-    for (int i = 0; i < 3; i++) p.position[i] += g_cfg.testHeadOffset[i];
+    for (int i = 0; i < 3; i++) p.position[i] += g_cfg.testHeadOffset[i] + g_cfg.vrCameraOffset[i];
 }
 
 // Runtimes give both eyes the head's orientation, up to rounding: made exactly the same, so the
@@ -1457,6 +1836,58 @@ void BuildEyeMatrix(const float* anchor, const xr::EyePose& p, float* e)
     }
     e[3] = e[7] = e[11] = 0.0f;
     e[15] = 1.0f;
+}
+
+// The cockpit's near clipping plane, as far out as the cabin lets it be. The depth's 24 bits are spread
+// out from the near plane: a few centimetres away, what lies a millimetre or two apart some tens of
+// metres off (a sign's face on its board) comes out at the same depth, in bands. Nearest to the eyes in
+// the cockpit are the roof over the head and the sides beside it (the cabin's box, less some 3 cm of roof
+// and doors), and a plane at h from the eye, its normal N towards it, comes no nearer along the view than
+// h over the largest v . N of the corner directions v = (x, y, 1) of an eye's frustum (in its axes).
+float CockpitNear(const float* anchor, const xr::EyePose* pose, const xr::EyeFov* fov, float maxNear)
+{
+    float nearest = maxNear;
+    BYTE* player = *(BYTE**)fo2::kLocalPlayer;
+    BYTE* car = player ? *(BYTE**)(player + fo2::kPlayerCar) : nullptr;
+    if (car)
+    {
+        const float* m = (const float*)(car + fo2::kCarMatrix);
+        const float* lo = (const float*)(car + fo2::kCarCabinMin);
+        const float* hi = (const float*)(car + fo2::kCarCabinMax);
+        const float* com = (const float*)(car + fo2::kCarCentreOfMass);
+        const float wall = 0.03f;
+        for (int eye = 0; eye < 2; eye++)
+        {
+            float e[16], c[4][3];  // the eye's right, up, forward and place in the car's axes
+            BuildEyeMatrix(anchor, pose[eye], e);
+            for (int r = 0; r < 4; r++)
+                for (int i = 0; i < 3; i++)
+                {
+                    const float* v = e + 4 * r;
+                    float d[3] = { v[0], v[1], v[2] };
+                    if (r == 3)
+                        for (int k = 0; k < 3; k++) d[k] -= m[12 + k];
+                    c[r][i] = d[0] * m[4 * i] + d[1] * m[4 * i + 1] + d[2] * m[4 * i + 2];
+                }
+            // The roof (normal up), the left and the right side.
+            const struct { int axis; float sign, h; } planes[] = {
+                { 1, 1.0f, hi[1] - com[1] - wall - c[3][1] },
+                { 0, -1.0f, c[3][0] - (lo[0] - com[0] + wall) },
+                { 0, 1.0f, hi[0] - com[0] - wall - c[3][0] },
+            };
+            for (const auto& p : planes)
+            {
+                if (p.h <= 0.0f) continue;  // the head out of the box
+                float most = 0.0f;
+                for (float x : { fov[eye].left, fov[eye].right })
+                    for (float y : { fov[eye].down, fov[eye].up })
+                        most = std::max(most, p.sign * (x * c[0][p.axis] + y * c[1][p.axis] + c[2][p.axis]));
+                if (most > 0.0f) nearest = std::min(nearest, p.h / most);
+            }
+        }
+    }
+    g_cockpitNear = std::clamp(0.85f * nearest, g_cfg.vrNearClip, maxNear);
+    return g_cockpitNear;
 }
 
 // The engine's back buffer size (DeviceD3d fields), which its post-processing uses for the
@@ -1656,7 +2087,10 @@ bool RenderVrEyes(IDirect3DDevice9* dev, BYTE* ctx, BYTE** cams, float* fovScale
     float* camViews = (float*)(cam + fo2::kCamViews);
     float* camFov = (float*)(cam + fo2::kCamFov);
     float anchor[16], anchor2[16], views[fo2::kCamViewCount * 16];
+    float savedCam[16];
+    memcpy(savedCam, camM, sizeof(savedCam));
     memcpy(anchor, camM, sizeof(anchor));
+    bool cockpit = CockpitEye(anchor);
     memcpy(anchor2, camM2, sizeof(anchor2));
     memcpy(views, camViews, sizeof(views));
     float savedFov = *camFov;
@@ -1672,8 +2106,8 @@ bool RenderVrEyes(IDirect3DDevice9* dev, BYTE* ctx, BYTE** cams, float* fovScale
     // the wider it is, the smaller and simpler everything is drawn.
     xr::EyeFov fov[2] = { xr::Fov(0), xr::Fov(1) };
     xr::EyePose pose[2] = { xr::Pose(0), xr::Pose(1) };
-    ApplyTestHead(pose[0]);
-    ApplyTestHead(pose[1]);
+    ApplyHeadOffsets(pose[0]);
+    ApplyHeadOffsets(pose[1]);
     SameDirection(pose);
     if (!rec::ReplayView(pose, fov)) rec::RecordView(pose, fov);
     // The speed zoom ([VR] SpeedZoom): at speed the game widens its horizontal field of view (by fovScale,
@@ -1722,6 +2156,12 @@ bool RenderVrEyes(IDirect3DDevice9* dev, BYTE* ctx, BYTE** cams, float* fovScale
     float* camFar = (float*)(cam + fo2::kCamFar);
     float savedFar = *camFar;
     if (g_cfg.vrViewDistance > 0.0f) *camFar = savedFar * g_cfg.vrViewDistance;
+    // The near clipping plane: the camera inside the car leaves out what is nearer than 0.3 m, which in
+    // the cockpit is the roof over one's head and the pillars beside it (CockpitNear; [VR] NearClip the
+    // nearest it may come).
+    float* camNear = (float*)(cam + fo2::kCamNear);
+    float savedNear = *camNear;
+    if (cockpit && g_cfg.vrNearClip > 0.0f) *camNear = CockpitNear(anchor, pose, fov, savedNear);
     // Grass ends (fading out) a fixed distance ahead, which in the headset is plainly in view:
     // [VR] GrassDistance moves both ends of it.
     float* grass = (float*)(ctx + fo2::kCtxPlantFar);
@@ -1786,6 +2226,8 @@ bool RenderVrEyes(IDirect3DDevice9* dev, BYTE* ctx, BYTE** cams, float* fovScale
         dev->SetDepthStencilSurface(g_vrt.ds[eye]);
         dev->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL, 0, 1.0f, 0);
         g_vrEye.active = true;
+        g_vrEye.index = eye;
+        g_vrEye.cockpit = cockpit;
         g_vrEye.coverTan = cover;
         g_vrEye.fov = fov[eye];
         share::BeginEye(eye);
@@ -1811,6 +2253,7 @@ bool RenderVrEyes(IDirect3DDevice9* dev, BYTE* ctx, BYTE** cams, float* fovScale
     grass[0] = savedGrass[0];
     grass[1] = savedGrass[1];
     *camFar = savedFar;
+    *camNear = savedNear;
     dev->SetRenderTarget(0, oldRT);
     dev->SetDepthStencilSurface(oldDS);
     if (oldRT) oldRT->Release();
@@ -1819,10 +2262,11 @@ bool RenderVrEyes(IDirect3DDevice9* dev, BYTE* ctx, BYTE** cams, float* fovScale
     {
         g_saveEyesThisFrame = false;
         g_eyeShotPending = true;  // saved at Present, as they go to the headset
-        Log("VR eye fov: left %.3f %.3f %.3f %.3f, right %.3f %.3f %.3f %.3f (tan l r u d), cover %.3f", fov[0].left, fov[0].right,
-            fov[0].up, fov[0].down, fov[1].left, fov[1].right, fov[1].up, fov[1].down, cover);
+        Log("VR eye fov: left %.3f %.3f %.3f %.3f, right %.3f %.3f %.3f %.3f (tan l r u d), cover %.3f%s", fov[0].left, fov[0].right,
+            fov[0].up, fov[0].down, fov[1].left, fov[1].right, fov[1].up, fov[1].down, cover, cockpit ? ", cockpit" : "");
+        if (cockpit) Log("cockpit: the sun's share past the car %.2f, near clipping plane %.3f m", g_sunShare, g_cockpitNear);
     }
-    memcpy(camM, anchor, sizeof(anchor));
+    memcpy(camM, savedCam, sizeof(savedCam));
     memcpy(camM2, anchor2, sizeof(anchor2));
     memcpy(camViews, views, sizeof(views));
     *camFov = savedFov;
@@ -1947,6 +2391,10 @@ bool InstallRenderHooks()
     if (!PatchTrailFill()) Log("particles: trail fill differs - not patched");
     if (g_cfg.vrEnabled && !PatchLodDistance(g_cfg.vrLodDistance)) Log("level of detail: code differs - distances unchanged");
     if (g_cfg.vrEnabled) Log(share::Install() ? "eyes: the right eye reuses the left eye's leaf and grass cards" : "eyes: leaf pass differs - each eye builds its own");
+    if (g_cfg.vrEnabled && !PatchCall(fo2::kCarViewCall, fo2::kSetCarView, (const void*)&CarViewHook))
+        Log("cockpit: the car view call differs - the camera inside the car shows no driver");
+    if (g_cfg.vrEnabled && !PatchCall(fo2::kSampleAnimCall, fo2::kSampleAnim, (const void*)&SampleAnimHook))
+        Log("drivers: the animation call differs - the hands move in the animation's steps");
     ok &= PatchPointer(fo2::kSlotSetViewport, fo2::kSetViewport, (const void*)&SetViewportHook);
     ok &= PatchPointer(fo2::kSlotSetCamera, fo2::kSetCamera, (const void*)&SetCameraHook);
     ok &= PatchPointer(fo2::kSlotSetFrustum, fo2::kSetFrustum, (const void*)&SetFrustumHook);

@@ -6,7 +6,9 @@
 //   down KEY / up KEY / tap KEY   hold, release, or press briefly (KEY: ENTER, ESC, SPACE, UP,
 //                                 DOWN, LEFT, RIGHT, F1..F12, A..Z, 0..9 or a DIK code like 0x1C)
 //   shot                          screenshot (like F11)
-//   head X Y Z YAW                the test head offset (metres) and turn (degrees to the right)
+//   head X Y Z YAW [PITCH]        the test head offset (metres), turn (degrees to the right) and tilt
+//                                 (degrees up)
+//   camera X Y Z                  [VR] CameraOffset (metres), written to the ini as the camera keys do
 //   trace                         log one frame of render calls
 //   log TEXT                      a line in FO2VR.log
 // Lines appended to the file are carried out once a frame.

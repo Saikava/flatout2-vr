@@ -60,6 +60,10 @@ constexpr int kDevHeight = 0xC;
 // sized by the viewport's width over the field of view (kCamFov), and draws them as screen sprites.
 constexpr uintptr_t kLensFlareCall = 0x4CBBDA;
 constexpr uintptr_t kLensFlare = 0x596980;
+// The flare's sun: float[3], from the camera (the sun is drawn at the camera's position plus this).
+// How much of it the flare shows comes from the sun's own test, a small render toward it (0x5962xx)
+// that has the track and its objects but not the cars.
+constexpr int kFlareSun = 0x15C;
 
 // The sun's glow: the sky pass (0x592470) calls 0x596540 with the camera in esi and the track's flare
 // in ebx. It projects the sun with the camera's own frustum (kCamFrustum) and draws the glow there as
@@ -299,6 +303,52 @@ constexpr uintptr_t kLocalPlayer = 0x6B21F8;  // Player*
 constexpr int kPlayerCar = 0x33C;             // Car*
 constexpr int kCarMatrix = 0x1B0;             // float[16], rows right, up, forward, position
 constexpr int kCarVelocity = 0x280;           // float[3], m/s
+// Each frame the race renderer (0x4C9B80, per view) shows every car as the view needs it: at 0x4C9D23 it
+// calls 0x43DAD0 (car in ecx, mode in eax). Mode 1 shows the whole car with its driver and steering
+// wheel; the car the view follows gets its camera's choice instead (the camera's vfunc 8): 0 for the
+// camera inside the car, which leaves the driver (kCarDriver), the steering wheel (kCarSteeringWheel)
+// and the windows (the car's materials of shader 6, listed from kCarWindows: flag 0x10000 at +8) out,
+// or 2 with no car at all. The driver and the steering wheel are scene nodes, left out by flag 2 at
+// +0x10. The car keeps the mode at kCarViewMode.
+constexpr uintptr_t kCarViewCall = 0x4C9D23;
+constexpr uintptr_t kSetCarView = 0x43DAD0;
+constexpr int kCarViewMode = 0x291C;
+// The driver (the male or the female model) is placed at the car's DriverLoc (the seat, below the hips),
+// with the car's axes. The camera inside the car is placed from there too (its PositionType 4 in the
+// car's camera.ini), in front of the driver's head and above it, differently in every car.
+constexpr int kCarDriver = 0x2AC0;         // scene node*
+// The driver's place in the car's axes (kCarMatrix): DriverLoc (at +0x1CA4) less the centre of mass
+// (+0x1C60). The camera inside the car is placed from it (0x4D0070).
+constexpr int kCarDriverLoc = 0x1C78;      // float[3]
+// The cabin's box (CollisionTopMin and Max in the car's body.ini, float[3] each, read at 0x433E5E), in
+// the model's axes: less the centre of mass (kCarCentreOfMass) they are in kCarMatrix's.
+constexpr int kCarCabinMin = 0x190;
+constexpr int kCarCabinMax = 0x19C;
+constexpr int kCarCentreOfMass = 0x1C60;   // float[3]
+// The driver's ragdoll (+0x2A90) keeps its 11 bones' skinning matrices from +0x50 (float[16] each, model
+// to world, in the order of data/drivers/ragdoll/male_bones.ini or female_bones.ini: the lower torso
+// first, the head 7th), posed in every frame from the driving animation while the driver sits in the
+// car, before the frame is drawn. At +0 it points to its segments (the head first), each a box placed
+// in the model's axes by a matrix (float[16], the box's middle at +0x30). Every car step
+// poses it from the steering (0x57C970, called at 0x4295E4): the animation (ragdoll +0x858) is sampled
+// at (steering + 1) / 2 of its length by 0x57ADA0 (at 0x57CA2F), __stdcall(animation, node, float t,
+// float* matrices), edx = 0. That takes the time floor(t * (length - 1)) and gives every bone its pose
+// of the frame there, without blending the next: the driving animation has 100 frames over the
+// steering's whole travel, and the hands move in steps.
+constexpr int kCarRagdoll = 0x2A90;
+constexpr int kRagdollMatrices = 0x50;
+constexpr int kRagdollHeadBone = 6;
+constexpr int kRagdollSegments = 0x0;    // the head's segment first
+constexpr int kSegmentBoxMiddle = 0x30;  // float[3], the model's axes
+constexpr uintptr_t kSampleAnimCall = 0x57CA2F;
+constexpr uintptr_t kSampleAnim = 0x57ADA0;
+// An animation: its bone count (+0), start and end time (+4, +8), time per frame (+0x14).
+constexpr int kAnimBones = 0x0;
+constexpr int kAnimStart = 0x4;
+constexpr int kAnimEnd = 0x8;
+constexpr int kAnimFrameTime = 0x14;
+constexpr int kCarSteeringWheel = 0x32F0;  // scene node*
+constexpr int kCarWindows = 0x45BC;        // begin, end of an array of pointers
 
 // ---- game state -----------------------------------------------------------------------------
 constexpr uintptr_t kGameFlow = 0x8E8410;  // GameFlow*

@@ -114,6 +114,7 @@ void LoadConfig()
     wchar_t offset[64] = L"";
     GetPrivateProfileStringW(L"Test", L"HeadOffset", L"0 0 0", offset, 64, p);
     swscanf(offset, L"%f %f %f", &g_cfg.testHeadOffset[0], &g_cfg.testHeadOffset[1], &g_cfg.testHeadOffset[2]);
+    g_cfg.testFakeHeadset = GetPrivateProfileIntW(L"Test", L"FakeHeadset", d.testFakeHeadset, p) != 0;
     g_cfg.testRecord = GetPrivateProfileIntW(L"Test", L"Record", d.testRecord, p) != 0;
     g_cfg.testReplay = GetPrivateProfileIntW(L"Test", L"Replay", d.testReplay, p) != 0;
     g_cfg.testFrameTimes = GetPrivateProfileIntW(L"Test", L"FrameTimes", d.testFrameTimes, p) != 0;
@@ -153,10 +154,35 @@ void LoadConfig()
     g_cfg.vrViewDistance = IniFloat(p, L"VR", L"ViewDistance", d.vrViewDistance);
     g_cfg.vrSpeedBlur = GetPrivateProfileIntW(L"VR", L"SpeedBlur", d.vrSpeedBlur, p) != 0;
     g_cfg.vrSpeedZoom = IniFloat(p, L"VR", L"SpeedZoom", d.vrSpeedZoom);
+    {
+        wchar_t buf[64] = L"";
+        GetPrivateProfileStringW(L"VR", L"CameraOffset", L"0 0 0", buf, 64, p);
+        float* o = g_cfg.vrCameraOffset;
+        swscanf(buf, L"%f %f %f", &o[0], &o[1], &o[2]);
+    }
+    g_cfg.vrCockpit = GetPrivateProfileIntW(L"VR", L"Cockpit", d.vrCockpit, p) != 0;
+    g_cfg.vrNearClip = IniFloat(p, L"VR", L"NearClip", d.vrNearClip);
     g_cfg.keyRecenter = GetPrivateProfileIntW(L"Keys", L"Recenter", d.keyRecenter, p);
     g_cfg.logIntervalSeconds = IniFloat(p, L"Log", L"IntervalSeconds", d.logIntervalSeconds);
     g_cfg.keyScreenshot = GetPrivateProfileIntW(L"Keys", L"Screenshot", d.keyScreenshot, p);
     g_cfg.keyHud = GetPrivateProfileIntW(L"Keys", L"Hud", d.keyHud, p);
+    g_cfg.keyCameraUp = GetPrivateProfileIntW(L"Keys", L"CameraUp", d.keyCameraUp, p);
+    g_cfg.keyCameraDown = GetPrivateProfileIntW(L"Keys", L"CameraDown", d.keyCameraDown, p);
+    g_cfg.keyCameraLeft = GetPrivateProfileIntW(L"Keys", L"CameraLeft", d.keyCameraLeft, p);
+    g_cfg.keyCameraRight = GetPrivateProfileIntW(L"Keys", L"CameraRight", d.keyCameraRight, p);
+    g_cfg.keyCameraForward = GetPrivateProfileIntW(L"Keys", L"CameraForward", d.keyCameraForward, p);
+    g_cfg.keyCameraBack = GetPrivateProfileIntW(L"Keys", L"CameraBack", d.keyCameraBack, p);
+    g_cfg.keyCameraReset = GetPrivateProfileIntW(L"Keys", L"CameraReset", d.keyCameraReset, p);
+}
+
+void SaveCameraOffset()
+{
+    std::wstring ini = ModuleDir() + L"FO2VR.ini";
+    const float* o = g_cfg.vrCameraOffset;
+    wchar_t buf[64];
+    swprintf(buf, 64, L"%.3f %.3f %.3f", o[0], o[1], o[2]);
+    // Replaces the whole line (an ini without the key gets it at the end of [VR]).
+    WritePrivateProfileStringW(L"VR", L"CameraOffset", buf, ini.c_str());
 }
 
 double NowSeconds()

@@ -257,8 +257,17 @@ void RunCommand(std::string line)
     if (cmd == "head")
     {
         float* o = g_cfg.testHeadOffset;
-        sscanf(arg.c_str(), "%f %f %f %f", &o[0], &o[1], &o[2], &g_cfg.testHeadYawDeg);
-        Log("input file: head offset %.2f %.2f %.2f, yaw %.1f", o[0], o[1], o[2], g_cfg.testHeadYawDeg);
+        g_cfg.testHeadPitchDeg = 0;
+        sscanf(arg.c_str(), "%f %f %f %f %f", &o[0], &o[1], &o[2], &g_cfg.testHeadYawDeg, &g_cfg.testHeadPitchDeg);
+        Log("input file: head offset %.2f %.2f %.2f, yaw %.1f, pitch %.1f", o[0], o[1], o[2], g_cfg.testHeadYawDeg, g_cfg.testHeadPitchDeg);
+        return;
+    }
+    if (cmd == "camera")
+    {
+        float* o = g_cfg.vrCameraOffset;
+        sscanf(arg.c_str(), "%f %f %f", &o[0], &o[1], &o[2]);
+        SaveCameraOffset();
+        Log("input file: CameraOffset=%.3f %.3f %.3f", o[0], o[1], o[2]);
         return;
     }
     if (cmd == "log")

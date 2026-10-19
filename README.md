@@ -5,6 +5,9 @@ refresh rate, with the HUD on a panel in front of you.
 
 - **Stereo 3D and head tracking** in every race camera: lean out of the window, look back at the wrecks
   behind you.
+- **A cockpit**: the game's camera inside the car puts you in the driver's seat, with the driver's hands
+  on the steering wheel, the dashboard, the roof and the pillars around you (the game itself shows no
+  driver and no steering wheel there). Press C in a race until you are inside the car.
 - **Smooth motion at 72 / 90 / 120 Hz**: the physics steps once per headset frame, so the world moves
   evenly at any refresh rate. The game's own steps are capped at 100 a second.
 - **HUD on a floating panel**: position, laps, speedometer, map and the pause menu. Menus between
@@ -58,6 +61,7 @@ The game's controls are unchanged.
 | --- | --- |
 | F8  | Recenter the view (sit as you want to sit in the car and press it) |
 | F9  | Hide the HUD while racing, or bring it back (it still shows for the countdown, the pause menu and the results) |
+| Numpad 8 2 4 6, + - | Move the view against the car while held: up, down, left, right, forward, back (slowly at first), e.g. to sit a little lower in the cockpit. Numpad 5 puts it back. The view stays where you left it for the next game. Num Lock must be on |
 | F11 | Screenshot of the monitor, both eyes and the HUD (into `scripts\shots\`) |
 
 ## Settings
@@ -70,6 +74,9 @@ The game's controls are unchanged.
 | `MSAA` | 4 | Antialiasing samples (0 = off) |
 | `WorldScale` | 1.0 | Head movement scale |
 | `Hud`, `HudDistance`, `HudWidth`, `HudHeight` | 1, 1.2, 1.3, 0.0 | The HUD panel: on/off (2 = not while racing, as with F9), distance, width, height (meters) |
+| `Cockpit` | 1 | The camera inside the car is a cockpit (0: as the game shows it, from in front of the driver's head with no driver) |
+| `CameraOffset` | 0 0 0 | The view moved against the car, meters (right, up, forward): in the cockpit from the driver's eyes; the numpad keys set it |
+| `NearClip` | 0.05 | The cockpit's near clipping plane comes no nearer than this (meters); it is kept as far out as the roof and the sides allow |
 | `ScreenDistance`, `ScreenWidth` | 2.0, 2.4 | The menus' virtual screen (meters) |
 | `Mirror` | 1 | The monitor shows the left eye (0: the game's own view, costs a third render) |
 | `PhysicsAtHeadsetRate` | 1 | One physics step per headset frame (0: the game's 10 ms steps) |

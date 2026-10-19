@@ -25,6 +25,8 @@ struct Config
     bool stepProbe = false;  // log how evenly the player's car moves from frame to frame
     float testHeadOffset[3] = {};  // metres added to the eye positions (x right, y up, z forward)
     float testHeadYawDeg = 0;      // the head turned right by this much (background mode command "head")
+    float testHeadPitchDeg = 0;    // and up by this much
+    bool testFakeHeadset = false;  // no runtime: races render the eyes straight ahead (with PaceHz, VrEyesWithoutHeadset)
     bool testBackground = false;  // window on another monitor, no sound, keys from a file (background.h)
     bool testSampling = false;    // profiler: sample where the game thread runs (slow frames are logged)
     bool testShareEyes = true;     // the right eye copies the left eye's leaf and grass cards (0: each eye builds its own)
@@ -54,15 +56,23 @@ struct Config
     float vrViewDistance = 3.0f;   // the far clipping distance times this
     bool vrSpeedBlur = true;       // races: the game's speed blur in the eyes
     float vrSpeedZoom = 1.0f;      // races: the game's widening of the field of view at speed, times this
+    float vrCameraOffset[3] = {};  // races: metres the eyes are moved against the car (x right, y up, z forward)
+    bool vrCockpit = true;         // the camera inside the car shows the driver, the steering wheel and the windows
+    float vrNearClip = 0.05f;      // the cockpit: the eyes' near clipping distance, metres (0: the camera's own)
     // [Log]
     float logIntervalSeconds = 2.0f;
     // [Keys]
     int keyScreenshot = 0x7A;  // F11
     int keyRecenter = 0x77;    // F8
     int keyHud = 0x78;         // F9: Hud 1 <-> 2
+    // [VR] CameraOffset while held (the numeric keypad: 8 2 4 6, + -), and back to 0 (5)
+    int keyCameraUp = 0x68, keyCameraDown = 0x62, keyCameraLeft = 0x64, keyCameraRight = 0x66;
+    int keyCameraForward = 0x6B, keyCameraBack = 0x6D, keyCameraReset = 0x65;
 };
 extern Config g_cfg;
 void LoadConfig();
+// Writes [VR] CameraOffset to the ini (the camera keys changed it).
+void SaveCameraOffset();
 
 double NowSeconds();
 

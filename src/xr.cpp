@@ -502,8 +502,23 @@ void EndFrame(const XrCompositionLayerBaseHeader* layer, const XrCompositionLaye
 
 }  // namespace
 
+// [Test] FakeHeadset: no runtime at all. The session counts as running, never has a frame, and its
+// eyes look straight ahead (DefaultViews), so races render the eyes for screenshots (the eyes' test
+// path, PaceHz with VrEyesWithoutHeadset) with no headset connected.
+bool g_fake;
+
 bool InitInstance()
 {
+    if (g_cfg.testFakeHeadset)
+    {
+        g_fake = true;
+        float scale = g_cfg.vrRenderScale > 0.1f ? g_cfg.vrRenderScale : 1.0f;
+        g_eyeW = (uint32_t)(2064 * scale + 0.5f);  // Quest 3's recommended size
+        g_eyeH = (uint32_t)(2208 * scale + 0.5f);
+        DefaultViews();
+        Log("xr: no runtime ([Test] FakeHeadset): eyes %ux%u straight ahead", g_eyeW, g_eyeH);
+        return true;
+    }
     // Runtime choice: the loader reads XR_RUNTIME_JSON when it is loaded.
     std::wstring runtime = g_cfg.vrRuntime;
     if (_wcsicmp(runtime.c_str(), L"steamvr") == 0)
@@ -569,7 +584,7 @@ bool InitInstance()
     return true;
 }
 
-bool Available() { return g_instance != XR_NULL_HANDLE; }
+bool Available() { return g_instance != XR_NULL_HANDLE || g_fake; }
 
 void OnDevice(IDirect3DDevice9* dev)
 {
@@ -683,7 +698,7 @@ void PollEvents()
     }
 }
 
-bool Running() { return g_running; }
+bool Running() { return g_running || g_fake; }
 
 void EyeSize(unsigned* w, unsigned* h)
 {
