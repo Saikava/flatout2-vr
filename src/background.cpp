@@ -231,7 +231,7 @@ int KeyCode(const std::string& name)
     return -1;
 }
 
-bool g_shotRequested, g_traceRequested;
+bool g_shotRequested, g_traceRequested, g_hudRequested;
 
 void RunCommand(std::string line)
 {
@@ -247,6 +247,11 @@ void RunCommand(std::string line)
     if (cmd == "trace")
     {
         g_traceRequested = true;
+        return;
+    }
+    if (cmd == "hud")
+    {
+        g_hudRequested = true;
         return;
     }
     if (cmd == "head")
@@ -570,8 +575,8 @@ int BackgroundPoll()
         GetWindowRect(g_gameWindow, &r);
         if (r.left != g_place.left || r.top != g_place.top || r.right != g_place.right || r.bottom != g_place.bottom) PlaceWindow();
     }
-    int r = (g_shotRequested ? kPollShot : 0) | (g_traceRequested ? kPollTrace : 0);
-    g_shotRequested = g_traceRequested = false;
+    int r = (g_shotRequested ? kPollShot : 0) | (g_traceRequested ? kPollTrace : 0) | (g_hudRequested ? kPollHud : 0);
+    g_shotRequested = g_traceRequested = g_hudRequested = false;
     return r;
 }
 

@@ -45,7 +45,7 @@ struct Config
     float vrWorldScale = 1.0f;
     bool vrMirror = true;  // in races the monitor shows the left eye instead of its own render
     bool vrPhysicsAtHeadsetRate = true;  // races: one physics step per headset frame
-    bool vrHud = true;             // races: the game's HUD on a panel in the headset
+    int vrHud = 1;                 // races: the game's HUD on a panel in the headset (2: not while racing)
     float vrHudDistance = 1.2f;    // metres in front of the recenter origin
     float vrHudWidth = 1.3f;       // metres
     float vrHudHeight = 0.0f;      // metres above the recenter origin
@@ -59,6 +59,7 @@ struct Config
     // [Keys]
     int keyScreenshot = 0x7A;  // F11
     int keyRecenter = 0x77;    // F8
+    int keyHud = 0x78;         // F9: Hud 1 <-> 2
 };
 extern Config g_cfg;
 void LoadConfig();

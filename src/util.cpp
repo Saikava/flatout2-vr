@@ -143,7 +143,8 @@ void LoadConfig()
     g_cfg.vrWorldScale = IniFloat(p, L"VR", L"WorldScale", d.vrWorldScale);
     g_cfg.vrMirror = GetPrivateProfileIntW(L"VR", L"Mirror", d.vrMirror, p) != 0;
     g_cfg.vrPhysicsAtHeadsetRate = GetPrivateProfileIntW(L"VR", L"PhysicsAtHeadsetRate", d.vrPhysicsAtHeadsetRate, p) != 0;
-    g_cfg.vrHud = GetPrivateProfileIntW(L"VR", L"Hud", d.vrHud, p) != 0;
+    int hud = GetPrivateProfileIntW(L"VR", L"Hud", d.vrHud, p);
+    g_cfg.vrHud = hud >= 0 && hud <= 2 ? hud : d.vrHud;
     g_cfg.vrHudDistance = IniFloat(p, L"VR", L"HudDistance", d.vrHudDistance);
     g_cfg.vrHudWidth = IniFloat(p, L"VR", L"HudWidth", d.vrHudWidth);
     g_cfg.vrHudHeight = IniFloat(p, L"VR", L"HudHeight", d.vrHudHeight);
@@ -155,6 +156,7 @@ void LoadConfig()
     g_cfg.keyRecenter = GetPrivateProfileIntW(L"Keys", L"Recenter", d.keyRecenter, p);
     g_cfg.logIntervalSeconds = IniFloat(p, L"Log", L"IntervalSeconds", d.logIntervalSeconds);
     g_cfg.keyScreenshot = GetPrivateProfileIntW(L"Keys", L"Screenshot", d.keyScreenshot, p);
+    g_cfg.keyHud = GetPrivateProfileIntW(L"Keys", L"Hud", d.keyHud, p);
 }
 
 double NowSeconds()

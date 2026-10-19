@@ -57,6 +57,7 @@ The game's controls are unchanged.
 | Key | Action |
 | --- | --- |
 | F8  | Recenter the view (sit as you want to sit in the car and press it) |
+| F9  | Hide the HUD while racing, or bring it back (it still shows for the countdown, the pause menu and the results) |
 | F11 | Screenshot of the monitor, both eyes and the HUD (into `scripts\shots\`) |
 
 ## Settings
@@ -68,7 +69,7 @@ The game's controls are unchanged.
 | `RenderScale` | 1.0 | Eye resolution relative to the headset's recommended size |
 | `MSAA` | 4 | Antialiasing samples (0 = off) |
 | `WorldScale` | 1.0 | Head movement scale |
-| `Hud`, `HudDistance`, `HudWidth`, `HudHeight` | 1, 1.2, 1.3, 0.0 | The HUD panel: on/off, distance, width, height (meters) |
+| `Hud`, `HudDistance`, `HudWidth`, `HudHeight` | 1, 1.2, 1.3, 0.0 | The HUD panel: on/off (2 = not while racing, as with F9), distance, width, height (meters) |
 | `ScreenDistance`, `ScreenWidth` | 2.0, 2.4 | The menus' virtual screen (meters) |
 | `Mirror` | 1 | The monitor shows the left eye (0: the game's own view, costs a third render) |
 | `PhysicsAtHeadsetRate` | 1 | One physics step per headset frame (0: the game's 10 ms steps) |

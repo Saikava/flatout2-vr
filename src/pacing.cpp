@@ -691,6 +691,8 @@ static int __cdecl FrameGate(BYTE* gameFlow)
 
 double FrameStartTime() { return g_frameStart; }
 
+int PhysicsSteps() { return g_physicsSteps; }
+
 namespace {
 
 // Particles made in bulk (see game.h) come at the rate the game was tuned for: so many per physics

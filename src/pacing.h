@@ -9,3 +9,7 @@ void ProbeCamera(const float* camMatrix);
 
 // When the gate last let a frame run (NowSeconds), for timing the game's own work.
 double FrameStartTime();
+
+// World steps simulated so far: a running race steps in every frame, a paused one not at all (0
+// throughout when the race simulation's code differs).
+int PhysicsSteps();

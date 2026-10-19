@@ -23,8 +23,9 @@ bool BackgroundMode();
 void BackgroundBeforeDevice(_D3DPRESENT_PARAMETERS_* pp);
 void BackgroundAfterDevice(HWND__* window);
 
-// Once a frame: carries out new commands. Returns kPollShot / kPollTrace when asked for.
-constexpr int kPollShot = 1, kPollTrace = 2;
+// Once a frame: carries out new commands. Returns kPollShot / kPollTrace / kPollHud (the Hud key)
+// when asked for.
+constexpr int kPollShot = 1, kPollTrace = 2, kPollHud = 4;
 int BackgroundPoll();
 
 // The mod's own hotkeys: in background mode only while the game's window has the focus.

@@ -1102,6 +1102,41 @@ bool KeyPressed(int vk, bool& wasDown)
     return pressed;
 }
 
+// [VR] Hud=2: the HUD panel is left out while the race runs, and comes back for its start (the
+// countdown), the pause menu and the results. The race state stays "racing" in the pause menu; that
+// the game is paused shows in the physics instead: a running race steps the world in every frame, a
+// paused one not at all. The Hud key switches between 1 and 2.
+constexpr int kRaceStateRacing = 8;
+bool g_hudKeyWasDown;
+int g_lastPhysicsSteps, g_framesWithoutStep;
+bool g_hudLeftOut;
+
+void ToggleHud()
+{
+    if (g_cfg.vrHud == 0)
+    {
+        Log("Hud key: Hud=0, no HUD panel to show");
+        return;
+    }
+    g_cfg.vrHud = g_cfg.vrHud == 2 ? 1 : 2;
+    Log("Hud key: Hud=%d (%s)", g_cfg.vrHud, g_cfg.vrHud == 2 ? "not while racing" : "always");
+}
+
+// Once a frame: whether the HUD panel goes to the headset with this frame's eyes.
+bool HudPanelShown()
+{
+    int steps = PhysicsSteps();
+    g_framesWithoutStep = steps != g_lastPhysicsSteps ? 0 : g_framesWithoutStep + 1;
+    g_lastPhysicsSteps = steps;
+    bool leftOut = g_cfg.vrHud == 2 && InRace() && RaceState() == kRaceStateRacing && g_framesWithoutStep < 2;
+    if (leftOut != g_hudLeftOut)
+    {
+        g_hudLeftOut = leftOut;
+        Log("HUD panel %s", leftOut ? "left out (racing)" : "shown");
+    }
+    return !leftOut;
+}
+
 std::wstring ShotPath(const char* tag)
 {
     std::wstring dir = ModuleDir() + L"shots\\";
@@ -1167,6 +1202,7 @@ int __fastcall EnginePresentHook(void* self, void*)
     int bg = BackgroundPoll();
     shot |= (bg & kPollShot) != 0;
     if ((bg & kPollTrace) && g_trace != Trace::Running) g_trace = Trace::Armed;
+    if (KeyPressed(g_cfg.keyHud, g_hudKeyWasDown) || (bg & kPollHud)) ToggleHud();
     if (g_cfg.autoShotSeconds > 0 && InRace() && now - g_lastShot >= g_cfg.autoShotSeconds) shot = true;
     if (shot)
     {
@@ -1209,11 +1245,12 @@ int __fastcall EnginePresentHook(void* self, void*)
             }
         }
     }
+    bool hudShown = HudPanelShown();
     if (g_eyesPending)
     {
         g_eyesPending = false;
         double s0 = NowSeconds();
-        bool hud = g_cfg.vrHud && g_hud.captured;
+        bool hud = g_cfg.vrHud && g_hud.captured && hudShown;
         xr::SubmitEyes(g_vrt.tex[0], g_vrt.tex[1], hud ? g_hud.panel : nullptr, g_hud.panelW, g_hud.panelH);
         g_vrStats.submit += NowSeconds() - s0;
         g_vrStats.submitT.Add(NowSeconds() - s0);
