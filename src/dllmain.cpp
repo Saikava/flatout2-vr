@@ -7,8 +7,30 @@
 
 #include <windows.h>
 
+// "FlatOut2.exe setup" (or -setup, the launchers' Settings): WinMain compares its whole command line
+// with these two, case aside (0x520EFC), and then only shows the settings dialog (render device,
+// resolution, antialiasing) and exits. The mod stays out of it: OpenXR would wait for the headset
+// (and start SteamVR) before the dialog shows, a recording would be started, and the last game's log
+// would make room for an empty one.
+static bool SettingsDialog()
+{
+    // The command line after the program name (quoted or not) and the blanks after it, as WinMain gets it.
+    const wchar_t* p = GetCommandLineW();
+    if (*p == L'"')
+    {
+        p++;
+        while (*p && *p != L'"') p++;
+        if (*p) p++;
+    }
+    else
+        while (*p > L' ') p++;
+    while (*p && *p <= L' ') p++;
+    return _wcsicmp(p, L"setup") == 0 || _wcsicmp(p, L"-setup") == 0;
+}
+
 static void Init()
 {
+    if (SettingsDialog()) return;
     LogInit(ModuleDir() + L"FO2VR.log");
     LoadConfig();
 
