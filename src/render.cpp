@@ -27,40 +27,6 @@
 #include <cstring>
 #include <string>
 
-// Lens flare call in RenderViews (register arguments, so the hook is naked). The flare is placed
-// with the camera's symmetric field of view and would sit in the wrong place in an eye; it is
-// skipped while VR eyes render.
-static bool g_skipLensFlare;
-static uintptr_t g_lensFlareFn = fo2::kLensFlare;
-
-static __declspec(naked) void LensFlareHook()
-{
-    __asm {
-        cmp g_skipLensFlare, 0
-        jne skip
-        jmp dword ptr [g_lensFlareFn]
-    skip:
-        ret
-    }
-}
-
-// The screen-space crash sparks (particle object in eax) fly at the monitor's camera; on the VR HUD
-// panel they would fly across a flat sheet in front of the player, so they are left out while the
-// HUD goes to the headset.
-static bool g_skipHudParticles;
-static uintptr_t g_hudParticlesFn = fo2::kHudParticles;
-
-static __declspec(naked) void HudParticlesHook()
-{
-    __asm {
-        cmp g_skipHudParticles, 0
-        jne skip
-        jmp dword ptr [g_hudParticlesFn]
-    skip:
-        ret
-    }
-}
-
 // The streak particles' trail builder (0x59F310) ends a trail that is shorter than its six
 // segments by filling the rest with copies of its last vertex pair: one copy from the stack, then
 // the vertex buffer copied onto itself. That reads the locked vertex buffer back, from memory that
@@ -188,11 +154,16 @@ struct VrEye
     bool active = false;
     float coverTan = 0;  // tan(fov/2) the camera was given so the engine's culling covers the eye
     xr::EyeFov fov = {};
+    // The game camera's own view on the monitor: horizontal field of view (radians) and the tangents
+    // of its half angles.
+    float monitorFov = 0, monitorTanH = 0, monitorTanV = 0;
+    // The monitor the lens flare is drawn on (see LensFlare): tangents of its half angles.
+    float flareTanH = 0, flareTanV = 0;
 } g_vrEye;
 // VR races: the game draws its HUD (everything after RenderViews until Present: HUD, pause menu,
-// crash sparks) into this target instead of the back buffer, over transparent black, so that it
-// can go to the headset on its own panel and be laid over the monitor's picture. The colours end
-// up premultiplied by alpha; the alpha channel is blended on its own ("over" for normal blending,
+// the HUD's own particles) into this target instead of the back buffer, over transparent black, so
+// that it can go to the headset on its own panel and be laid over the monitor's picture. The colours
+// end up premultiplied by alpha; the alpha channel is blended on its own ("over" for normal blending,
 // left alone for additive blending, see SetRenderStateHook).
 struct HudTargets
 {
@@ -209,6 +180,7 @@ struct HudTargets
     DWORD gameColorWrite = 0xF;  // the game's D3DRS_COLORWRITEENABLE (the capture adds alpha)
 } g_hud;
 void EndHudCapture(IDirect3DDevice9* dev);
+void FadeTarget(IDirect3DDevice9* dev, IDirect3DSurface9* target, DWORD colour, bool hud);
 bool g_eyesPending;  // this frame's eyes are rendered; they go to the headset at Present (with the HUD)
 bool g_vrFrameDone;  // the VR frame of this game frame was already submitted
 bool g_recenterKeyWasDown;
@@ -340,6 +312,7 @@ int g_shotIndex;
 bool g_shotKeyWasDown;
 bool g_loggedTargets;
 bool g_saveEyesThisFrame;
+bool g_eyeShotPending;  // the eyes rendered this frame are saved at Present
 
 // One-frame trace of render target traffic (the background mode's "trace" command, ReplayTrace).
 enum class Trace { Off, Armed, Running, Done } g_trace = Trace::Off;
@@ -412,6 +385,35 @@ using SpriteFn = void(__thiscall*)(void* self, const void* data);
 const auto oSpriteRect = (SpriteFn)fo2::kSpriteRect;
 const auto oSpriteQuad = (SpriteFn)fo2::kSpriteQuad;
 
+// The game darkens the whole screen with the HUD (when the car is reset, behind a dialog; see game.h):
+// in VR that would land on the HUD panel alone, a dark sheet floating in front of the player. Their
+// colours are taken instead (alpha in the top byte; 0 for none this frame) and laid over everything
+// at Present (FadeTarget): both eyes, the monitor's picture and, for those that go over the HUD, the
+// HUD itself. g_fade[0]: over the HUD; g_fade[1]: over the picture alone.
+DWORD g_fade[2];
+
+// a over b, colours with alpha in the top byte.
+DWORD FadeOver(DWORD a, DWORD b)
+{
+    float aa = (a >> 24) / 255.0f, ba = (b >> 24) / 255.0f, oa = aa + ba * (1.0f - aa);
+    if (oa <= 0.0f) return 0;
+    DWORD out = (DWORD)lroundf(oa * 255.0f) << 24;
+    for (int shift = 0; shift < 24; shift += 8)
+    {
+        float c = (((a >> shift) & 0xFF) * aa + ((b >> shift) & 0xFF) * ba * (1.0f - aa)) / oa;
+        out |= (DWORD)lroundf(c) << shift;
+    }
+    return out;
+}
+
+// While on, screen sprites are moved from one picture of the back buffer's pixel space into another
+// (see LensFlare): x' = x * scale[0] + offset[0], y' = y * scale[1] + offset[1].
+struct SpriteMap
+{
+    bool on = false;
+    float scale[2] = { 1, 1 }, offset[2] = {};
+} g_spriteMap;
+
 void __fastcall SpriteRectHook(void* self, void*, const void* rect)
 {
     unsigned ret[3];
@@ -422,6 +424,25 @@ void __fastcall SpriteRectHook(void* self, void*, const void* rect)
         snprintf(buf, sizeof(buf), "%.0f %.0f %.0f %.0f", r[0], r[1], r[2], r[3]);
         LogEyeCall("screen sprite", ret, buf);
     }
+    if (g_eyesPending)
+    {
+        uintptr_t from = (uintptr_t)_ReturnAddress();
+        for (const auto& f : fo2::kFadeSprites)
+            if (from == f.ret)
+            {
+                DWORD& fade = g_fade[f.overHud ? 0 : 1];
+                fade = FadeOver(((const DWORD*)rect)[8], fade);
+                if (g_hud.active) return;
+            }
+    }
+    if (g_spriteMap.on)
+    {
+        float r[9];  // x0, y0, x1, y1, u0, v0, u1, v1, colour
+        memcpy(r, rect, sizeof(r));
+        for (int i = 0; i < 4; i++) r[i] = r[i] * g_spriteMap.scale[i & 1] + g_spriteMap.offset[i & 1];
+        oSpriteRect(self, r);
+        return;
+    }
     oSpriteRect(self, rect);
 }
 
@@ -429,6 +450,15 @@ void __fastcall SpriteQuadHook(void* self, void*, const void* vertices)
 {
     unsigned ret[3];
     if (NewEyeCall("screen sprite quad", _AddressOfReturnAddress(), ret)) LogEyeCall("screen sprite quad", ret);
+    if (g_spriteMap.on)
+    {
+        float v[4][6];  // x, y, z, colour, u, v
+        memcpy(v, vertices, sizeof(v));
+        for (auto& p : v)
+            for (int i = 0; i < 2; i++) p[i] = p[i] * g_spriteMap.scale[i] + g_spriteMap.offset[i];
+        oSpriteQuad(self, v);
+        return;
+    }
     oSpriteQuad(self, vertices);
 }
 
@@ -612,6 +642,94 @@ static __declspec(naked) void SunGlowHook()
     }
 }
 
+// The lens flare (RenderViews calls it per view after the scene, the camera in eax, the flare in edi)
+// lays its ghosts along the line from the sun through the middle of the picture. The middle of an
+// eye's picture looks some degrees to the side (the eyes' fields of view are not symmetric), a
+// different direction in each eye: the ghosts would land in different places and not fuse. So it is
+// drawn as on a monitor whose middle is straight ahead of the head, and its sprites are moved into the
+// eye by direction (g_spriteMap): both eyes show the same flare, as far away as the sun. That monitor
+// is the back buffer's shape and tall enough to cover the eyes (g_vrEye.flareTanH/V, the tangents of
+// its half angles); the field of view the flare is given makes its pieces the angular size they have
+// on the game's own monitor.
+static uintptr_t g_lensFlareFn = fo2::kLensFlare;
+
+// (camera, flare)
+static __declspec(naked) void __stdcall CallLensFlare(BYTE*, void*)
+{
+    __asm {
+        push edi
+        mov eax, [esp + 8]
+        mov edi, [esp + 12]
+        call dword ptr [g_lensFlareFn]
+        pop edi
+        ret 8
+    }
+}
+
+static void __stdcall LensFlare(BYTE* cam, void* flare)
+{
+    if (!g_vrEye.active)
+    {
+        CallLensFlare(cam, flare);
+        return;
+    }
+    float tanH = g_vrEye.flareTanH, tanV = g_vrEye.flareTanV;
+    float* fr = (float*)(cam + fo2::kCamFrustum);
+    float* fov = (float*)(cam + fo2::kCamFov);
+    float* shape = (float*)fo2::kScreenShape;
+    int* vp = (int*)fo2::kViewportX;
+    int* size = (int*)(*(BYTE**)fo2::kDeviceD3d + fo2::kDevWidth);
+    float savedFr[4] = { fr[0], fr[1], fr[2], fr[3] }, savedFov = *fov, savedShape[2] = { shape[0], shape[1] };
+    int savedVp[4] = { vp[0], vp[1], vp[2], vp[3] }, savedSize[2] = { size[0], size[1] };
+    float n = fr[4], W = (float)g_screenW, H = (float)g_screenH;
+    fr[0] = -n * tanH;
+    fr[1] = n * tanH;
+    fr[2] = -n * tanV;
+    fr[3] = n * tanV;
+    *fov = g_vrEye.monitorFov * tanH / g_vrEye.monitorTanH;
+    shape[0] = W;
+    shape[1] = H;
+    vp[0] = vp[1] = 0;
+    vp[2] = size[0] = (int)g_screenW;
+    vp[3] = size[1] = (int)g_screenH;
+    // A point of that monitor at x (tangent (2x / W - 1) * tanH) is at the same tangent in the eye's
+    // picture, which spans fov.left to fov.right over the back buffer's width; y alike, downwards.
+    const xr::EyeFov& f = g_vrEye.fov;
+    g_spriteMap.scale[0] = 2.0f * tanH / (f.right - f.left);
+    g_spriteMap.offset[0] = W * (-tanH - f.left) / (f.right - f.left);
+    g_spriteMap.scale[1] = 2.0f * tanV / (f.up - f.down);
+    g_spriteMap.offset[1] = H * (f.up - tanV) / (f.up - f.down);
+    g_spriteMap.on = true;
+    CallLensFlare(cam, flare);
+    g_spriteMap.on = false;
+    memcpy(fr, savedFr, sizeof(savedFr));
+    *fov = savedFov;
+    shape[0] = savedShape[0];
+    shape[1] = savedShape[1];
+    memcpy(vp, savedVp, sizeof(savedVp));
+    size[0] = savedSize[0];
+    size[1] = savedSize[1];
+}
+
+static __declspec(naked) void LensFlareHook()
+{
+    __asm {
+        push edi
+        push eax
+        call LensFlare
+        ret
+    }
+}
+
+// The pause menu's retry question wraps at the menus' 540 units, scaled to the screen like the text
+// (see game.h). width: the back buffer's.
+static void SetRetryTextWidth(UINT width)
+{
+    static float current = 540.0f;
+    float wrap = 540.0f * (float)width / 640.0f;
+    if (wrap != current && PatchCode(fo2::kRetryTextWidth, &current, &wrap, 4)) current = wrap;
+}
+
 // ---- device hooks ---------------------------------------------------------------------------
 
 void ReleaseHudTargets()
@@ -675,7 +793,6 @@ void BeginHudCapture(IDirect3DDevice9* dev)
     SetHudAlphaBlend(dev, destBlend);
     oSetRenderState(dev, D3DRS_COLORWRITEENABLE, colorWrite | D3DCOLORWRITEENABLE_ALPHA);
     g_hud.active = true;
-    g_skipHudParticles = true;
 }
 
 HRESULT __stdcall SetRenderStateHook(IDirect3DDevice9* dev, D3DRENDERSTATETYPE state, DWORD value)
@@ -1064,6 +1181,34 @@ int __fastcall EnginePresentHook(void* self, void*)
         }
     }
 
+    DWORD world = FadeOver(g_fade[0], g_fade[1]);
+    if ((g_eyesPending || g_eyeShotPending) && (world >> 24))
+    {
+        for (IDirect3DTexture9* eye : g_vrt.tex)
+        {
+            IDirect3DSurface9* s = nullptr;
+            if (eye && SUCCEEDED(eye->GetSurfaceLevel(0, &s)))
+            {
+                FadeTarget(dev, s, world, false);
+                s->Release();
+            }
+        }
+    }
+    g_fade[0] = g_fade[1] = 0;
+    if (g_eyeShotPending)
+    {
+        g_eyeShotPending = false;
+        // The resolved eye textures: what the headset gets.
+        for (int eye = 0; eye < 2; eye++)
+        {
+            IDirect3DSurface9* s = nullptr;
+            if (g_vrt.tex[eye] && SUCCEEDED(g_vrt.tex[eye]->GetSurfaceLevel(0, &s)))
+            {
+                SaveSurfacePng(dev, s, ShotPath(eye == 0 ? "vr_left" : "vr_right").c_str());
+                s->Release();
+            }
+        }
+    }
     if (g_eyesPending)
     {
         g_eyesPending = false;
@@ -1199,6 +1344,33 @@ void InvertCamera(const float* c, float* v)
     v[15] = 1.0f;
 }
 
+// a * b for the game's matrices, which move row vectors: a's transform, then b's.
+void MulMatrix(const float* a, const float* b, float* out)
+{
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++)
+            out[4 * i + j] = a[4 * i] * b[j] + a[4 * i + 1] * b[4 + j] + a[4 * i + 2] * b[8 + j] + a[4 * i + 3] * b[12 + j];
+}
+
+// The speed blur zooms the bloom out from a point of the picture: on a monitor the middle (the tracks'
+// looks may move it), where the game camera looks. In an eye it zooms from where that direction is in
+// the eye's picture: the same direction in both eyes, so the streaks fuse, far away like the horizon.
+// Looking aside, the point moves to the side or off the picture, as the direction of travel does.
+// center: the game's (0..1 across and down the monitor's picture); out: the eye's.
+void EyeBlurCenter(const float center[2], const xr::EyePose& p, const xr::EyeFov& f, float out[2])
+{
+    // The direction in the game camera's axes (right, up, forward), then in the eye's, whose axes are
+    // given in the camera's (see BuildEyeMatrix).
+    float d[3] = { (2.0f * center[0] - 1.0f) * g_vrEye.monitorTanH, (1.0f - 2.0f * center[1]) * g_vrEye.monitorTanV, 1.0f };
+    float x = d[0] * p.right[0] + d[1] * p.right[1] + d[2] * p.right[2];
+    float y = d[0] * p.up[0] + d[1] * p.up[1] + d[2] * p.up[2];
+    float z = d[0] * p.forward[0] + d[1] * p.forward[1] + d[2] * p.forward[2];
+    // Looking back, the zoom's lines meet at the opposite point, the direction one comes from.
+    if (fabsf(z) < 0.01f) z = z < 0.0f ? -0.01f : 0.01f;
+    out[0] = std::clamp((x / z - f.left) / (f.right - f.left), -100.0f, 100.0f);
+    out[1] = std::clamp((f.up - y / z) / (f.up - f.down), -100.0f, 100.0f);
+}
+
 // Test: the head moved by [Test] HeadOffset and turned about the vertical axis (the background
 // mode's "head" command).
 void ApplyTestHead(xr::EyePose& p)
@@ -1312,6 +1484,71 @@ void DrawScreenQuad(IDirect3DDevice9* dev, IDirect3DTexture9* tex, float u0, flo
     saved->Release();
 }
 
+// Lays the screen fade's colour (alpha in the top byte) over a render target (the bound one when null).
+// Over a picture it blends as the game's fade does; over the HUD (premultiplied colours over
+// transparency, laid over the eyes later) it fades the HUD's own colours and adds the fade's colour
+// only where the HUD covers, so that HUD and eyes together come out as the game's fade over both.
+// The target's alpha is kept.
+void FadeTarget(IDirect3DDevice9* dev, IDirect3DSurface9* target, DWORD colour, bool hud)
+{
+    IDirect3DSurface9* old = nullptr;
+    if (FAILED(dev->GetRenderTarget(0, &old))) return;
+    IDirect3DSurface9* rt = target ? target : old;
+    D3DSURFACE_DESC d;
+    rt->GetDesc(&d);
+    IDirect3DStateBlock9* saved = nullptr;
+    if (FAILED(dev->CreateStateBlock(D3DSBT_ALL, &saved)))
+    {
+        old->Release();
+        return;
+    }
+    if (target) dev->SetRenderTarget(0, target);
+
+    DWORD a = colour >> 24;
+    if (hud)  // premultiplied by its alpha, scaled by the HUD's own (DESTALPHA)
+        colour = (a << 24) | ((((colour >> 16) & 0xFF) * a / 255) << 16) | ((((colour >> 8) & 0xFF) * a / 255) << 8) | ((colour & 0xFF) * a / 255);
+    struct V { float x, y, z, rhw; DWORD c; };
+    float W = (float)d.Width - 0.5f, H = (float)d.Height - 0.5f;
+    const V quad[4] = { { -0.5f, -0.5f, 0, 1, colour }, { W, -0.5f, 0, 1, colour }, { -0.5f, H, 0, 1, colour }, { W, H, 0, 1, colour } };
+
+    D3DVIEWPORT9 vp = { 0, 0, d.Width, d.Height, 0.0f, 1.0f };
+    dev->SetViewport(&vp);
+    dev->SetVertexShader(nullptr);
+    dev->SetPixelShader(nullptr);
+    dev->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
+    dev->SetTexture(0, nullptr);
+    dev->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+    dev->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_DIFFUSE);
+    dev->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+    dev->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_DIFFUSE);
+    dev->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
+    dev->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
+    dev->SetRenderState(D3DRS_ZENABLE, D3DZB_FALSE);
+    dev->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+    dev->SetRenderState(D3DRS_STENCILENABLE, FALSE);
+    dev->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+    dev->SetRenderState(D3DRS_SRCBLEND, hud ? D3DBLEND_DESTALPHA : D3DBLEND_SRCALPHA);
+    dev->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+    dev->SetRenderState(D3DRS_BLENDOP, D3DBLENDOP_ADD);
+    dev->SetRenderState(D3DRS_SEPARATEALPHABLENDENABLE, TRUE);
+    dev->SetRenderState(D3DRS_SRCBLENDALPHA, D3DBLEND_ZERO);
+    dev->SetRenderState(D3DRS_DESTBLENDALPHA, D3DBLEND_ONE);
+    dev->SetRenderState(D3DRS_BLENDOPALPHA, D3DBLENDOP_ADD);
+    dev->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+    dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    dev->SetRenderState(D3DRS_FILLMODE, D3DFILL_SOLID);
+    dev->SetRenderState(D3DRS_LIGHTING, FALSE);
+    dev->SetRenderState(D3DRS_FOGENABLE, FALSE);
+    dev->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
+    dev->SetRenderState(D3DRS_COLORWRITEENABLE, 0xF);
+    dev->SetRenderState(D3DRS_SRGBWRITEENABLE, FALSE);
+    dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, sizeof(V));
+    saved->Apply();
+    saved->Release();
+    if (target) dev->SetRenderTarget(0, old);
+    old->Release();
+}
+
 // Shows the left eye on the monitor instead of rendering the scene a third time: a 16:9 crop
 // around the eye's straight-ahead direction, drawn into the bound render target (the HUD goes
 // over it afterwards).
@@ -1331,7 +1568,6 @@ void MirrorLeftEye(IDirect3DDevice9* dev, const xr::EyeFov& fov)
 void EndHudCapture(IDirect3DDevice9* dev)
 {
     g_hud.active = false;
-    g_skipHudParticles = false;
     oSetRenderState(dev, D3DRS_SEPARATEALPHABLENDENABLE, FALSE);
     oSetRenderState(dev, D3DRS_COLORWRITEENABLE, g_hud.gameColorWrite);
     oSetRenderTarget(dev, 0, g_hud.gameRT);
@@ -1339,6 +1575,9 @@ void EndHudCapture(IDirect3DDevice9* dev)
     if (g_hud.gameRT) g_hud.gameRT->Release();
     if (g_hud.gameDS) g_hud.gameDS->Release();
     g_hud.gameRT = g_hud.gameDS = nullptr;
+    DWORD world = FadeOver(g_fade[0], g_fade[1]);
+    if (world >> 24) FadeTarget(dev, nullptr, world, false);
+    if (g_fade[0] >> 24) FadeTarget(dev, g_hud.rt, g_fade[0], true);
     DrawScreenQuad(dev, g_hud.tex, 0.0f, 0.0f, 1.0f, 1.0f, true);
     IDirect3DSurface9* panel = nullptr;
     if (SUCCEEDED(g_hud.panel->GetSurfaceLevel(0, &panel)))
@@ -1371,9 +1610,11 @@ bool RenderVrEyes(IDirect3DDevice9* dev, BYTE* ctx, BYTE** cams, float* fovScale
 
     g_gpu.Begin(dev);
     float* camM = (float*)(cam + fo2::kCamMatrix);
-    // Every copy of the camera's placement follows the eye (see game.h).
-    // The past views too: in the eyes the streaks of moving particles show their own motion in the
-    // world, not the camera's (nor the head's).
+    // Every copy of the camera's placement follows the eye (see game.h). The past views too, each the
+    // eye where it would have been with the head as it is now and the camera where it was then: a
+    // streak shows the particle's motion against the car, as on the monitor, and not the head's. The
+    // stunt cars' jet is all streaks that keep up with the car: only the camera's motion draws its
+    // flame out behind the nozzle.
     float* camM2 = (float*)(cam + fo2::kCamMatrixCopy2);
     float* camViews = (float*)(cam + fo2::kCamViews);
     float* camFov = (float*)(cam + fo2::kCamFov);
@@ -1398,6 +1639,25 @@ bool RenderVrEyes(IDirect3DDevice9* dev, BYTE* ctx, BYTE** cams, float* fovScale
     ApplyTestHead(pose[1]);
     SameDirection(pose);
     if (!rec::ReplayView(pose, fov)) rec::RecordView(pose, fov);
+    // The speed zoom ([VR] SpeedZoom): at speed the game widens its horizontal field of view (by fovScale,
+    // up to some 1.3 times the angle) and stretches its picture sideways by half as much, and the world
+    // shrinks into the distance. The headset's field of view is its own: instead the eyes are rendered
+    // with their angles widened as the monitor's are, and shown in the headset as they are, so the
+    // world shrinks the same. The game's own widening stays off in the eyes (fovScale 1, below).
+    float zoom = 1.0f + (savedScale - 1.0f) * g_cfg.vrSpeedZoom;
+    if (zoom > 1.0f)
+    {
+        float half = 0.5f * savedFov;
+        float kH = tanf(std::min(half * zoom, 1.5f)) / tanf(half);
+        float kV = kH / (1.0f + 0.5f * (zoom - 1.0f));
+        for (auto& f : fov)
+        {
+            f.left *= kH;
+            f.right *= kH;
+            f.up *= kV;
+            f.down *= kV;
+        }
+    }
     float aspect = (float)g_vrt.w / (float)g_vrt.h;
     float* screenShape = (float*)fo2::kScreenShape;
     float savedShape[2] = { screenShape[0], screenShape[1] };
@@ -1412,7 +1672,7 @@ bool RenderVrEyes(IDirect3DDevice9* dev, BYTE* ctx, BYTE** cams, float* fovScale
     IDirect3DSurface9 *oldRT = nullptr, *oldDS = nullptr;
     dev->GetRenderTarget(0, &oldRT);
     dev->GetDepthStencilSurface(&oldDS);
-    if (fovScale) fovScale[0] = 1.0f;  // no speed zoom in VR
+    if (fovScale) fovScale[0] = 1.0f;
     int* screenSize = EngineScreenSize();
     int savedScreen[2] = { screenSize[0], screenSize[1] };
     screenSize[0] = (int)g_vrt.w;
@@ -1434,17 +1694,33 @@ bool RenderVrEyes(IDirect3DDevice9* dev, BYTE* ctx, BYTE** cams, float* fovScale
         grass[0] *= g_cfg.vrGrassDistance;
         grass[1] *= g_cfg.vrGrassDistance;
     }
-    g_skipLensFlare = true;
+    // The lens flare's monitor and the speed blur's centre are measured against the game camera's own
+    // view (see LensFlare and EyeBlurCenter).
+    g_vrEye.monitorFov = savedFov;
+    g_vrEye.monitorTanH = tanf(0.5f * savedFov);
+    g_vrEye.monitorTanV = g_vrEye.monitorTanH * savedShape[1] / savedShape[0];
+    g_vrEye.flareTanV = std::max(tanV, tanH * (float)g_screenH / (float)g_screenW) * 1.02f;
+    g_vrEye.flareTanH = g_vrEye.flareTanV * (float)g_screenW / (float)g_screenH;
+    // The camera's past placements, each moved along with the camera's present one where that differs
+    // from the game's own (C_k * V_0 * anchor).
+    float pastAnchor[fo2::kCamViewCount][16];
+    for (int i = 1; i < fo2::kCamViewCount; i++)
+    {
+        float c[16], t[16];
+        InvertCamera(views + 16 * i, c);
+        MulMatrix(c, views, t);
+        MulMatrix(t, anchor, pastAnchor[i]);
+    }
     UseEyeFilterTextures(dev);
-    // The speed blur zooms the bloom out from the middle of the screen, which is the game camera's
-    // straight ahead on a monitor but a different direction in each eye (some 15 degrees to either
-    // side), so the streaks would not match; in the headset real motion shows the speed anyway, and the
-    // blur only smears the picture. It is off in the eyes: their speed factor is 0 (the game sets it
-    // anew every frame; the blur's settings themselves are only filled in at its first use).
+    // The speed blur ([VR] SpeedBlur): from where the game camera looks, in each eye (EyeBlurCenter); or
+    // off, with the eyes' speed factor 0 (the game sets it anew every frame). The blur's settings are
+    // only filled in at its first use, inside an eye's render: until then they are left alone.
     float* blurSpeed = (float*)fo2::kRadialBlurSpeed;
-    float savedBlurSpeed[4];
+    float* blurCenter = (float*)fo2::kRadialBlurCenter;
+    float savedBlurSpeed[4], savedBlurCenter[2] = {};
+    bool blurCenterSaved = false;
     memcpy(savedBlurSpeed, blurSpeed, sizeof(savedBlurSpeed));
-    memset(blurSpeed, 0, sizeof(savedBlurSpeed));
+    if (!g_cfg.vrSpeedBlur) memset(blurSpeed, 0, sizeof(savedBlurSpeed));
     for (int eye = 0; eye < 2; eye++)
     {
         float e[16];
@@ -1453,7 +1729,19 @@ bool RenderVrEyes(IDirect3DDevice9* dev, BYTE* ctx, BYTE** cams, float* fovScale
         InvertCamera(e, ev);
         memcpy(camM, e, sizeof(e));
         memcpy(camM2, e, sizeof(e));
-        for (int i = 0; i < fo2::kCamViewCount; i++) memcpy(camViews + 16 * i, ev, sizeof(ev));
+        memcpy(camViews, ev, sizeof(ev));
+        for (int i = 1; i < fo2::kCamViewCount; i++)
+        {
+            float pe[16];
+            BuildEyeMatrix(pastAnchor[i], pose[eye], pe);
+            InvertCamera(pe, camViews + 16 * i);
+        }
+        if (g_cfg.vrSpeedBlur && *(const BYTE*)fo2::kPostSettingsLoaded)
+        {
+            if (!blurCenterSaved) memcpy(savedBlurCenter, blurCenter, sizeof(savedBlurCenter));
+            blurCenterSaved = true;
+            EyeBlurCenter(savedBlurCenter, pose[eye], fov[eye], blurCenter);
+        }
         *camFov = 2.0f * atanf(cover);
         CopyGameScreenTexture(dev, eye == 0);
         SetFullViewportGlobals();
@@ -1475,9 +1763,9 @@ bool RenderVrEyes(IDirect3DDevice9* dev, BYTE* ctx, BYTE** cams, float* fovScale
         }
     }
     share::EndEyes();
-    g_skipLensFlare = false;
     RestoreFilterTextures();
     memcpy(blurSpeed, savedBlurSpeed, sizeof(savedBlurSpeed));
+    if (blurCenterSaved) memcpy(blurCenter, savedBlurCenter, sizeof(savedBlurCenter));
     g_gpu.EyesDone();
     screenSize[0] = savedScreen[0];
     screenSize[1] = savedScreen[1];
@@ -1493,16 +1781,7 @@ bool RenderVrEyes(IDirect3DDevice9* dev, BYTE* ctx, BYTE** cams, float* fovScale
     if (g_saveEyesThisFrame)
     {
         g_saveEyesThisFrame = false;
-        // The resolved eye textures: what the headset gets.
-        for (int eye = 0; eye < 2; eye++)
-        {
-            IDirect3DSurface9* s = nullptr;
-            if (SUCCEEDED(g_vrt.tex[eye]->GetSurfaceLevel(0, &s)))
-            {
-                SaveSurfacePng(dev, s, ShotPath(eye == 0 ? "vr_left" : "vr_right").c_str());
-                s->Release();
-            }
-        }
+        g_eyeShotPending = true;  // saved at Present, as they go to the headset
         Log("VR eye fov: left %.3f %.3f %.3f %.3f, right %.3f %.3f %.3f %.3f (tan l r u d), cover %.3f", fov[0].left, fov[0].right,
             fov[0].up, fov[0].down, fov[1].left, fov[1].right, fov[1].up, fov[1].down, cover);
     }
@@ -1544,6 +1823,7 @@ void __stdcall RenderViewsHook(BYTE* ctx, BYTE** cams, float* fovScale)
             g_screenW = d.Width;
             g_screenH = d.Height;
             bb->Release();
+            SetRetryTextWidth(g_screenW);
         }
     }
     if (race && dev && !g_loggedTargets)
@@ -1626,7 +1906,6 @@ bool InstallRenderHooks()
     ok &= PatchCall(fo2::kSunGlowCall, fo2::kSunGlow, (const void*)&SunGlowHook);
     ok &= PatchPointer(fo2::kSlotSpriteRect, fo2::kSpriteRect, (const void*)&SpriteRectHook);
     ok &= PatchPointer(fo2::kSlotSpriteQuad, fo2::kSpriteQuad, (const void*)&SpriteQuadHook);
-    ok &= PatchCall(fo2::kHudParticlesCall, fo2::kHudParticles, (const void*)&HudParticlesHook);
     if (!prof::HookParticles()) Log("profiler: particle call differs - not timed");
     if (!PatchTrailFill()) Log("particles: trail fill differs - not patched");
     if (g_cfg.vrEnabled && !PatchLodDistance(g_cfg.vrLodDistance)) Log("level of detail: code differs - distances unchanged");

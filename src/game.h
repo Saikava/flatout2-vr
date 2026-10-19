@@ -55,7 +55,9 @@ constexpr int kDevWidth = 0x8;
 constexpr int kDevHeight = 0xC;
 
 // Lens flare of one view: called by RenderViews per view after the scene, with the camera in
-// eax and the flare object in edi; projects the sun with the camera's symmetric field of view.
+// eax and the flare object in edi. It projects the sun with the camera's frustum (kCamFrustum) into
+// the viewport (kViewportX), lays its pieces along the line from there through the viewport's middle,
+// sized by the viewport's width over the field of view (kCamFov), and draws them as screen sprites.
 constexpr uintptr_t kLensFlareCall = 0x4CBBDA;
 constexpr uintptr_t kLensFlare = 0x596980;
 
@@ -65,10 +67,31 @@ constexpr uintptr_t kLensFlare = 0x596980;
 constexpr uintptr_t kSunGlowCall = 0x592509;
 constexpr uintptr_t kSunGlow = 0x596540;
 
-// Screen-space crash sparks and debris ("HUD particles", flying at the camera): drawn after the race
-// frame (RenderRace) by 0x4C4430, the particle object in eax, called at 0x45F78B.
-constexpr uintptr_t kHudParticlesCall = 0x45F78B;
-constexpr uintptr_t kHudParticles = 0x4C4430;
+// Darkenings of the whole screen drawn with the HUD, each a screen sprite rectangle over the whole
+// screen in its colour, alpha in the top byte (kSpriteRect, rect[8]); the return addresses of their
+// sprite calls, and whether they go over the HUD:
+// - the race's overlay fade (0x477D40, among the game loop's overlays run by 0x45FC90): to black and
+//   back when the car is reset;
+// - the game's screen fade (0x45FD00, run by 0x45FC90 while GameFlow +0x968 is set);
+// - the dialogs' backdrop (0x496930): the race start dialog dims the picture behind it.
+struct FadeSprite
+{
+    uintptr_t ret;
+    bool overHud;
+};
+constexpr FadeSprite kFadeSprites[] = { { 0x477EAB, true }, { 0x45FE81, true }, { 0x4969E8, false } };
+
+// The pause menu's question before a retry ("Are you sure you wish to restart...") is wrapped
+// (0x54E8A0, called by 0x49BB80) to a width pushed as a constant, 540 (the float immediate of a push
+// at kRetryTextWidth): the menus' 640x480 units, while the text is drawn scaled to the screen (its
+// font and position by the screen's width / 640) and measured so. At 3840 pixels across it wraps into
+// a narrow column that runs into the YES / NO below.
+constexpr uintptr_t kRetryTextWidth = 0x49BE85;
+
+// The HUD's own particles (object at 0x8E8470: impact_piece, impact_spark and nitro_flare sprites):
+// pieces and sparks breaking off an opponent's health bar when it is hit (0x4C5210) and flames on the
+// nitro gauge (0x4C4D80); flat, falling across the screen. Moved by 0x4C4200, drawn with the HUD by
+// 0x4C4430 (called at 0x45F78B).
 
 // RenderViews works out each camera's level-of-detail factor (kCamLodFactor) as atan(fov / 2)
 // times the constant at kLodConstant; these are the two instructions that load it
@@ -150,6 +173,9 @@ constexpr uintptr_t kRadialBlurPasses = 0x8E83B8;  // int
 constexpr uintptr_t kRadialBlurStrength = 0x8E83CC;
 constexpr uintptr_t kRadialBlurSpeed = 0x8DA468;  // float[4]
 constexpr uintptr_t kColorFilterOn = 0x8E83D0;    // Data.Effect.PostProcess.ColorFilter (int)
+// Set once the post-processing's first run (0x5A7740) has filled in its settings' defaults and handed
+// them to the data (byte).
+constexpr uintptr_t kPostSettingsLoaded = 0x8E8606;
 
 // Last viewport passed to SetViewport (x, y, w, h); the engine restores viewports from here.
 constexpr uintptr_t kViewportX = 0x8DA2CC;
@@ -167,12 +193,15 @@ constexpr uintptr_t kProjMatrix = 0x8E5F40;
 // ---- render camera (cams[i] in RenderViews) -----------------------------------------------
 constexpr int kCamMatrix = 0x80;   // float[16], rows: right, up, forward, position (y up, LH)
 // The camera keeps more copies of its placement: the same matrix at +0x40, and the view matrix
-// (its inverse) at +0x130 followed by the view matrices of the 7 frames before. The particle
-// renderer (0x59F8B0) takes the camera's position from +0x70 and moves the particles into camera
-// space itself (drawing them with an identity camera): a particle with the current view, the
-// points of its motion streak (0x59F310) with the views of the frames before.
+// (its inverse) at +0x130 followed by the view matrices of the 7 steps before (the race shifts them
+// on with every physics step, 0x551C00, and fills all eight with the present one when the camera
+// cuts, 0x551B50). The particle renderer (0x59F8B0) takes the camera's position from +0x70 and moves
+// the particles into camera space itself (drawing them with an identity camera): a particle with the
+// current view, the points of its motion streak (0x59F310, where the particle was 0.04 s, 0.08 s, ...
+// before) with the views of the steps before. A streak so shows the particle's motion against the
+// camera's.
 constexpr int kCamMatrixCopy2 = 0x40;
-constexpr int kCamViews = 0x130;  // float[8][16]: now, 1 frame ago, ... 7 frames ago
+constexpr int kCamViews = 0x130;  // float[8][16]: now, 1 step ago, ... 7 steps ago
 constexpr int kCamViewCount = 8;
 // float[7]: left, right, bottom, top (at the near plane), near, far, ortho flag.
 // RenderViews rewrites it on entry from kCamFov / kCamAspect (symmetric).
@@ -225,6 +254,45 @@ constexpr int kWorldStepMs = 0x2072C;  // int
 // whole milliseconds: "fild ms; fld 0.001; fmul" at 0x4297A7 (ebp = world). The wheels and the
 // drivetrain integrate with it.
 constexpr uintptr_t kCarStepLoad = 0x4297A7;
+
+// ---- particles ---------------------------------------------------------------------------------
+// Every view keeps its particles in lists: a main one of 8192 and two of 512, each with its count
+// and capacity (int) in the view's entry (kParticleViews, kParticleViewCount entries of 0x44 bytes;
+// also the view's position, +0x30). An effect adds a particle to the lists of the views near enough
+// with 0x58EE80, 0x58EED0 or 0x58EF30 (cdecl: particle, a flag byte per view), which drop it when a
+// list is full.
+constexpr uintptr_t kParticleViews = 0x8DE050;
+constexpr int kParticleViewSize = 0x44;
+constexpr uintptr_t kParticleViewCount = 0x8DDF10;  // unsigned
+constexpr uintptr_t kAddParticle = 0x58EE80;        // the main list, count at +0x10
+constexpr uintptr_t kAddParticleB = 0x58EED0;       // count at +0x28
+constexpr uintptr_t kAddParticleC = 0x58EF30;       // count at +0x1C
+// Effects that make particles in bulk, and the calls that add them (call site, add function, its
+// list's count in a view's entry, how often the effect runs):
+// - the track's emitters (fountains of sparks and fire; the stunt stadium is full of them): every
+//   physics step of the race (0x4725C0) runs them through 0x591E50, a particle per emitter and step
+//   (0x59A940);
+// - dust and dirt off the ground: the race tick (0x472D30) calls 0x43E480 for every car once per frame
+//   (at 0x47372E), whose wheels' contacts kick it up (0x5856B0, 0x582960); and every step hands the
+//   world's contacts of the step to 0x5878B0 (also through 0x591E50).
+enum class Every
+{
+    Step,
+    Frame
+};
+struct ParticleAddCall
+{
+    uintptr_t site, target;
+    int countOffset;
+    Every every;
+};
+constexpr ParticleAddCall kBulkParticleAdds[] = {
+    { 0x59BB47, kAddParticle, 0x10, Every::Step },   { 0x5861E7, kAddParticleB, 0x28, Every::Frame },
+    { 0x586B0F, kAddParticleC, 0x1C, Every::Frame }, { 0x587246, kAddParticle, 0x10, Every::Frame },
+    { 0x587895, kAddParticleB, 0x28, Every::Frame }, { 0x5837B4, kAddParticle, 0x10, Every::Frame },
+    { 0x58800F, kAddParticleB, 0x28, Every::Step },  { 0x588263, kAddParticle, 0x10, Every::Step },
+    { 0x58889D, kAddParticle, 0x10, Every::Step },
+};
 
 // ---- players and cars ------------------------------------------------------------------------
 constexpr uintptr_t kLocalPlayer = 0x6B21F8;  // Player*

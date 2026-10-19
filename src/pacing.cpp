@@ -19,6 +19,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iterator>
+#include <utility>
 
 static int __cdecl FrameGate(BYTE* gameFlow);
 
@@ -689,9 +691,61 @@ static int __cdecl FrameGate(BYTE* gameFlow)
 
 double FrameStartTime() { return g_frameStart; }
 
+namespace {
+
+// Particles made in bulk (see game.h) come at the rate the game was tuned for: so many per physics
+// step (100 steps a second) or per frame (60 frames). At the headset's 120 there are more of them,
+// and the stunt stadium's emitters, which all but fill the main particle list of 8192 at the game's
+// own pace, keep it full: every new particle is then dropped, whichever effect makes it, and the
+// stunt cars' jet flames, exhaust, nitro flames and sparks go missing. The effects still run as
+// before (they draw on the game's shared random numbers, which races and replays depend on), but
+// only the share of their particles the game's own rate would make is added (a step's time over
+// 10 ms, a frame's real time over 1/60 s), and none of them into the last sixteenth of a list, which
+// is kept for the other effects.
+using AddParticleFn = void(__cdecl*)(const void* particle, const BYTE* views);
+
+template <int Call>
+void __cdecl AddBulkParticle(const void* particle, const BYTE* views)
+{
+    const auto& add = fo2::kBulkParticleAdds[Call];
+    static float share;
+    if (add.every == fo2::Every::Step)
+        share += std::min(g_physicsStep * 100.0f, 1.0f);
+    else
+    {
+        BYTE* gf = *(BYTE**)fo2::kGameFlow;
+        share += gf ? std::clamp(Field(gf, fo2::kGfFrameDtReal) * 0.06f, 0.0f, 1.0f) : 1.0f;
+    }
+    if (share < 1.0f) return;
+    share -= 1.0f;
+    BYTE room[8];
+    unsigned n = *(const unsigned*)fo2::kParticleViewCount;
+    if (n > std::size(room))
+    {
+        ((AddParticleFn)add.target)(particle, views);
+        return;
+    }
+    for (unsigned v = 0; v < n; v++)
+    {
+        const int* list = (const int*)(fo2::kParticleViews + v * fo2::kParticleViewSize + add.countOffset);  // count, capacity
+        room[v] = views[v] && list[0] < list[1] - list[1] / 16;
+    }
+    ((AddParticleFn)add.target)(particle, room);
+}
+
+template <int... Calls>
+bool PatchBulkParticles(std::integer_sequence<int, Calls...>)
+{
+    return (PatchCall(fo2::kBulkParticleAdds[Calls].site, fo2::kBulkParticleAdds[Calls].target, (const void*)&AddBulkParticle<Calls>) & ...);
+}
+
+}  // namespace
+
 bool InstallPacingHooks()
 {
     bool ok = PatchCall(fo2::kFrameGateCall, fo2::kFrameGate, (const void*)&FrameGateHook);
+    if (!PatchBulkParticles(std::make_integer_sequence<int, (int)std::size(fo2::kBulkParticleAdds)>()))
+        Log("particles: the code of an effect differs - its particles are not limited");
     // Everything the physics step depends on is checked before anything is changed: the world
     // step's "push 0.01" (becomes a call of PushPhysicsStep, same length), the piece limit's two
     // immediates, the race tick's three step immediates and the cars' step load.
