@@ -2,6 +2,7 @@
 
 #include "record.h"
 #include "util.h"
+#include "xr.h"
 
 #include <windows.h>
 #include <d3d9.h>
@@ -10,6 +11,7 @@
 #include <mmdeviceapi.h>
 #include <audiopolicy.h>
 
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <deque>
@@ -189,6 +191,14 @@ void SetKey(BYTE dik, bool down)
 
     UINT sc = dik & 0x7F;
     UINT vk = MapVirtualKeyA((dik & 0x80) ? (0xE000 | sc) : sc, MAPVK_VSC_TO_VK_EX) & 0xFF;
+    // The hook (WH_KEYBOARD) is told the shift, control and alt keys without their side (VK_CONTROL, not
+    // VK_LCONTROL), and the game's controls name them so (the nitro, the stunts' launch: "CONTROL").
+    if (vk == VK_LSHIFT || vk == VK_RSHIFT)
+        vk = VK_SHIFT;
+    else if (vk == VK_LCONTROL || vk == VK_RCONTROL)
+        vk = VK_CONTROL;
+    else if (vk == VK_LMENU || vk == VK_RMENU)
+        vk = VK_MENU;
     if (!vk) return;
     BYTE& state = ((BYTE*)kKeyState)[vk];
     int& held = *(int*)kKeysHeld;
@@ -231,7 +241,9 @@ int KeyCode(const std::string& name)
     return -1;
 }
 
-bool g_shotRequested, g_traceRequested, g_hudRequested;
+bool g_shotRequested, g_traceRequested, g_hudRequested, g_ejectRequested;
+char g_mirrorKnockSide;
+int g_mirrorKnockState;
 
 void RunCommand(std::string line)
 {
@@ -254,12 +266,54 @@ void RunCommand(std::string line)
         g_hudRequested = true;
         return;
     }
+    if (cmd == "eject")
+    {
+        g_ejectRequested = true;
+        return;
+    }
+    if (cmd == "mirror")
+    {
+        char side = 0, how[8] = "";
+        if (sscanf(arg.c_str(), " %c %7s", &side, how) == 2 && (side == 'l' || side == 'r'))
+        {
+            g_mirrorKnockSide = side;
+            g_mirrorKnockState = strcmp(how, "off") == 0 ? 2 : 1;
+        }
+        return;
+    }
     if (cmd == "head")
     {
         float* o = g_cfg.testHeadOffset;
         g_cfg.testHeadPitchDeg = 0;
         sscanf(arg.c_str(), "%f %f %f %f %f", &o[0], &o[1], &o[2], &g_cfg.testHeadYawDeg, &g_cfg.testHeadPitchDeg);
         Log("input file: head offset %.2f %.2f %.2f, yaw %.1f, pitch %.1f", o[0], o[1], o[2], g_cfg.testHeadYawDeg, g_cfg.testHeadPitchDeg);
+        return;
+    }
+    if (cmd == "hand")
+    {
+        // hand <0 left | 1 right> x y z yaw pitch [trigger [stick-x stick-y [button]]]: a pretend controller
+        // pointing from (x, y z) from the recenter origin; "hand 1 off" puts it away.
+        int h = 0, button = 0;
+        float p[3] = {}, yaw = 0, pitch = 0;
+        xr::Controller c;
+        char word[8] = "";
+        int n = sscanf(arg.c_str(), "%d %7s", &h, word);
+        if (n == 2 && strcmp(word, "off") == 0)
+        {
+            xr::SetTestHand(h & 1, c);
+            Log("input file: hand %d off", h & 1);
+            return;
+        }
+        sscanf(arg.c_str(), "%d %f %f %f %f %f %f %f %f %d", &h, &p[0], &p[1], &p[2], &yaw, &pitch, &c.trigger, &c.stick[0], &c.stick[1], &button);
+        float y = yaw * 0.017453293f, x = pitch * 0.017453293f;
+        float f[3] = { sinf(y) * cosf(x), sinf(x), cosf(y) * cosf(x) }, r[3] = { cosf(y), 0.0f, -sinf(y) };
+        c.tracked = true;
+        c.button = button != 0;
+        for (int i = 0; i < 3; i++) c.aim.position[i] = p[i], c.aim.forward[i] = f[i], c.aim.right[i] = r[i];
+        c.aim.up[0] = f[1] * r[2] - f[2] * r[1], c.aim.up[1] = f[2] * r[0] - f[0] * r[2], c.aim.up[2] = f[0] * r[1] - f[1] * r[0];
+        xr::SetTestHand(h & 1, c);
+        Log("input file: hand %d at %.2f %.2f %.2f, yaw %.1f, pitch %.1f, trigger %.2f, stick %.2f %.2f, button %d", h & 1, p[0], p[1], p[2], yaw, pitch,
+            c.trigger, c.stick[0], c.stick[1], button);
         return;
     }
     if (cmd == "camera")
@@ -584,12 +638,22 @@ int BackgroundPoll()
         GetWindowRect(g_gameWindow, &r);
         if (r.left != g_place.left || r.top != g_place.top || r.right != g_place.right || r.bottom != g_place.bottom) PlaceWindow();
     }
-    int r = (g_shotRequested ? kPollShot : 0) | (g_traceRequested ? kPollTrace : 0) | (g_hudRequested ? kPollHud : 0);
-    g_shotRequested = g_traceRequested = g_hudRequested = false;
+    int r = (g_shotRequested ? kPollShot : 0) | (g_traceRequested ? kPollTrace : 0) | (g_hudRequested ? kPollHud : 0) |
+            (g_ejectRequested ? kPollEject : 0);
+    g_shotRequested = g_traceRequested = g_hudRequested = g_ejectRequested = false;
     return r;
 }
 
 bool HotkeysAllowed() { return !g_on || GetForegroundWindow() == g_gameWindow; }
 
 void RequestShot() { g_shotRequested = true; }
+
+bool TakeMirrorKnock(char* side, int* state)
+{
+    if (!g_mirrorKnockSide) return false;
+    *side = g_mirrorKnockSide;
+    *state = g_mirrorKnockState;
+    g_mirrorKnockSide = 0;
+    return true;
+}
 void RequestTrace() { g_traceRequested = true; }

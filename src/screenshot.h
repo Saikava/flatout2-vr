@@ -7,6 +7,8 @@ struct IDirect3DSurface9;
 // thread. keepAlpha: the PNG keeps the surface's alpha channel (otherwise opaque).
 void SaveSurfacePng(IDirect3DDevice9* dev, IDirect3DSurface9* surface, const wchar_t* path, bool keepAlpha = false);
 void SaveBackBufferPng(IDirect3DDevice9* dev, const wchar_t* path);
+// Writes pixels (32-bit BGRA, w x h) as a PNG on a worker thread.
+void SavePixelsPng(const wchar_t* path, const unsigned* bgra, unsigned w, unsigned h);
 // Once a frame on the render thread: moves the screenshots on (their copies are read a few
 // frames after they were taken, when the GPU is done with them).
 void ScreenshotTick();

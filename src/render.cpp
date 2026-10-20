@@ -26,6 +26,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <vector>
 
 // The streak particles' trail builder (0x59F310) ends a trail that is shorter than its six
 // segments by filling the rest with copies of its last vertex pair: one copy from the stack, then
@@ -109,7 +110,8 @@ const auto oSetFrustum = (SetFrustumFn)fo2::kSetFrustum;
 // ---- IDirect3DDevice9 hooks (vtable) -------------------------------------------------------
 namespace vt {
 constexpr int Reset = 16, StretchRect = 34, SetRenderTarget = 37, SetDepthStencilSurface = 39,
-              BeginScene = 41, EndScene = 42, Clear = 43, SetRenderState = 57;
+              BeginScene = 41, EndScene = 42, Clear = 43, SetRenderState = 57, DrawPrimitive = 81, DrawIndexedPrimitive = 82,
+              DrawPrimitiveUP = 83, DrawIndexedPrimitiveUP = 84;
 }
 using ResetFn = HRESULT(__stdcall*)(IDirect3DDevice9*, D3DPRESENT_PARAMETERS*);
 using StretchRectFn = HRESULT(__stdcall*)(IDirect3DDevice9*, IDirect3DSurface9*, const RECT*, IDirect3DSurface9*, const RECT*,
@@ -119,6 +121,11 @@ using SetDepthStencilSurfaceFn = HRESULT(__stdcall*)(IDirect3DDevice9*, IDirect3
 using SceneFn = HRESULT(__stdcall*)(IDirect3DDevice9*);
 using ClearFn = HRESULT(__stdcall*)(IDirect3DDevice9*, DWORD, const D3DRECT*, DWORD, D3DCOLOR, float, DWORD);
 using SetRenderStateFn = HRESULT(__stdcall*)(IDirect3DDevice9*, D3DRENDERSTATETYPE, DWORD);
+using DrawPrimitiveFn = HRESULT(__stdcall*)(IDirect3DDevice9*, D3DPRIMITIVETYPE, UINT, UINT);
+using DrawIndexedPrimitiveFn = HRESULT(__stdcall*)(IDirect3DDevice9*, D3DPRIMITIVETYPE, INT, UINT, UINT, UINT, UINT);
+using DrawPrimitiveUPFn = HRESULT(__stdcall*)(IDirect3DDevice9*, D3DPRIMITIVETYPE, UINT, const void*, UINT);
+using DrawIndexedPrimitiveUPFn = HRESULT(__stdcall*)(IDirect3DDevice9*, D3DPRIMITIVETYPE, UINT, UINT, UINT, const void*, D3DFORMAT,
+                                                     const void*, UINT);
 
 ResetFn oReset;
 StretchRectFn oStretchRect;
@@ -127,6 +134,10 @@ SetDepthStencilSurfaceFn oSetDepthStencilSurface;
 SceneFn oBeginScene, oEndScene;
 ClearFn oClear;
 SetRenderStateFn oSetRenderState;
+DrawPrimitiveFn oDrawPrimitive;
+DrawIndexedPrimitiveFn oDrawIndexedPrimitive;
+DrawPrimitiveUPFn oDrawPrimitiveUP;
+DrawIndexedPrimitiveUPFn oDrawIndexedPrimitiveUP;
 IDirect3DDevice9* g_hookedDevice;
 
 // ---- state ----------------------------------------------------------------------------------
@@ -154,6 +165,8 @@ struct VrEye
     bool active = false;
     int index = 0;         // 0 left, 1 right
     bool cockpit = false;  // seen from the driver's seat (CockpitEye)
+    bool mirror = false;   // a side mirror's view (RenderMirrors), not an eye
+    UINT w = 0, h = 0;     // the target's size
     float coverTan = 0;  // tan(fov/2) the camera was given so the engine's culling covers the eye
     xr::EyeFov fov = {};
     // The game camera's own view on the monitor: horizontal field of view (radians) and the tangents
@@ -168,12 +181,15 @@ float g_cockpitNear;      // and its last near clipping plane (CockpitNear)
 // the HUD's own particles) into this target instead of the back buffer, over transparent black, so
 // that it can go to the headset on its own panel and be laid over the monitor's picture. The colours
 // end up premultiplied by alpha; the alpha channel is blended on its own ("over" for normal blending,
-// left alone for additive blending, see SetRenderStateHook).
+// left alone for additive blending, see SetRenderStateHook). The cockpit's instruments, when they are
+// shown in the car, are drawn into targets of their own instead (see DrawHudBatch, HudCardOf).
 struct HudTargets
 {
     IDirect3DTexture9* tex = nullptr;    // back buffer size
     IDirect3DSurface9* rt = nullptr;     // its level 0
     IDirect3DSurface9* ds = nullptr;     // single-sample depth of the same size
+    IDirect3DTexture9* cards[2] = {};    // the instruments, the same size: the rival's card in the second
+    IDirect3DSurface9* cardRT[2] = {};   // (on the screen it overlaps the map)
     IDirect3DTexture9* panel = nullptr;  // smaller copy for the headset
     UINT w = 0, h = 0, panelW = 0, panelH = 0;
     bool failed = false;
@@ -184,6 +200,11 @@ struct HudTargets
     DWORD gameColorWrite = 0xF;  // the game's D3DRS_COLORWRITEENABLE (the capture adds alpha)
 } g_hud;
 void EndHudCapture(IDirect3DDevice9* dev);
+void ReleaseMirrorTargets();
+void KnockMirror(char side, int state);
+bool RouteHudCards();
+bool HudCardsRouted();
+int HudSpriteOwner(const void* stack, uintptr_t from, float x0, float y0, float x1, float y1);
 void FadeTarget(IDirect3DDevice9* dev, IDirect3DSurface9* target, DWORD colour, bool hud);
 bool g_eyesPending;  // this frame's eyes are rendered; they go to the headset at Present (with the HUD)
 bool g_vrFrameDone;  // the VR frame of this game frame was already submitted
@@ -428,6 +449,38 @@ DWORD FadeColour(DWORD c, float f)
     return out;
 }
 
+// A box in the back buffer's pixels.
+struct ScreenBox
+{
+    float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
+    int count = 0;
+    void Add(float x, float y) { x0 = std::min(x0, x), y0 = std::min(y0, y), x1 = std::max(x1, x), y1 = std::max(y1, y); }
+};
+
+// The screen sprites in the game's queue while the HUD is captured (see game.h, kSpriteQueueCount), in
+// its order: each one's box and, when the game code that queues it tells, the instrument it belongs to
+// (HudSpriteOwner; kNoOwner: where the batch's other sprites with none lie, see DrawHudBatch).
+constexpr int kNoOwner = -1, kOwnerPanel = -2;
+struct QueuedSprite
+{
+    float x0, y0, x1, y1;  // x0 > x1: not known (queued before the capture)
+    int owner;
+};
+struct SpriteQueue
+{
+    std::vector<QueuedSprite> sprites;
+    bool drawn = false;  // the batch is drawn (once for each pass): the next sprite starts the next one
+
+    void Add(const void* stack, uintptr_t from, float x0, float y0, float x1, float y1)
+    {
+        // Called after the game queued it (a full queue is drawn first): the queue holds it and those before.
+        size_t queued = (size_t)std::max(1, *(const int*)fo2::kSpriteQueueCount);
+        if (drawn || sprites.size() + 1 != queued) sprites.assign(queued - 1, QueuedSprite{ 1, 0, 0, 0, kNoOwner });
+        drawn = false;
+        sprites.push_back({ x0, y0, x1, y1, HudCardsRouted() ? HudSpriteOwner(stack, from, x0, y0, x1, y1) : kNoOwner });
+    }
+} g_hudQueue;
+
 void __fastcall SpriteRectHook(void* self, void*, const void* rect)
 {
     unsigned ret[3];
@@ -457,9 +510,15 @@ void __fastcall SpriteRectHook(void* self, void*, const void* rect)
         DWORD& colour = *(DWORD*)&r[8];
         colour = FadeColour(colour, g_spriteMap.fade);
         oSpriteRect(self, r);
-        return;
     }
-    oSpriteRect(self, rect);
+    else
+        oSpriteRect(self, rect);
+    if (g_hud.active)
+    {
+        const float* r = (const float*)rect;
+        g_hudQueue.Add(_AddressOfReturnAddress(), (uintptr_t)_ReturnAddress(), std::min(r[0], r[2]), std::min(r[1], r[3]),
+                       std::max(r[0], r[2]), std::max(r[1], r[3]));
+    }
 }
 
 void __fastcall SpriteQuadHook(void* self, void*, const void* vertices)
@@ -477,9 +536,16 @@ void __fastcall SpriteQuadHook(void* self, void*, const void* vertices)
             colour = FadeColour(colour, g_spriteMap.fade);
         }
         oSpriteQuad(self, v);
-        return;
     }
-    oSpriteQuad(self, vertices);
+    else
+        oSpriteQuad(self, vertices);
+    if (g_hud.active)
+    {
+        const float* v = (const float*)vertices;  // x, y, z, colour, u, v
+        ScreenBox b;
+        for (int i = 0; i < 4; i++) b.Add(v[6 * i], v[6 * i + 1]);
+        g_hudQueue.Add(_AddressOfReturnAddress(), (uintptr_t)_ReturnAddress(), b.x0, b.y0, b.x1, b.y1);
+    }
 }
 
 void TraceLine(const char* fmt, ...)
@@ -563,8 +629,8 @@ void __fastcall SetViewportHook(void* self, void*, int x, int y, int w, int h, i
     if (g_vrEye.active && fullScreen)
     {
         x = y = 0;
-        w = (int)g_vrt.w;
-        h = (int)g_vrt.h;
+        w = (int)g_vrEye.w;
+        h = (int)g_vrEye.h;
     }
     oSetViewport(self, x, y, w, h, view);
 }
@@ -819,6 +885,7 @@ static void __stdcall LensFlare(BYTE* cam, void* flare)
         CallLensFlare(cam, flare);
         return;
     }
+    if (g_vrEye.mirror) return;  // none in the side mirrors
     if (g_vrEye.cockpit && g_vrEye.index == 0) MeasureSun(cam, flare);
     g_spriteMap.fade = g_vrEye.cockpit ? g_sunShare : 1.0f;
     float tanH = g_vrEye.flareTanH, tanV = g_vrEye.flareTanV;
@@ -882,7 +949,8 @@ static void SetRetryTextWidth(UINT width)
 
 void ReleaseHudTargets()
 {
-    IUnknown* all[6] = { g_hud.tex, g_hud.rt, g_hud.ds, g_hud.panel, g_hud.gameRT, g_hud.gameDS };
+    IUnknown* all[10] = { g_hud.tex, g_hud.rt, g_hud.ds, g_hud.cards[0], g_hud.cardRT[0], g_hud.cards[1], g_hud.cardRT[1], g_hud.panel,
+                          g_hud.gameRT, g_hud.gameDS };
     for (IUnknown* r : all)
         if (r) r->Release();
     g_hud = HudTargets();
@@ -900,6 +968,9 @@ bool EnsureHudTargets(IDirect3DDevice9* dev)
               SUCCEEDED(g_hud.tex->GetSurfaceLevel(0, &g_hud.rt)) &&
               SUCCEEDED(dev->CreateDepthStencilSurface(w, h, D3DFMT_D24S8, D3DMULTISAMPLE_NONE, 0, TRUE, &g_hud.ds, nullptr)) &&
               SUCCEEDED(dev->CreateTexture(pw, ph, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &g_hud.panel, nullptr));
+    for (int i = 0; i < 2 && ok; i++)
+        ok = SUCCEEDED(dev->CreateTexture(w, h, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &g_hud.cards[i], nullptr)) &&
+             SUCCEEDED(g_hud.cards[i]->GetSurfaceLevel(0, &g_hud.cardRT[i]));
     Log("VR HUD targets %ux%u, panel %ux%u: %s", w, h, pw, ph, ok ? "created" : "FAILED");
     if (ok) PrepareScreenshots(dev, pw, ph, D3DFMT_A8R8G8B8, 1);
     if (!ok)
@@ -933,6 +1004,12 @@ void BeginHudCapture(IDirect3DDevice9* dev)
     dev->GetRenderState(D3DRS_DESTBLEND, &destBlend);
     dev->GetRenderState(D3DRS_COLORWRITEENABLE, &colorWrite);
     g_hud.gameColorWrite = colorWrite;
+    if (RouteHudCards())
+        for (IDirect3DSurface9* card : g_hud.cardRT)
+        {
+            oSetRenderTarget(dev, 0, card);
+            oClear(dev, 0, nullptr, D3DCLEAR_TARGET, 0, 1.0f, 0);
+        }
     oSetRenderTarget(dev, 0, g_hud.rt);
     oSetDepthStencilSurface(dev, g_hud.ds);
     oClear(dev, 0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL, 0, 1.0f, 0);
@@ -940,6 +1017,7 @@ void BeginHudCapture(IDirect3DDevice9* dev)
     oSetRenderState(dev, D3DRS_BLENDOPALPHA, D3DBLENDOP_ADD);
     SetHudAlphaBlend(dev, destBlend);
     oSetRenderState(dev, D3DRS_COLORWRITEENABLE, colorWrite | D3DCOLORWRITEENABLE_ALPHA);
+    g_hudQueue = SpriteQueue();
     g_hud.active = true;
 }
 
@@ -1063,6 +1141,7 @@ void RestoreFilterTextures()
 void ReleaseVrTargets()
 {
     ReleaseSunQueries();
+    ReleaseMirrorTargets();
     if (g_screenTexCopy) g_screenTexCopy->Release();
     g_screenTexCopy = nullptr;
     for (IDirect3DTexture9*& t : g_filter.tex)
@@ -1345,30 +1424,337 @@ void DriverEyeFromSeat(BYTE* car, float* out)
     memcpy(out, car == g_eyeCar ? g_eyeFromSeat : kDriverEye, sizeof(g_eyeFromSeat));
 }
 
+// The driver's eyes in the world, as the cockpit has them.
+void CarEye(BYTE* car, float* eye)
+{
+    const float* m = (const float*)(car + fo2::kCarMatrix);
+    const float* seat = (const float*)(car + fo2::kCarDriverLoc);
+    float eyeFromSeat[3];
+    DriverEyeFromSeat(car, eyeFromSeat);
+    float p[3] = { seat[0] + eyeFromSeat[0], seat[1] + eyeFromSeat[1], seat[2] + eyeFromSeat[2] };
+    for (int i = 0; i < 3; i++) eye[i] = m[12 + i] + p[0] * m[i] + p[1] * m[4 + i] + p[2] * m[8 + i];
+}
+
 // When the eyes look from inside the player's car, the camera's placement moves to the driver's eyes,
-// fixed in the car (the driver's own node flies off with it when it is thrown out). Which camera the view
-// has comes out while the view renders (CarViewMode): this is the last frame's, so a cut from the camera
-// inside to one outside is told by the distance.
+// fixed in the car (the driver's own node flies off with it when it is thrown out: see FlightEye). Which
+// camera the view has comes out while the view renders (CarViewMode): this is the last frame's, so a cut from
+// the camera inside to one outside is told by the distance.
 bool CockpitEye(float* anchor)
 {
     if (!g_cockpitView || !g_cfg.vrCockpit) return false;
     BYTE* player = *(BYTE**)fo2::kLocalPlayer;
     BYTE* car = player ? *(BYTE**)(player + fo2::kPlayerCar) : nullptr;
     if (!car) return false;
-    const float* m = (const float*)(car + fo2::kCarMatrix);
-    const float* seat = (const float*)(car + fo2::kCarDriverLoc);
-    float eyeFromSeat[3];
-    DriverEyeFromSeat(car, eyeFromSeat);
-    float p[3] = { seat[0] + eyeFromSeat[0], seat[1] + eyeFromSeat[1], seat[2] + eyeFromSeat[2] };
     float eye[3], d2 = 0;
-    for (int i = 0; i < 3; i++)
-    {
-        eye[i] = m[12 + i] + p[0] * m[i] + p[1] * m[4 + i] + p[2] * m[8 + i];
-        d2 += (eye[i] - anchor[12 + i]) * (eye[i] - anchor[12 + i]);
-    }
+    CarEye(car, eye);
+    for (int i = 0; i < 3; i++) d2 += (eye[i] - anchor[12 + i]) * (eye[i] - anchor[12 + i]);
     if (d2 > 1.0f) return false;
     memcpy(anchor + 12, eye, sizeof(eye));
     return true;
+}
+
+// The player at this PC (see game.h: in the stunts kLocalPlayer stays empty).
+BYTE* LocalPlayer()
+{
+    BYTE* player = *(BYTE**)fo2::kLocalPlayer;
+    BYTE* gf = *(BYTE**)fo2::kGameFlow;
+    BYTE* race = gf && !player ? *(BYTE**)(gf + fo2::kGfRace) : nullptr;
+    if (!race) return player;
+    BYTE** begin = *(BYTE***)(race + fo2::kRacePlayers);
+    BYTE** end = *(BYTE***)(race + fo2::kRacePlayers + 4);
+    for (BYTE** p = begin; p && p < end && p - begin < 16; p++)
+        if (*p && *(int*)(*p + fo2::kPlayerType) == 1) return *p;
+    return nullptr;
+}
+
+// A turn (the rows right, up, forward of a matrix) as a quaternion (x, y, z, w), and back.
+void RowsToQuat(const float* m, float* q)
+{
+    // a(i, j): the matrix with the rows as its columns.
+    auto a = [m](int i, int j) { return m[4 * j + i]; };
+    float tr = a(0, 0) + a(1, 1) + a(2, 2);
+    if (tr > 0.0f)
+    {
+        float s = 2.0f * sqrtf(tr + 1.0f);
+        q[0] = (a(2, 1) - a(1, 2)) / s, q[1] = (a(0, 2) - a(2, 0)) / s, q[2] = (a(1, 0) - a(0, 1)) / s, q[3] = 0.25f * s;
+    }
+    else if (a(0, 0) > a(1, 1) && a(0, 0) > a(2, 2))
+    {
+        float s = 2.0f * sqrtf(std::max(1.0f + a(0, 0) - a(1, 1) - a(2, 2), 1e-6f));
+        q[0] = 0.25f * s, q[1] = (a(0, 1) + a(1, 0)) / s, q[2] = (a(0, 2) + a(2, 0)) / s, q[3] = (a(2, 1) - a(1, 2)) / s;
+    }
+    else if (a(1, 1) > a(2, 2))
+    {
+        float s = 2.0f * sqrtf(std::max(1.0f + a(1, 1) - a(0, 0) - a(2, 2), 1e-6f));
+        q[0] = (a(0, 1) + a(1, 0)) / s, q[1] = 0.25f * s, q[2] = (a(1, 2) + a(2, 1)) / s, q[3] = (a(0, 2) - a(2, 0)) / s;
+    }
+    else
+    {
+        float s = 2.0f * sqrtf(std::max(1.0f + a(2, 2) - a(0, 0) - a(1, 1), 1e-6f));
+        q[0] = (a(0, 2) + a(2, 0)) / s, q[1] = (a(1, 2) + a(2, 1)) / s, q[2] = 0.25f * s, q[3] = (a(1, 0) - a(0, 1)) / s;
+    }
+    float l = sqrtf(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
+    for (int i = 0; i < 4; i++) q[i] /= l > 1e-6f ? l : 1.0f;
+}
+
+void QuatToRows(const float* q, float* m)
+{
+    float x = q[0], y = q[1], z = q[2], w = q[3];
+    const float a[3][3] = { { 1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w) },
+                            { 2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w) },
+                            { 2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y) } };
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++) m[4 * j + i] = a[i][j];
+}
+
+// From the turn a to b by t (0..1), at an even pace.
+void Slerp(const float* a, const float* b, float t, float* out)
+{
+    float d = a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3], sb = d < 0.0f ? -1.0f : 1.0f;
+    d = fabsf(d);
+    float wa = 1.0f - t, wb = t;
+    if (d < 0.9995f)
+    {
+        float th = acosf(d), s = sinf(th);
+        wa = sinf((1.0f - t) * th) / s, wb = sinf(t * th) / s;
+    }
+    float l = 0;
+    for (int i = 0; i < 4; i++) out[i] = wa * a[i] + wb * sb * b[i], l += out[i] * out[i];
+    l = sqrtf(l);
+    for (int i = 0; i < 4; i++) out[i] /= l > 1e-6f ? l : 1.0f;
+}
+
+float SmoothStep(float x)
+{
+    x = std::clamp(x, 0.0f, 1.0f);
+    return x * x * (3.0f - 2.0f * x);
+}
+
+// [VR] EjectView: when the driver is thrown out of the car (a heavy crash, or launched in the stunts; see
+// game.h, kRagdollOut) the game cuts to its camera behind him. When the eyes were his (the cockpit) they stay
+// in his head instead as he flies: in the middle of its box as the physics moves it (not at the face, which
+// often lands on the ground: the middle stays 8 cm or more clear of what the box lies on), but not turned with
+// it as it tumbles: the view turns with the user's head only, against the car's heading at the moment he left
+// it with the horizon level (the world comes level over the first second). From where they were the moment
+// before (the driver's eyes in the car) the eyes glide into the head over the first 0.3 s, so there is no cut.
+// His own body is left out of the eyes (as for the camera inside the car), the near clipping plane comes in to
+// 6 cm (the ground, the car he goes through), the speed zoom and blur (the car's) stay out, and the cockpit's
+// cards with the car (the HUD is all on its panel, as with the cameras outside). When the car is reset with
+// him back in it the eyes go back to the cockpit (the game cuts its own camera there), coming up from black over
+// 0.4 s. EjectView=2 does the same from the cameras outside the car (the stunts' cars have no camera inside):
+// the eyes glide in from the game's camera over 0.8 s.
+constexpr float kFlightNear = 0.06f;         // metres
+constexpr float kFlightGlide = 0.3f;         // seconds, from the cockpit
+constexpr float kFlightGlideOutside = 0.8f;  // from a camera outside the car
+constexpr float kFlightLevel = 1.0f;         // seconds until the view is level
+constexpr float kFlightBackFade = 0.4f;      // seconds from black, back in the car
+// The game puts the ragdoll by the windscreen and its first physics step pushes it on, clear of the car (some
+// 0.4 m more than its speed): for so many frames the eyes stay where they were (in the cockpit, with the car) and
+// only then glide into the head.
+constexpr int kFlightSettleFrames = 2;
+
+struct Flight
+{
+    BYTE* car = nullptr;  // the player's car, its driver out and the eyes in his head (null: none)
+    double start = 0;     // when the eyes start gliding into his head (after kFlightSettleFrames)
+    bool cockpit = false;  // the eyes were in the cockpit (else the game's camera)
+    bool gliding = false;  // the ragdoll has settled, the eyes glide (or are) in his head
+    float fromCamera[3] = {}, fromMove[3] = {};  // the game's camera the frame before, and its last step
+    float glideTime = 0;
+    float glide[3] = {};                // where the eyes were less where his are, at the start (it fades out)
+    float dvel[3] = {};                 // and how fast they went less how fast his go (m/s; it fades out too)
+    float from[4] = {}, level[4] = {};  // the view's turn at the start and level (quaternions)
+    float launch[3] = {};               // his head at the start
+    float head[3] = {};                 // his head in the last frame
+    double lastNow = 0;                 // and when that was
+    // For the log: the frames, the eyes' last place and step, their first steps (and the one before), the
+    // largest change of step and the head's largest step (the physics').
+    int frames = 0;
+    float last[3] = {}, lastStep = 0, maxJerk = 0, maxJerkAt = 0, firstSteps[6] = {}, stepBefore = 0;
+    float maxHeadStep = 0, maxHeadStepAt = 0;
+    bool driverHidden = false;  // the driver's node was left out before the eyes left him out
+    // The frame before (FlightSeen): the eyes' anchor and step, whether it was the cockpit.
+    float prevAnchor[16] = {}, prevStep = 0, prevMove[3] = {};
+    bool prevCockpit = false;
+    double prevTime = 0;
+    double back = 0;  // when the eyes went back into the car
+} g_flight;
+
+// The thrown driver's head in the world: the middle of its box (its segment's matrix, which the physics moves).
+bool HeadEye(BYTE* car, float* eye)
+{
+    const float* m = *(const float**)(car + fo2::kCarRagdoll + fo2::kRagdollSegments);
+    if (!m) return false;
+    const float* c = (const float*)(car + fo2::kCarMatrix);
+    float d2 = 0;
+    for (int i = 0; i < 3; i++)
+    {
+        eye[i] = m[12 + i];
+        d2 += (eye[i] - c[12 + i]) * (eye[i] - c[12 + i]);
+    }
+    return d2 < 500.0f * 500.0f;  // (false for NaN too)
+}
+
+void EndFlight(const char* why)
+{
+    Flight& f = g_flight;
+    float d = 0;
+    for (int i = 0; i < 3; i++) d += (f.head[i] - f.launch[i]) * (f.head[i] - f.launch[i]);
+    Log("eject: %s after %.2f s, %d frames, %.1f m from where he left the car; the eyes' steps %.3f before, then %.3f %.3f %.3f %.3f "
+        "%.3f %.3f m; their step changed at most %.3f m (at %.2f s); his head moved at most %.3f m in a frame (at %.2f s)",
+        why, NowSeconds() - f.start, f.frames, sqrtf(d), f.stepBefore, f.firstSteps[0], f.firstSteps[1], f.firstSteps[2], f.firstSteps[3],
+        f.firstSteps[4], f.firstSteps[5], f.maxJerk, f.maxJerkAt, f.maxHeadStep, f.maxHeadStepAt);
+    f.car = nullptr;
+    f.back = NowSeconds();
+}
+
+// Once a frame, before the eyes: when the player's driver is out, the eyes' anchor in his head (true).
+bool FlightEye(float* anchor)
+{
+    Flight& f = g_flight;
+    BYTE* player = LocalPlayer();
+    BYTE* car = player ? *(BYTE**)(player + fo2::kPlayerCar) : nullptr;
+    bool out = car && *(const int*)(car + fo2::kCarRagdoll + fo2::kRagdollOut) != 0;
+    if (f.car && car != f.car) EndFlight("the eyes leave the thrown driver (another car)");
+    if (f.car && !out) EndFlight("back in the car");
+    // Back in the car: the eyes come up from black (laid over them at Present, see g_fade).
+    float back = (float)(NowSeconds() - f.back) / kFlightBackFade;
+    if (back < 1.0f) g_fade[1] = FadeOver(g_fade[1], (DWORD)lroundf(255.0f * (1.0f - SmoothStep(back))) << 24);
+    if (!car || !g_cfg.vrEjectView || !out) return false;
+    double now = NowSeconds();
+    float head[3];
+    bool placed = HeadEye(car, head);
+    const float* c = (const float*)(car + fo2::kCarMatrix);
+    if (!f.car)
+    {
+        // Thrown out just now: the eyes were in the cockpit the frame before (or, EjectView=2, with any camera).
+        bool cockpit = f.prevCockpit && now - f.prevTime < 0.25;
+        if (!placed || now - f.prevTime >= 0.25 || (!cockpit && g_cfg.vrEjectView < 2)) return false;
+        Flight next;
+        memcpy(next.prevAnchor, f.prevAnchor, sizeof(next.prevAnchor));
+        next.car = car;
+        next.start = now;
+        next.cockpit = cockpit;
+        memcpy(next.fromCamera, f.prevAnchor + 12, sizeof(next.fromCamera));
+        memcpy(next.fromMove, f.prevMove, sizeof(next.fromMove));
+        next.glideTime = cockpit ? kFlightGlide : kFlightGlideOutside;
+        memcpy(next.launch, head, sizeof(head));
+        memcpy(next.head, head, sizeof(head));
+        memcpy(next.last, f.prevAnchor + 12, sizeof(next.last));
+        next.lastStep = next.stepBefore = f.prevStep;
+        // The view's turn the frame before, and the same heading level (the car's, if it looked straight up
+        // or down).
+        RowsToQuat(f.prevAnchor, next.from);
+        float fx = f.prevAnchor[8], fz = f.prevAnchor[10];
+        if (fx * fx + fz * fz < 0.04f) fx = c[8], fz = c[10];
+        float l = sqrtf(fx * fx + fz * fz);
+        if (l < 1e-3f) fx = 0.0f, fz = l = 1.0f;
+        fx /= l, fz /= l;
+        float level[16] = { fz, 0, -fx, 0, 0, 1, 0, 0, fx, 0, fz, 0, 0, 0, 0, 1 };
+        RowsToQuat(level, next.level);
+        f = next;
+    }
+    if (!f.gliding && f.frames >= kFlightSettleFrames && placed)
+    {
+        // Settled: from where the eyes were (in the cockpit, or the game's camera going on as it went).
+        float from[3];
+        if (f.cockpit)
+            CarEye(car, from);
+        else
+            for (int i = 0; i < 3; i++) from[i] = f.fromCamera[i] + (float)(f.frames + 1) * f.fromMove[i];
+        f.gliding = true;
+        f.start = now;
+        float dt = (float)std::clamp(now - f.lastNow, 1.0 / 150.0, 1.0 / 30.0);
+        for (int i = 0; i < 3; i++)
+        {
+            f.glide[i] = from[i] - head[i];
+            f.dvel[i] = ((from[i] - f.last[i]) - (head[i] - f.head[i])) / dt;
+        }
+        memcpy(f.head, head, sizeof(head));
+        const float* v = (const float*)(car + fo2::kCarVelocity);
+        float gl = sqrtf(f.glide[0] * f.glide[0] + f.glide[1] * f.glide[1] + f.glide[2] * f.glide[2]);
+        Log("eject: the driver is thrown out at %.0f km/h, the eyes follow his head (from %s, %.2f m away; the view %.0f deg off level)",
+            3.6f * sqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]), f.cockpit ? "the cockpit" : "the game's camera", gl,
+            2.0f * acosf(std::min(1.0f, fabsf(f.from[0] * f.level[0] + f.from[1] * f.level[1] + f.from[2] * f.level[2] +
+                                              f.from[3] * f.level[3]))) * 57.29578f);
+    }
+    float t = (float)(now - f.start);
+    if (!f.gliding)
+    {
+        // Still where they were, turned as the frame before.
+        QuatToRows(f.from, anchor);
+        if (f.cockpit)
+            CarEye(car, anchor + 12);
+        else
+            for (int i = 0; i < 3; i++) anchor[12 + i] = f.fromCamera[i] + (float)(f.frames + 1) * f.fromMove[i];
+        if (placed) memcpy(f.head, head, sizeof(head));
+    }
+    else if (placed && t > 0.0f)
+    {
+        float hs = 0;
+        for (int i = 0; i < 3; i++) hs += (head[i] - f.head[i]) * (head[i] - f.head[i]);
+        if (sqrtf(hs) > f.maxHeadStep) f.maxHeadStep = sqrtf(hs), f.maxHeadStepAt = t;
+        memcpy(f.head, head, sizeof(head));  // (else where it was)
+    }
+    if (f.gliding)
+    {
+        float q[4];
+        Slerp(f.from, f.level, SmoothStep(t / kFlightLevel), q);
+        QuatToRows(q, anchor);
+        // The glide's offset and the difference of speed fade out together, the eyes' speed with no step (the
+        // offset as a smoothstep, the speed as the Hermite curve that starts with it and ends at rest).
+        float u = std::min(t / f.glideTime, 1.0f), g = 1.0f - SmoothStep(u), h = f.glideTime * u * (1.0f - u) * (1.0f - u);
+        for (int i = 0; i < 3; i++) anchor[12 + i] = f.head[i] + g * f.glide[i] + h * f.dvel[i];
+    }
+    anchor[3] = anchor[7] = anchor[11] = 0.0f;
+    anchor[15] = 1.0f;
+    // How evenly the eyes move (the log): their step from the last frame and its change.
+    float step = 0;
+    for (int i = 0; i < 3; i++) step += (anchor[12 + i] - f.last[i]) * (anchor[12 + i] - f.last[i]);
+    step = sqrtf(step);
+    if (f.frames < 6) f.firstSteps[f.frames] = step;
+    if (fabsf(step - f.lastStep) > f.maxJerk) f.maxJerk = fabsf(step - f.lastStep), f.maxJerkAt = t;
+    f.lastStep = step;
+    memcpy(f.last, anchor + 12, sizeof(f.last));
+    f.lastNow = now;
+    f.frames++;
+    BYTE* driver = *(BYTE**)(car + fo2::kCarDriver);
+    f.driverHidden = driver && (*(const unsigned*)(driver + fo2::kNodeFlags) & fo2::kNodeHidden);
+    return true;
+}
+
+// After the eyes' anchor is set: for the next frame's FlightEye.
+void FlightSeen(const float* anchor, bool cockpit)
+{
+    Flight& f = g_flight;
+    for (int i = 0; i < 3; i++) f.prevMove[i] = anchor[12 + i] - f.prevAnchor[12 + i];
+    f.prevStep = sqrtf(f.prevMove[0] * f.prevMove[0] + f.prevMove[1] * f.prevMove[1] + f.prevMove[2] * f.prevMove[2]);
+    memcpy(f.prevAnchor, anchor, sizeof(f.prevAnchor));
+    f.prevCockpit = cockpit;
+    f.prevTime = NowSeconds();
+}
+
+// The thrown driver's body is left out of the eyes: SetCarView (which sets the driver's node's flags when the
+// car's view changes) has run for the view (CarViewDone); after the eyes he is put back as he was.
+void FlightDriverBack()
+{
+    BYTE* driver = g_flight.car ? *(BYTE**)(g_flight.car + fo2::kCarDriver) : nullptr;
+    if (driver && !g_flight.driverHidden) *(unsigned*)(driver + fo2::kNodeFlags) &= ~fo2::kNodeHidden;
+}
+
+// For tests (the background mode's "eject"): the player's driver thrown out of the car, as a heavy crash does.
+void ThrowDriverOut()
+{
+    BYTE* player = LocalPlayer();
+    BYTE* car = player ? *(BYTE**)(player + fo2::kPlayerCar) : nullptr;
+    if (!car || !InRace() || *(const int*)(car + fo2::kCarRagdoll + fo2::kRagdollOut))
+    {
+        Log("eject: no car with its driver in it");
+        return;
+    }
+    using ThrowFn = void(__stdcall*)(BYTE* car, int arg);
+    ((ThrowFn)fo2::kThrowDriverOut)(car, *(const int*)(car + fo2::kCarCrashArg));
+    Log("eject: the driver thrown out for the test: %s", *(const int*)(car + fo2::kCarRagdoll + fo2::kRagdollOut) ? "out" : "still in");
 }
 
 // The drivers' hands follow the steering through the driving animation's frames, one step every 0.02 of
@@ -1450,23 +1836,147 @@ static __declspec(naked) void SampleAnimHook()
 
 static int __stdcall CarViewMode(int mode, BYTE* car)
 {
+    bool flying = g_vrEye.active && car == g_flight.car;  // the eyes in the thrown driver's head: the car whole
     BYTE* player = *(BYTE**)fo2::kLocalPlayer;
-    if (!player || car != *(BYTE**)(player + fo2::kPlayerCar)) return mode;
+    if (!player || car != *(BYTE**)(player + fo2::kPlayerCar)) return flying ? 1 : mode;
     g_cockpitView = mode == 0;
     bool cockpit = g_cockpitView && g_cfg.vrCockpit && xr::Running();
-    return cockpit ? 1 : mode;
+    return cockpit || flying ? 1 : mode;
+}
+
+// After SetCarView: in the eyes the thrown driver's own body is left out (see FlightEye).
+static void __stdcall CarViewDone(BYTE* car)
+{
+    BYTE* driver = g_vrEye.active && car == g_flight.car ? *(BYTE**)(car + fo2::kCarDriver) : nullptr;
+    if (driver) *(unsigned*)(driver + fo2::kNodeFlags) |= fo2::kNodeHidden;
 }
 
 // At kCarViewCall, instead of kSetCarView (car in ecx, mode in eax).
 static __declspec(naked) void CarViewHook()
 {
     __asm {
-        push ecx
+        push ecx  // (for CarViewDone)
         push ecx
         push eax
         call CarViewMode
-        pop ecx
-        jmp dword ptr [g_setCarViewFn]
+        mov ecx, [esp]
+        call dword ptr [g_setCarViewFn]
+        call CarViewDone
+        ret
+    }
+}
+
+// [VR] CockpitGlass: the car's windows seen from the driver's seat. The game's camera inside the car leaves them
+// out; the cockpit shows the car whole (CarViewMode), and from inside the game's glass (see game.h) looks wrong both
+// ways: the windscreen reflects the environment map's black ground, no glass to be seen, only the picture darkened
+// by half (and its depth hides the sun's flare and the dust beyond it), while the side windows, at their glancing
+// angle, are a bright haze. In the cockpit's eyes the player's whole glass is drawn lighter: its reflection and tint
+// times CockpitGlass (1: as strong as the game's), the sun's glints on it times its square (from inside they glare
+// over the road ahead), the reflection turned upwards (mirrored in the level plane through the eye: the sky, as on
+// the glass seen from outside, instead of the ground), and without its depth, so that what lies beyond shows through.
+// Every window, whole or broken, is drawn as its layer facing out, which glass seen from outside always has (the one
+// facing in is up to the model); broken glass otherwise as the game draws it.
+static uintptr_t g_batchDrawFn = fo2::kBatchDraw;
+
+// (batch in esi)
+static __declspec(naked) void __stdcall CallBatchDraw(BYTE*)
+{
+    __asm {
+        push esi
+        mov esi, [esp + 8]
+        call dword ptr [g_batchDrawFn]
+        pop esi
+        ret 4
+    }
+}
+
+// The player's car's glass: whether a batch is some of it, and whether that is broken.
+enum class Glass { None, Whole, Broken };
+
+Glass GlassOf(BYTE* batch)
+{
+    BYTE* player = *(BYTE**)fo2::kLocalPlayer;
+    BYTE* car = player ? *(BYTE**)(player + fo2::kPlayerCar) : nullptr;
+    if (!car) return Glass::None;
+    BYTE** first = *(BYTE***)(car + fo2::kCarWindows);
+    BYTE** last = *(BYTE***)(car + fo2::kCarWindows + 4);
+    if (!first || std::find(first, last, batch) == last) return Glass::None;
+    BYTE* material = *(BYTE**)batch;
+    for (int i = 0; i < 4; i++)
+    {
+        const BYTE* window = car + fo2::kCarWindowSlots + i * fo2::kWindowSlotSize;
+        if (*(BYTE* const*)window == material) return window[fo2::kWindowBroken] ? Glass::Broken : Glass::Whole;
+    }
+    return Glass::Whole;  // glass that does not break
+}
+
+// The side mirrors' housings' textures, while they are looked for (see MakeGlassMask).
+bool g_mirrorSkinWanted;
+void NoteMirrorSkin(BYTE* batch);
+void MirrorsIntoEye();
+
+static void __stdcall DynamicBatchDraw(BYTE* batch)
+{
+    if (g_mirrorSkinWanted && g_vrEye.active) NoteMirrorSkin(batch);
+    Glass glass = g_vrEye.active && g_vrEye.cockpit ? GlassOf(batch) : Glass::None;
+    if (glass == Glass::None)
+    {
+        CallBatchDraw(batch);
+        return;
+    }
+    MirrorsIntoEye();  // the side mirrors seen through the windows (see RenderMirrors)
+    IDirect3DDevice9* dev = *(IDirect3DDevice9**)fo2::kD3DDevice;
+    DWORD cull = D3DCULL_CCW;
+    dev->GetRenderState(D3DRS_CULLMODE, &cull);
+    dev->SetRenderState(D3DRS_CULLMODE, cull == D3DCULL_CW ? D3DCULL_CCW : D3DCULL_CW);
+    if (glass == Glass::Broken)
+    {
+        CallBatchDraw(batch);
+        dev->SetRenderState(D3DRS_CULLMODE, cull);
+        return;
+    }
+    float g = g_cfg.vrCockpitGlass;
+    if (g <= 0.0f)
+    {
+        dev->SetRenderState(D3DRS_CULLMODE, cull);
+        return;
+    }
+    // The vertex shader's constants (pro_car_window.sha): the world matrix's rows from c4, the eye at c8, the specular
+    // colour at c22, the tint (w) at c32, the Fresnel term's base and slope at c33.
+    float world[3][4], eye[4], specular[4], tint[4], fresnel[4];
+    dev->GetVertexShaderConstantF(4, &world[0][0], 3);
+    dev->GetVertexShaderConstantF(8, eye, 1);
+    dev->GetVertexShaderConstantF(22, specular, 1);
+    dev->GetVertexShaderConstantF(32, tint, 1);
+    dev->GetVertexShaderConstantF(33, fresnel, 1);
+    float s[4] = { specular[0] * g * g, specular[1] * g * g, specular[2] * g * g, specular[3] };
+    float t[4] = { tint[0], tint[1], tint[2], 1.0f - (1.0f - tint[3]) * g };
+    float f[4] = { fresnel[0] * g, fresnel[1] * g, fresnel[2], fresnel[3] };
+    // y -> 2 eye.y - y: the eye stays, the reflection's vertical turns.
+    float up[4] = { -world[1][0], -world[1][1], -world[1][2], 2.0f * eye[1] - world[1][3] };
+    dev->SetVertexShaderConstantF(22, s, 1);
+    dev->SetVertexShaderConstantF(32, t, 1);
+    dev->SetVertexShaderConstantF(33, f, 1);
+    dev->SetVertexShaderConstantF(5, up, 1);
+    DWORD depthWrite = TRUE;
+    dev->GetRenderState(D3DRS_ZWRITEENABLE, &depthWrite);
+    dev->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+    CallBatchDraw(batch);
+    dev->SetRenderState(D3DRS_ZWRITEENABLE, depthWrite);
+    dev->SetRenderState(D3DRS_CULLMODE, cull);
+    dev->SetVertexShaderConstantF(5, world[1], 1);
+    dev->SetVertexShaderConstantF(22, specular, 1);
+    dev->SetVertexShaderConstantF(32, tint, 1);
+    dev->SetVertexShaderConstantF(33, fresnel, 1);
+}
+
+// At kDynamicBatchDrawCall, instead of kBatchDraw (the batch in esi).
+static __declspec(naked) void DynamicBatchDrawHook()
+{
+    __asm {
+        push esi
+        call DynamicBatchDraw
+        ret
     }
 }
 
@@ -1487,6 +1997,7 @@ void ToggleHud()
         return;
     }
     g_cfg.vrHud = g_cfg.vrHud == 2 ? 1 : 2;
+    SaveIniValue("VR", "Hud", g_cfg.vrHud == 2 ? "2" : "1");  // (kept for the next game)
     Log("Hud key: Hud=%d (%s)", g_cfg.vrHud, g_cfg.vrHud == 2 ? "not while racing" : "always");
 }
 
@@ -1571,6 +2082,10 @@ int __fastcall EnginePresentHook(void* self, void*)
     shot |= (bg & kPollShot) != 0;
     if ((bg & kPollTrace) && g_trace != Trace::Running) g_trace = Trace::Armed;
     if (KeyPressed(g_cfg.keyHud, g_hudKeyWasDown) || (bg & kPollHud)) ToggleHud();
+    if (bg & kPollEject) ThrowDriverOut();
+    char knockSide;
+    int knockState;
+    if (TakeMirrorKnock(&knockSide, &knockState)) KnockMirror(knockSide, knockState);
     if (g_cfg.autoShotSeconds > 0 && InRace() && now - g_lastShot >= g_cfg.autoShotSeconds) shot = true;
     if (shot)
     {
@@ -1582,6 +2097,8 @@ int __fastcall EnginePresentHook(void* self, void*)
         {
             SaveSurfacePng(dev, panel, ShotPath("vr_hud").c_str(), true);
             panel->Release();
+            // and the cockpit's instruments, drawn apart
+            for (int i = 0; i < 2 && HudCardsRouted(); i++) SaveSurfacePng(dev, g_hud.cardRT[i], ShotPath(i ? "vr_cards2" : "vr_cards").c_str(), true);
         }
     }
 
@@ -1709,6 +2226,12 @@ void HookSlot(void** vtbl, int index, void* hook, T& orig)
     VirtualProtect(&vtbl[index], sizeof(void*), old, &old);
 }
 
+HRESULT __stdcall DrawPrimitiveHook(IDirect3DDevice9* dev, D3DPRIMITIVETYPE t, UINT first, UINT n);
+HRESULT __stdcall DrawIndexedPrimitiveHook(IDirect3DDevice9* dev, D3DPRIMITIVETYPE t, INT base, UINT least, UINT count, UINT start, UINT n);
+HRESULT __stdcall DrawPrimitiveUPHook(IDirect3DDevice9* dev, D3DPRIMITIVETYPE t, UINT n, const void* v, UINT stride);
+HRESULT __stdcall DrawIndexedPrimitiveUPHook(IDirect3DDevice9* dev, D3DPRIMITIVETYPE t, UINT least, UINT count, UINT n, const void* i,
+                                             D3DFORMAT f, const void* v, UINT stride);
+
 void HookDevice(IDirect3DDevice9* dev)
 {
     if (!dev || dev == g_hookedDevice) return;
@@ -1721,6 +2244,10 @@ void HookDevice(IDirect3DDevice9* dev)
     HookSlot(vtbl, vt::EndScene, (void*)&EndSceneHook, oEndScene);
     HookSlot(vtbl, vt::Clear, (void*)&ClearHook, oClear);
     HookSlot(vtbl, vt::SetRenderState, (void*)&SetRenderStateHook, oSetRenderState);
+    HookSlot(vtbl, vt::DrawPrimitive, (void*)&DrawPrimitiveHook, oDrawPrimitive);
+    HookSlot(vtbl, vt::DrawIndexedPrimitive, (void*)&DrawIndexedPrimitiveHook, oDrawIndexedPrimitive);
+    HookSlot(vtbl, vt::DrawPrimitiveUP, (void*)&DrawPrimitiveUPHook, oDrawPrimitiveUP);
+    HookSlot(vtbl, vt::DrawIndexedPrimitiveUP, (void*)&DrawIndexedPrimitiveUPHook, oDrawIndexedPrimitiveUP);
     g_hookedDevice = dev;
     Log("IDirect3DDevice9 %p hooked (vtable %p)", (void*)dev, (void*)vtbl);
     prof::Hook(dev, g_cfg.testDeviceTiming || g_cfg.testReplayTrace > 0);
@@ -1890,6 +2417,904 @@ float CockpitNear(const float* anchor, const xr::EyePose* pose, const xr::EyeFov
     return g_cockpitNear;
 }
 
+// The cockpit's instruments ([VR] CockpitHud): the HUD's gauges, position, lap, map and the rival's name
+// and damage stand in the car as cards on one band curved round the driver's eyes (a sphere), drawn into
+// the eyes' pictures with the depth, so the hands and the steering wheel go in front of them. They are laid
+// out the same in every car (as made by hand in the Venom: the gauges in the wheel's opening above its hub,
+// the position left of the wheel, the lap and the rival's card right of it, the map below the rival's),
+// turned to the wheel's hub as the driver's eyes see it (LayCockpitCards). The HUD draws them into targets of
+// their own instead of its own (DrawHudBatch; the eyes show the frame before's), so each card shows all of
+// its instrument, its effects too (the nitro's flames by the gauges, the crash bonus by the rival's card), and
+// nothing else; the HUD panel keeps the rest (the messages, the countdown, the pause menu).
+struct CockpitCard
+{
+    float du0, dv0, du1, dv1;  // where the HUD draws it, fractions of the (16:9) screen: a draw that lies
+                               // inside goes to the card's target (CardOfBox)
+    float u0, v0, u1, v1;      // the part of that target the card shows, all the drawing does
+    float left, right, top, bottom;  // its place on the band: degrees right of and above the wheel's hub as
+                                     // the driver's eyes see it
+    float Aspect() const { return (u1 - u0) * 16.0f / ((v1 - v0) * 9.0f); }
+};
+enum { kCardGauges, kCardPosition, kCardLap, kCardMap, kCardRival, kCardCount };
+constexpr CockpitCard kCockpitCards[kCardCount] = {
+    // gauges (and the nitro's label above, the nitro's bar at their left and its flames)
+    { 0.65f, 0.58f, 1.10f, 1.10f, 0.710f, 0.645f, 1.000f, 1.000f, -5.34f, 3.84f, 12.30f, 5.98f },
+    // position
+    { -0.10f, -0.10f, 0.30f, 0.16f, 0.000f, 0.000f, 0.230f, 0.150f, -31.54f, -17.42f, 12.88f, 7.68f },
+    // lap
+    { 0.70f, -0.10f, 1.10f, 0.16f, 0.770f, 0.000f, 1.000f, 0.150f, 17.24f, 31.35f, 12.88f, 7.68f },
+    // map (a tilted disc)
+    { -0.10f, 0.50f, 0.23f, 0.86f, 0.010f, 0.560f, 0.220f, 0.840f, 25.16f, 36.47f, 7.29f, -1.21f },
+    // the rival's name and damage, with the crash bonus above it and its stars to the right (which reach
+    // into the map's place and past the damage's bar)
+    { -0.20f, 0.785f, 0.50f, 1.10f, 0.000f, 0.740f, 0.620f, 0.970f, 24.59f, 62.18f, 15.50f, 7.53f },
+};
+constexpr float kCardsBand = 0.732f;      // the band's radius (metres), where the dashboard lets it be
+constexpr float kCardDepthPull = 0.015f;  // metres nearer in depth than they are, not to sink into the dashboard
+
+// The cards are drawn: in the cockpit, in a race, with the HUD on.
+bool CockpitCardsOn()
+{
+    return g_cfg.vrCockpitHud && g_cfg.vrCockpit && g_cfg.vrHud != 0 && g_cockpitView && InRace() && g_hud.tex;
+}
+
+// A mesh node's triangles (see game.h, kCarBody: its nearest model) in the car's axes, 9 floats each, and
+// the batch each comes from, appended. The indices are read from the batches' index buffers, the vertices
+// from the CPU's copy or else the vertex buffer.
+void ReadMesh(BYTE* car, BYTE* node, std::vector<float>& tris, std::vector<int>& batchOf)
+{
+    BYTE* model = node ? *(BYTE**)(node + fo2::kNodeModels) : nullptr;
+    if (!model) return;
+    // The model's axes and place in the car's.
+    const float* c = (const float*)(car + fo2::kCarMatrix);
+    const float* w = (const float*)(node + fo2::kNodeWorld);
+    float m[12];
+    for (int r = 0; r < 4; r++)
+    {
+        float d[3] = { w[4 * r], w[4 * r + 1], w[4 * r + 2] };
+        if (r == 3)
+            for (int k = 0; k < 3; k++) d[k] -= c[12 + k];
+        for (int i = 0; i < 3; i++) m[3 * r + i] = d[0] * c[4 * i] + d[1] * c[4 * i + 1] + d[2] * c[4 * i + 2];
+    }
+    BYTE** begin = *(BYTE***)(model + fo2::kModelBatches);
+    BYTE** end = *(BYTE***)(model + fo2::kModelBatches + 4);
+    for (BYTE** it = begin; it && it < end && it - begin < 64; it++)
+    {
+        BYTE* b = *it;
+        if (!b) continue;
+        DWORD prim = *(DWORD*)(b + fo2::kBatchPrimType);
+        int stride = *(int*)(b + fo2::kBatchStride);
+        int count = *(WORD*)(b + fo2::kBatchVertexCount), nidx = *(WORD*)(b + fo2::kBatchIndexCount);
+        int base = *(WORD*)(b + fo2::kBatchBaseVertex), first = *(WORD*)(b + fo2::kBatchFirstVertex);
+        int start = *(WORD*)(b + fo2::kBatchFirstIndex);
+        BYTE* ibo = *(BYTE**)(b + fo2::kBatchIndexBuffer);
+        BYTE* vbo = *(BYTE**)(b + fo2::kBatchVertexBuffer);
+        auto* ib = ibo ? *(IDirect3DIndexBuffer9**)(ibo + fo2::kIndexBufferD3D) : nullptr;
+        auto* vb = vbo ? *(IDirect3DVertexBuffer9**)(vbo + fo2::kVertexBufferD3D) : nullptr;
+        const BYTE* verts = *(const BYTE**)(b + fo2::kBatchVertices);
+        if (!ib || nidx < 3 || count <= 0 || stride < 12 || (prim != D3DPT_TRIANGLELIST && prim != D3DPT_TRIANGLESTRIP)) continue;
+        D3DINDEXBUFFER_DESC idesc;
+        if (FAILED(ib->GetDesc(&idesc)) || idesc.Format != D3DFMT_INDEX16 || (start + nidx) * 2u > idesc.Size) continue;
+        void* vdata = nullptr;
+        if (!verts)
+        {
+            D3DVERTEXBUFFER_DESC vdesc;
+            if (!vb || FAILED(vb->GetDesc(&vdesc)) || (unsigned)(base + first + count) * stride > vdesc.Size ||
+                FAILED(vb->Lock((base + first) * stride, count * stride, &vdata, D3DLOCK_READONLY)) || !vdata)
+                continue;
+            verts = (const BYTE*)vdata;
+        }
+        void* idata = nullptr;
+        if (SUCCEEDED(ib->Lock(start * 2, nidx * 2, &idata, D3DLOCK_READONLY)) && idata)
+        {
+            const WORD* idx = (const WORD*)idata;
+            auto at = [&](int i, float* out) {
+                int k = idx[i] - first;
+                if (k < 0 || k >= count) return false;
+                const float* p = (const float*)(verts + k * stride);
+                for (int j = 0; j < 3; j++) out[j] = p[0] * m[j] + p[1] * m[3 + j] + p[2] * m[6 + j] + m[9 + j];
+                return true;
+            };
+            int n = prim == D3DPT_TRIANGLELIST ? nidx / 3 : nidx - 2;
+            for (int t = 0; t < n; t++)
+            {
+                int i0 = prim == D3DPT_TRIANGLELIST ? 3 * t : t;
+                if (idx[i0] == idx[i0 + 1] || idx[i0 + 1] == idx[i0 + 2] || idx[i0] == idx[i0 + 2]) continue;  // a strip's joints
+                float v[9];
+                if (!at(i0, v) || !at(i0 + 1, v + 3) || !at(i0 + 2, v + 6)) continue;
+                tris.insert(tris.end(), v, v + 9);
+                batchOf.push_back((int)(it - begin));
+            }
+            ib->Unlock();
+        }
+        if (vdata) vb->Unlock();
+    }
+}
+
+// The cards' layout in the player's car (LayCockpitCards): on the band, a sphere round the driver's eyes.
+struct CockpitLayout
+{
+    BYTE* car = nullptr;
+    bool on[kCardCount] = {};     // the card is in the car
+    float corner[kCardCount][4][3];  // top left, top right, bottom left, bottom right, in the car's axes
+    float centre[3];              // the band's middle, in the car's axes
+    float radius = 0;             // its radius (metres)
+    float view[kCardCount][4];    // each card on it: its left and right (azimuth), top and bottom (elevation), radians
+};
+CockpitLayout g_dash;
+
+// Cards placed by hand with the Touch controllers ([Test] MoveCards, MoveCockpitCards): each one's middle
+// in the car's axes and its height (metres), kept for the car's model in scripts\FO2VR_cards.ini (a section
+// for each model, named by its folder, "Car_18"; a key for each card: x y z height; and the band's radius).
+// They stand in for the layout's places, seen from the band's middle the same.
+struct CardPlace
+{
+    bool set = false;
+    float mid[3] = {}, height = 0;
+};
+CardPlace g_places[kCardCount];
+float g_bandRadius;  // the car model's band (metres), 0: the layout's (LayCockpitCards)
+const char* const kCardNames[kCardCount] = { "gauges", "position", "lap", "map", "rival" };
+
+std::wstring CardsFile() { return ModuleDir() + L"FO2VR_cards.ini"; }
+
+// The car's model: the last part of its data folder ("Car_18").
+std::wstring CarModel(BYTE* car)
+{
+    const char* folder = *(const char**)(car + fo2::kCarFolder);
+    std::string s = folder ? folder : "";
+    while (!s.empty() && (s.back() == '/' || s.back() == '\\')) s.pop_back();
+    size_t slash = s.find_last_of("/\\");
+    if (slash != std::string::npos) s = s.substr(slash + 1);
+    return std::wstring(s.begin(), s.end());
+}
+
+void LoadCardPlaces(BYTE* car)
+{
+    std::wstring model = CarModel(car), file = CardsFile();
+    int n = 0;
+    for (int k = 0; k < kCardCount; k++)
+    {
+        CardPlace& p = g_places[k];
+        p = CardPlace();
+        wchar_t buf[128] = L"", name[16];
+        swprintf(name, 16, L"%hs", kCardNames[k]);
+        GetPrivateProfileStringW(model.c_str(), name, L"", buf, 128, file.c_str());
+        p.set = swscanf(buf, L"%f %f %f %f", &p.mid[0], &p.mid[1], &p.mid[2], &p.height) == 4 && p.height > 0.005f;
+        n += p.set;
+    }
+    wchar_t buf[32] = L"";
+    GetPrivateProfileStringW(model.c_str(), L"radius", L"", buf, 32, file.c_str());
+    g_bandRadius = std::clamp((float)_wtof(buf), 0.0f, 1.5f);
+    if (n) Log("cockpit: %d cards placed by hand in %ls (%ls)", n, model.c_str(), file.c_str());
+}
+
+void SaveCardPlace(BYTE* car, int k)
+{
+    const CardPlace& p = g_places[k];
+    std::wstring model = CarModel(car), file = CardsFile();
+    wchar_t buf[128], name[16], carName[40];
+    swprintf(name, 16, L"%hs", kCardNames[k]);
+    swprintf(buf, 128, L"%.4f %.4f %.4f %.4f", p.mid[0], p.mid[1], p.mid[2], p.height);
+    swprintf(carName, 40, L"%.32hs", (const char*)(car + fo2::kCarName));
+    WritePrivateProfileStringW(model.c_str(), L"car", carName, file.c_str());
+    WritePrivateProfileStringW(model.c_str(), name, p.set ? buf : nullptr, file.c_str());
+    if (g_dash.radius > 0)
+    {
+        // The band stays as it is now (pushed out or pulled in with a card).
+        g_bandRadius = g_dash.radius;
+        swprintf(buf, 128, L"%.4f", g_bandRadius);
+        WritePrivateProfileStringW(model.c_str(), L"radius", buf, file.c_str());
+    }
+    if (p.set)
+        Log("cockpit: %s placed by hand in %ls at %.3f %.3f %.3f, %.3f m high (the band %.3f m round the driver's eyes)", kCardNames[k],
+            model.c_str(), p.mid[0], p.mid[1], p.mid[2], p.height, g_dash.radius);
+    else
+        Log("cockpit: %s back to the layout in %ls", kCardNames[k], model.c_str());
+}
+
+// The band (see CockpitLayout): a point on it from its middle at (azimuth, elevation), r metres out; and a
+// point's azimuth, elevation and distance. The car's axes: x right, y up, z forward.
+void BandPoint(float az, float el, float r, float* out)
+{
+    const float dir[3] = { cosf(el) * sinf(az), sinf(el), cosf(el) * cosf(az) };
+    for (int i = 0; i < 3; i++) out[i] = g_dash.centre[i] + r * dir[i];
+}
+
+void BandAngles(const float* p, float& az, float& el, float& dist)
+{
+    float d[3] = { p[0] - g_dash.centre[0], p[1] - g_dash.centre[1], p[2] - g_dash.centre[2] };
+    float flat = sqrtf(d[0] * d[0] + d[2] * d[2]);
+    az = atan2f(d[0], d[2]), el = atan2f(d[1], flat), dist = sqrtf(flat * flat + d[1] * d[1]);
+}
+
+// A card on the band: its corners from its place there (view).
+void BandCorners(int k)
+{
+    const float* v = g_dash.view[k];
+    BandPoint(v[0], v[2], g_dash.radius, g_dash.corner[k][0]);
+    BandPoint(v[1], v[2], g_dash.radius, g_dash.corner[k][1]);
+    BandPoint(v[0], v[3], g_dash.radius, g_dash.corner[k][2]);
+    BandPoint(v[1], v[3], g_dash.radius, g_dash.corner[k][3]);
+}
+
+// A card onto the band from its middle and height (metres where it is): in the same direction and as
+// large as seen from the band's middle.
+void BendCard(int k, const float* mid, float height)
+{
+    float az, el, d;
+    BandAngles(mid, az, el, d);
+    d = std::max(d, 0.05f);
+    float ah = 2.0f * atanf(0.5f * height / d), aw = 2.0f * atanf(0.5f * height * kCockpitCards[k].Aspect() / d);
+    float* v = g_dash.view[k];
+    v[0] = az - 0.5f * aw, v[1] = az + 0.5f * aw, v[2] = el + 0.5f * ah, v[3] = el - 0.5f * ah;
+    BandCorners(k);
+}
+
+// The band moved out or in (radius metres): the cards stay as seen from its middle; those placed by hand
+// keep their places on it.
+void SetBandRadius(float radius)
+{
+    g_dash.radius = radius;
+    for (int k = 0; k < kCardCount; k++)
+    {
+        if (!g_dash.on[k]) continue;
+        BandCorners(k);
+        if (!g_places[k].set) continue;
+        const float* v = g_dash.view[k];
+        BandPoint(0.5f * (v[0] + v[1]), 0.5f * (v[2] + v[3]), radius, g_places[k].mid);
+        g_places[k].height = 2.0f * radius * tanf(0.5f * (v[2] - v[3]));
+    }
+}
+
+// A card placed by hand: on the band.
+void PlaceCard(int k)
+{
+    const CardPlace& p = g_places[k];
+    BendCard(k, p.mid, p.height);
+    g_dash.on[k] = true;
+}
+
+// A ray against a triangle (9 floats): the distance along d (a unit vector) from o, or -1.
+float RayTriangle(const float* o, const float* d, const float* t)
+{
+    float e1[3] = { t[3] - t[0], t[4] - t[1], t[5] - t[2] }, e2[3] = { t[6] - t[0], t[7] - t[1], t[8] - t[2] };
+    float p[3] = { d[1] * e2[2] - d[2] * e2[1], d[2] * e2[0] - d[0] * e2[2], d[0] * e2[1] - d[1] * e2[0] };
+    float det = e1[0] * p[0] + e1[1] * p[1] + e1[2] * p[2];
+    if (fabsf(det) < 1e-12f) return -1.0f;
+    float inv = 1.0f / det;
+    float s[3] = { o[0] - t[0], o[1] - t[1], o[2] - t[2] };
+    float u = (s[0] * p[0] + s[1] * p[1] + s[2] * p[2]) * inv;
+    if (u < 0.0f || u > 1.0f) return -1.0f;
+    float q[3] = { s[1] * e1[2] - s[2] * e1[1], s[2] * e1[0] - s[0] * e1[2], s[0] * e1[1] - s[1] * e1[0] };
+    float v = (d[0] * q[0] + d[1] * q[1] + d[2] * q[2]) * inv;
+    if (v < 0.0f || u + v > 1.0f) return -1.0f;
+    return (e2[0] * q[0] + e2[1] * q[1] + e2[2] * q[2]) * inv;
+}
+
+// The car's body and the steering wheel's hub as its first layout read them, before the start (the body
+// whole, the wheel straight).
+struct CabinMeshes
+{
+    BYTE* car = nullptr;
+    std::vector<float> body;
+    float hub[3] = {};
+} g_cabin;
+
+// The cards laid out in a car (see CockpitCard), once it has its driver's eyes: the band's middle there (as
+// the headset has them when centred, moved by [VR] CameraOffset; kept in the car, not following the head),
+// the layout turned to the wheel's hub as seen from it, the band as far out as in the Venom unless the car's
+// body (its dashboard, a door) is nearer at a card: then that near, so that no card sinks into it (where the
+// body is nearer than 0.45 m, a pillar, the card may be hidden behind it rather than the band brought in so
+// far). The cards placed by hand ([Test] MoveCards) stand in for theirs, on the band as far out as it was then.
+void LayCockpitCards(BYTE* car, BYTE* wheel)
+{
+    double t0 = NowSeconds();
+    g_dash = CockpitLayout();
+    g_dash.car = car;
+    const float* c = (const float*)(car + fo2::kCarMatrix);
+    if (g_cabin.car != car)
+    {
+        g_cabin = CabinMeshes();
+        g_cabin.car = car;
+        std::vector<int> batches;
+        ReadMesh(car, *(BYTE**)(car + fo2::kCarBody), g_cabin.body, batches);
+        const float* w = (const float*)(wheel + fo2::kNodeWorld) + 12;
+        for (int i = 0; i < 3; i++) g_cabin.hub[i] = (w[0] - c[12]) * c[4 * i] + (w[1] - c[13]) * c[4 * i + 1] + (w[2] - c[14]) * c[4 * i + 2];
+    }
+    const float* seat = (const float*)(car + fo2::kCarDriverLoc);
+    float eyes[3];
+    DriverEyeFromSeat(car, eyes);
+    for (int i = 0; i < 3; i++) g_dash.centre[i] = seat[i] + eyes[i] + g_cfg.vrCameraOffset[i];
+    float hubAz, hubEl, hubDist;
+    BandAngles(g_cabin.hub, hubAz, hubEl, hubDist);
+    constexpr float kDeg = 3.14159265f / 180.0f;
+    const std::vector<float>& body = g_cabin.body;
+    float radius = g_bandRadius > 0 ? g_bandRadius : kCardsBand;
+    int nearest = -1;
+    for (int k = 0; k < kCardCount; k++)
+    {
+        const CockpitCard& card = kCockpitCards[k];
+        float* v = g_dash.view[k];
+        v[0] = hubAz + card.left * kDeg, v[1] = hubAz + card.right * kDeg, v[2] = hubEl + card.top * kDeg, v[3] = hubEl + card.bottom * kDeg;
+        g_dash.on[k] = true;
+        if (g_bandRadius > 0) continue;
+        // The body across the card: 3 by 3 rays from the band's middle.
+        for (int a = 0; a < 3; a++)
+            for (int b = 0; b < 3; b++)
+            {
+                float az = v[0] + (v[1] - v[0]) * a / 2, el = v[2] + (v[3] - v[2]) * b / 2;
+                const float d[3] = { cosf(el) * sinf(az), sinf(el), cosf(el) * cosf(az) };
+                for (size_t t = 0; t + 9 <= body.size(); t += 9)
+                {
+                    float h = RayTriangle(g_dash.centre, d, &body[t]);
+                    if (h > 0.45f && h < radius + 0.02f) radius = h - 0.02f, nearest = k;
+                }
+            }
+    }
+    g_dash.radius = radius;
+    int placed = 0;
+    for (int k = 0; k < kCardCount; k++)
+    {
+        BandCorners(k);
+        if (g_places[k].set) PlaceCard(k), placed++;
+    }
+    Log("cockpit: %ls (%.32s): the cards turned to the wheel's hub (%+.1f %+.1f deg from the driver's eyes at %.3f %.3f %.3f) on a band "
+        "%.3f m round them%s%s (%d placed by hand, %.1f ms)", CarModel(car).c_str(), (const char*)(car + fo2::kCarName), hubAz / kDeg, hubEl / kDeg,
+        g_dash.centre[0], g_dash.centre[1], g_dash.centre[2], radius, nearest >= 0 ? ", as near as the body at the " : "",
+        nearest >= 0 ? kCardNames[nearest] : "", placed, 1000.0 * (NowSeconds() - t0));
+}
+
+// The instruments the HUD draws into their own targets this frame (those shown in the car): set as its
+// capture begins (BeginHudCapture). The eyes, rendered before it, show the frame before's.
+bool g_hudRoute[kCardCount];
+
+bool RouteHudCards()
+{
+    BYTE* player = *(BYTE**)fo2::kLocalPlayer;
+    bool shown = g_hud.cards[1] && CockpitCardsOn() && player && g_dash.car == *(BYTE**)(player + fo2::kPlayerCar), any = false;
+    for (int k = 0; k < kCardCount; k++) any |= g_hudRoute[k] = shown && g_dash.on[k];
+    return any;
+}
+
+bool HudCardsRouted()
+{
+    for (bool r : g_hudRoute)
+        if (r) return true;
+    return false;
+}
+
+UINT VertexCount(D3DPRIMITIVETYPE t, UINT n)
+{
+    return t == D3DPT_TRIANGLELIST ? 3 * n : t == D3DPT_LINELIST ? 2 * n : t == D3DPT_POINTLIST ? n : n + 2;
+}
+
+// The instrument whose place a box in the back buffer's pixels lies in (see CockpitCard), or -1. The
+// rival's before the map's, whose place holds the rival's crash bonus too.
+int CardOfBox(const ScreenBox& b)
+{
+    float x0 = b.x0 / g_hud.w, x1 = b.x1 / g_hud.w, y0 = b.y0 / g_hud.h, y1 = b.y1 / g_hud.h;
+    for (int k : { kCardRival, kCardGauges, kCardPosition, kCardLap, kCardMap })
+    {
+        const CockpitCard& c = kCockpitCards[k];
+        if (x0 >= c.du0 && x1 <= c.du1 && y0 >= c.dv0 && y1 <= c.dv1) return k;
+    }
+    return -1;
+}
+
+// A draw that stays on the HUD panel though its middle lies in the place of an instrument shown in the car:
+// logged (once for each place in the game's code that leads to it, at most 20), to find what else belongs
+// with the instrument.
+void LogStrayHudDraw(const void* stack, const ScreenBox& b, int sprites)
+{
+    static unsigned seen[20];
+    static int count;
+    if (count >= 20 || b.x0 > b.x1) return;
+    float u = 0.5f * (b.x0 + b.x1) / g_hud.w, v = 0.5f * (b.y0 + b.y1) / g_hud.h;
+    for (int k : { kCardRival, kCardGauges, kCardPosition, kCardLap, kCardMap })
+    {
+        const CockpitCard& c = kCockpitCards[k];
+        if (!g_hudRoute[k] || u < c.du0 || u > c.du1 || v < c.dv0 || v > c.dv1) continue;
+        unsigned ret[3];
+        prof::GameCallers(stack, ret);
+        unsigned key = ret[0] * 31u + ret[1] * 7u + ret[2];
+        for (int i = 0; i < count; i++)
+            if (seen[i] == key) return;
+        seen[count++] = key;
+        Log("cockpit: a HUD draw over the %s's place stays on the panel: %.3f %.3f .. %.3f %.3f (%d sprites), from %08X < %08X < %08X",
+            kCardNames[k], b.x0 / g_hud.w, b.y0 / g_hud.h, b.x1 / g_hud.w, b.y1 / g_hud.h, sprites, ret[0], ret[1], ret[2]);
+        return;
+    }
+}
+
+// A sprite's instrument by the game code that queues it (see SpriteQueue), else kNoOwner. The crash
+// bonus goes to the rival's card: its icon and its word ("SLAM") grow out of their place as they come.
+// The 2D particles go to the instrument they are by, the gauges' (the nitro's flames) or the rival's, else
+// to the panel: they are drawn in batches by texture, whatever they come from.
+int HudSpriteOwner(const void* stack, uintptr_t from, float x0, float y0, float x1, float y1)
+{
+    float u = 0.5f * (x0 + x1) / g_hud.w, v = 0.5f * (y0 + y1) / g_hud.h;
+    if (from == fo2::kHudParticleSprite[0] || from == fo2::kHudParticleSprite[1])
+        return v < 0.45f ? kOwnerPanel : u >= 0.6f ? kCardGauges : v >= 0.6f ? kCardRival : kOwnerPanel;
+    // The big font's letters by the rival's card while racing: the crash bonus's word ("SLAM", "POWER HIT",
+    // as it comes in large) and its stars, to the right of the rival's name (the pause menu's are there too).
+    if ((from == fo2::kHudBigTextSprite[0] || from == fo2::kHudBigTextSprite[1]) && u < 0.65f && v > 0.7f && g_framesWithoutStep < 2)
+        return kCardRival;
+    if (from == fo2::kHudTurnedSprite)
+    {
+        unsigned ret[3];  // the turned sprite's own caller
+        prof::GameCallers(stack, ret);
+        if (ret[0] == fo2::kHudTurnedSprite && ret[1] >= fo2::kHudCrashBonus && ret[1] < fo2::kHudCrashBonusEnd) return kCardRival;
+    }
+    return kNoOwner;
+}
+
+IDirect3DSurface9* CurrentTarget(IDirect3DDevice9* dev)
+{
+    IDirect3DSurface9* rt = nullptr;
+    dev->GetRenderTarget(0, &rt);
+    if (rt) rt->Release();
+    return rt;
+}
+
+// A draw of the HUD's other than its sprites' (vertices from v, `stride` apart; null: from stream 0), the
+// vertices from `first`: the instrument whose place it lies in, when that one is shown in the car; else -1.
+// These (the map's disc, a model) have their positions in the screen's pixels first in the vertex: their
+// box is read once for each place in the game's code that draws them (reading the vertices back costs a
+// wait for the GPU).
+int HudCardOf(IDirect3DDevice9* dev, const void* v, UINT stride, UINT first, UINT count)
+{
+    if (!g_hud.active || count == 0 || !HudCardsRouted() || CurrentTarget(dev) != g_hud.rt) return -1;
+    DWORD fvf = 0;
+    dev->GetFVF(&fvf);
+    if (!(fvf & D3DFVF_POSITION_MASK)) return -1;  // (a declaration of its own: not the HUD's)
+    unsigned ret[3];
+    prof::GameCallers(_AddressOfReturnAddress(), ret);
+    unsigned key = ret[0] ^ (ret[1] * 3u) ^ (ret[2] * 7u) ^ (count * 13u);
+    static struct { unsigned key; ScreenBox box; } known[16];
+    static int knownCount;
+    int n = 0;
+    while (n < knownCount && known[n].key != key) n++;
+    ScreenBox box;
+    if (n < knownCount)
+        box = known[n].box;
+    else
+    {
+        IDirect3DVertexBuffer9* vb = nullptr;
+        void* locked = nullptr;
+        if (!v)
+        {
+            UINT offset = 0;
+            D3DVERTEXBUFFER_DESC desc;
+            if (FAILED(dev->GetStreamSource(0, &vb, &offset, &stride)) || !vb) return -1;
+            if (stride < 8 || FAILED(vb->GetDesc(&desc)) || offset + (first + count) * stride > desc.Size ||
+                FAILED(vb->Lock(offset + first * stride, count * stride, &locked, D3DLOCK_READONLY)) || !locked)
+            {
+                vb->Release();
+                return -1;
+            }
+            v = locked;
+        }
+        else
+            v = (const BYTE*)v + first * stride;
+        for (UINT i = 0; i < count; i++)
+        {
+            const float* p = (const float*)((const BYTE*)v + i * stride);
+            box.Add(p[0], p[1]);
+        }
+        if (locked) vb->Unlock();
+        if (vb) vb->Release();
+        if (knownCount < 16) known[knownCount++] = { key, box };
+    }
+    int k = CardOfBox(box);
+    if (k >= 0 && g_hudRoute[k]) return k;
+    LogStrayHudDraw(_AddressOfReturnAddress(), box, 0);
+    return -1;
+}
+
+// A draw into an instrument's target (the same size as the HUD's), and back.
+template <class F>
+HRESULT DrawToCard(IDirect3DDevice9* dev, int k, F draw)
+{
+    D3DVIEWPORT9 vp;
+    dev->GetViewport(&vp);
+    oSetRenderTarget(dev, 0, g_hud.cardRT[k == kCardRival]);
+    dev->SetViewport(&vp);
+    HRESULT hr = draw();
+    oSetRenderTarget(dev, 0, g_hud.rt);
+    dev->SetViewport(&vp);
+    return hr;
+}
+
+// A batch of the HUD's screen sprites (see SpriteQueue), each where it belongs: the sprites with an
+// owner (HudSpriteOwner) where that says, all the others together where their box lies (an element's
+// pieces stay together); drawn in runs of sprites that go to the same place, in the queue's order.
+HRESULT DrawHudBatch(IDirect3DDevice9* dev, const void* stack, D3DPRIMITIVETYPE t, INT base, UINT least, UINT count, UINT start, UINT n)
+{
+    const std::vector<QueuedSprite>& q = g_hudQueue.sprites;
+    g_hudQueue.drawn = true;
+    UINT m = (UINT)q.size();
+    if (!g_hud.active || !HudCardsRouted() || !m || t != D3DPT_TRIANGLELIST || least || start || count != 4 * m || n != 2 * m ||
+        CurrentTarget(dev) != g_hud.rt)
+        return oDrawIndexedPrimitive(dev, t, base, least, count, start, n);
+    ScreenBox rest;
+    for (const QueuedSprite& s : q)
+        if (s.owner == kNoOwner && s.x0 <= s.x1) rest.Add(s.x0, s.y0), rest.Add(s.x1, s.y1), rest.count++;
+    int restCard = CardOfBox(rest);
+    if (restCard >= 0 && !g_hudRoute[restCard]) restCard = -1;
+    if (restCard < 0 && rest.count) LogStrayHudDraw(stack, rest, rest.count);
+    auto place = [&](UINT i) {
+        int o = q[i].owner;
+        return o == kNoOwner ? restCard : o >= 0 && g_hudRoute[o] ? o : -1;
+    };
+    HRESULT hr = D3D_OK;
+    for (UINT a = 0, b; a < m; a = b)
+    {
+        int k = place(a);
+        for (b = a + 1; b < m && place(b) == k;) b++;
+        auto draw = [&] { return oDrawIndexedPrimitive(dev, t, base, 4 * a, 4 * (b - a), 6 * a, 2 * (b - a)); };
+        hr = k >= 0 ? DrawToCard(dev, k, draw) : draw();
+    }
+    return hr;
+}
+
+HRESULT __stdcall DrawPrimitiveHook(IDirect3DDevice9* dev, D3DPRIMITIVETYPE t, UINT first, UINT n)
+{
+    int k = HudCardOf(dev, nullptr, 0, first, VertexCount(t, n));
+    if (k < 0) return oDrawPrimitive(dev, t, first, n);
+    return DrawToCard(dev, k, [&] { return oDrawPrimitive(dev, t, first, n); });
+}
+
+HRESULT __stdcall DrawIndexedPrimitiveHook(IDirect3DDevice9* dev, D3DPRIMITIVETYPE t, INT base, UINT least, UINT count, UINT start, UINT n)
+{
+    if ((uintptr_t)_ReturnAddress() == fo2::kSpriteBatchDraw)
+        return DrawHudBatch(dev, _AddressOfReturnAddress(), t, base, least, count, start, n);
+    int k = base >= 0 ? HudCardOf(dev, nullptr, 0, base + least, count) : -1;
+    if (k < 0) return oDrawIndexedPrimitive(dev, t, base, least, count, start, n);
+    return DrawToCard(dev, k, [&] { return oDrawIndexedPrimitive(dev, t, base, least, count, start, n); });
+}
+
+HRESULT __stdcall DrawPrimitiveUPHook(IDirect3DDevice9* dev, D3DPRIMITIVETYPE t, UINT n, const void* v, UINT stride)
+{
+    int k = stride >= 8 ? HudCardOf(dev, v, stride, 0, VertexCount(t, n)) : -1;
+    if (k < 0) return oDrawPrimitiveUP(dev, t, n, v, stride);
+    return DrawToCard(dev, k, [&] { return oDrawPrimitiveUP(dev, t, n, v, stride); });
+}
+
+HRESULT __stdcall DrawIndexedPrimitiveUPHook(IDirect3DDevice9* dev, D3DPRIMITIVETYPE t, UINT least, UINT count, UINT n, const void* i,
+                                             D3DFORMAT f, const void* v, UINT stride)
+{
+    int k = stride >= 8 ? HudCardOf(dev, v, stride, least, count) : -1;
+    if (k < 0) return oDrawIndexedPrimitiveUP(dev, t, least, count, n, i, f, v, stride);
+    return DrawToCard(dev, k, [&] { return oDrawIndexedPrimitiveUP(dev, t, least, count, n, i, f, v, stride); });
+}
+
+// Placing the cards by hand ([Test] MoveCards, the Touch controllers; for working out a layout): each
+// controller in use (moved or touched in the last 6 s) points a ray, drawn into the eyes up to the card it
+// points at (outlined) or 1 m out. Holding the trigger (or the grip) on a card carries it over the band where
+// the ray meets it; the thumbstick up and down pushes the band out and pulls it in with all its cards, left
+// and right makes the card smaller and larger. Let go, it stays there for the car's model (g_places). B or Y
+// on a card gives it back to the layout. Once a frame, with the eyes' poses (the game camera's placement as
+// they have it).
+struct HandRay
+{
+    bool shown = false, held = false;
+    float from[3] = {}, to[3] = {};  // the car's axes
+    int card = -1;                   // the card it points at or carries
+} g_rays[2];
+
+// Where a ray (from o along the unit d, the car's axes) meets the band from inside (its far side; from
+// outside its near one): the distance along it, or -1.
+float RayBand(const float* o, const float* d)
+{
+    float oc[3] = { o[0] - g_dash.centre[0], o[1] - g_dash.centre[1], o[2] - g_dash.centre[2] };
+    float b = oc[0] * d[0] + oc[1] * d[1] + oc[2] * d[2];
+    float c = oc[0] * oc[0] + oc[1] * oc[1] + oc[2] * oc[2] - g_dash.radius * g_dash.radius;
+    float disc = b * b - c;
+    if (disc < 0) return -1.0f;
+    float t0 = -b - sqrtf(disc), t1 = -b + sqrtf(disc);
+    return t0 > 0.05f ? t0 : t1 > 0.05f ? t1 : -1.0f;
+}
+
+void MoveCockpitCards(const float* anchor)
+{
+    static struct Hold
+    {
+        int card = -1;
+        float turn[2] = {};                  // its middle's azimuth and elevation from the point held
+        bool down = false, button = false;
+        float rest[3] = {};                  // where the controller was when last moved
+        double until = 0;                    // in use until then
+    } hold[2];
+    static double last;
+    double now = NowSeconds();
+    float dt = (float)std::clamp(now - last, 0.0, 0.1);
+    last = now;
+    for (HandRay& r : g_rays) r = HandRay();
+    BYTE* player = *(BYTE**)fo2::kLocalPlayer;
+    BYTE* car = player ? *(BYTE**)(player + fo2::kPlayerCar) : nullptr;
+    BYTE* wheel = car ? *(BYTE**)(car + fo2::kCarSteeringWheel) : nullptr;
+    bool on = g_cfg.testMoveCards && wheel && g_dash.car == car && CockpitCardsOn() && !g_hudLeftOut && g_dash.radius > 0;
+    const float* c = car ? (const float*)(car + fo2::kCarMatrix) : nullptr;
+    for (int h = 0; h < 2; h++)
+    {
+        Hold& g = hold[h];
+        xr::Controller in = xr::Hand(h);
+        if (!on || !in.tracked)
+        {
+            if (on && g.card >= 0) SaveCardPlace(car, g.card);
+            g.card = -1;
+            g.down = g.button = false;
+            continue;
+        }
+        // The ray in the world (as the eyes are placed), then in the car's axes.
+        xr::EyePose aim = in.aim;
+        for (int i = 0; i < 3; i++) aim.position[i] += g_cfg.testHeadOffset[i] + g_cfg.vrCameraOffset[i];
+        float m[16], o[3], d[3];
+        BuildEyeMatrix(anchor, aim, m);
+        for (int i = 0; i < 3; i++)
+        {
+            o[i] = (m[12] - c[12]) * c[4 * i] + (m[13] - c[13]) * c[4 * i + 1] + (m[14] - c[14]) * c[4 * i + 2];
+            d[i] = m[8] * c[4 * i] + m[9] * c[4 * i + 1] + m[10] * c[4 * i + 2];
+        }
+        float ld = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+        for (float& x : d) x /= ld > 1e-6f ? ld : 1.0f;
+        float stick[2];
+        for (int i = 0; i < 2; i++) stick[i] = fabsf(in.stick[i]) < 0.15f ? 0.0f : in.stick[i];
+        float moved = 0;
+        for (int i = 0; i < 3; i++) moved += (o[i] - g.rest[i]) * (o[i] - g.rest[i]);
+        if (in.trigger > 0.05f || in.grip > 0.05f || in.button || stick[0] || stick[1] || moved > 0.03f * 0.03f || g.card >= 0)
+        {
+            g.until = now + 6.0;
+            memcpy(g.rest, o, sizeof(o));
+        }
+        // The card it points at: where the ray meets the band.
+        int card = -1;
+        float best = 3.0f, at[2] = {};  // (its azimuth and elevation there)
+        {
+            float t = RayBand(o, d), p[3], dist;
+            for (int i = 0; i < 3; i++) p[i] = o[i] + t * d[i];
+            if (t > 0 && t < best) BandAngles(p, at[0], at[1], dist);
+            for (int k = 0; k < kCardCount && t > 0 && t < best && card < 0; k++)
+            {
+                const float* v = g_dash.view[k];
+                if (g_dash.on[k] && g_hudRoute[k] && at[0] >= v[0] && at[0] <= v[1] && at[1] <= v[2] && at[1] >= v[3]) card = k, best = t;
+            }
+        }
+        bool down = std::max(in.trigger, in.grip) > (g.down ? 0.3f : 0.6f);
+        if (down && !g.down && card >= 0 && hold[1 - h].card != card)
+        {
+            // Taken: placed by hand from now on, where it is.
+            CardPlace& pl = g_places[card];
+            const float* v = g_dash.view[card];
+            if (!pl.set)
+            {
+                BandPoint(0.5f * (v[0] + v[1]), 0.5f * (v[2] + v[3]), g_dash.radius, pl.mid);
+                pl.height = 2.0f * g_dash.radius * tanf(0.5f * (v[2] - v[3]));
+                pl.set = true;
+            }
+            g.card = card;
+            g.turn[0] = 0.5f * (v[0] + v[1]) - at[0], g.turn[1] = 0.5f * (v[2] + v[3]) - at[1];
+        }
+        if (!down && g.card >= 0)
+        {
+            SaveCardPlace(car, g.card);
+            g.card = -1;
+        }
+        g.down = down;
+        if (g.card >= 0)
+        {
+            // Over the band where the ray meets it (as far out as the stick puts it).
+            if (stick[1]) SetBandRadius(std::clamp(g_dash.radius * expf(0.5f * stick[1] * dt), 0.3f, 1.5f));
+            CardPlace& pl = g_places[g.card];
+            pl.height = std::clamp(pl.height * expf(1.0f * stick[0] * dt), 0.02f, 0.4f);
+            float t = RayBand(o, d), p[3], az, el, dist;
+            for (int i = 0; i < 3; i++) p[i] = o[i] + t * d[i];
+            if (t > 0)
+            {
+                BandAngles(p, az, el, dist);
+                BandPoint(az + g.turn[0], el + g.turn[1], g_dash.radius, pl.mid);
+                best = t;
+            }
+            PlaceCard(g.card);
+            card = g.card;
+        }
+        if (in.button && !g.button && card >= 0 && g.card < 0 && g_places[card].set)
+        {
+            g_places[card].set = false;
+            SaveCardPlace(car, card);
+            LayCockpitCards(car, wheel);
+        }
+        g.button = in.button;
+        HandRay& r = g_rays[h];
+        r.shown = now < g.until;
+        r.held = g.card >= 0;
+        r.card = card;
+        for (int i = 0; i < 3; i++) r.from[i] = o[i] + 0.03f * d[i], r.to[i] = o[i] + (card >= 0 ? best : 1.0f) * d[i];
+    }
+}
+
+void DrawCockpitCards(IDirect3DDevice9* dev, BYTE* cam, int eye)
+{
+    BYTE* player = *(BYTE**)fo2::kLocalPlayer;
+    BYTE* car = player ? *(BYTE**)(player + fo2::kPlayerCar) : nullptr;
+    BYTE* wheel = car ? *(BYTE**)(car + fo2::kCarSteeringWheel) : nullptr;
+    if (!wheel || !CockpitCardsOn() || g_hudLeftOut) return;  // (Hud=2 leaves them out with the panel)
+    const float* c = (const float*)(car + fo2::kCarMatrix);  // the car's axes
+    const float* e = (const float*)(cam + fo2::kCamMatrix);  // the eye's
+    // Laid out once the car has its driver's eyes (from the driver's posed head).
+    if (g_dash.car != car && car == g_eyeCar)
+    {
+        LoadCardPlaces(car);
+        LayCockpitCards(car, wheel);
+    }
+    if (g_dash.car != car) return;
+    float n = *(const float*)(cam + fo2::kCamNear), f = *(const float*)(cam + fo2::kCamFar);
+    const xr::EyeFov& fov = g_vrEye.fov;
+    float W = (float)g_vrt.w, H = (float)g_vrt.h;
+    auto dot = [](const float* a, const float* b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; };
+
+    struct V { float x, y, z, rhw; DWORD colour; float u, v; };
+    std::vector<V> verts;
+    std::vector<WORD> tris[2];  // the cards of each target (g_hud.cards)
+    // A point in the world into the eye's picture; false in front of the near plane.
+    auto project = [&](const float* p, float u, float v, V& out) {
+        float d[3] = { p[0] - e[12], p[1] - e[13], p[2] - e[14] };
+        float x = dot(d, e), y = dot(d, e + 4), z = dot(d, e + 8);
+        if (z < n) return false;
+        float zd = std::max(z - kCardDepthPull, n * 1.001f);
+        out = { (x / z - fov.left) / (fov.right - fov.left) * W - 0.5f, (fov.up - y / z) / (fov.up - fov.down) * H - 0.5f,
+                f / (f - n) * (1.0f - n / zd), 1.0f / z, 0xFFFFFFFF, u, v };
+        return true;
+    };
+    auto toWorld = [&](const float* q, float* out) {
+        for (int i = 0; i < 3; i++) out[i] = c[12 + i] + q[0] * c[i] + q[1] * c[4 + i] + q[2] * c[8 + i];
+    };
+    // A card on the band: its top and bottom at each of some columns along it, left to right (one every 2
+    // degrees: bent as the band is); `cols` pieces.
+    constexpr int kMaxColumns = 32;
+    auto bandColumns = [&](int k, float (*p)[3], int& cols) {
+        const float* v = g_dash.view[k];
+        cols = std::clamp((int)ceilf((v[1] - v[0]) / (2.0f * 3.14159265f / 180.0f)), 1, kMaxColumns);
+        for (int j = 0; j <= cols; j++)
+        {
+            float az = v[0] + (v[1] - v[0]) * j / cols, q[3];
+            BandPoint(az, v[2], g_dash.radius, q);
+            toWorld(q, p[2 * j]);
+            BandPoint(az, v[3], g_dash.radius, q);
+            toWorld(q, p[2 * j + 1]);
+        }
+    };
+    for (int k = 0; k < kCardCount; k++)
+    {
+        const CockpitCard& card = kCockpitCards[k];
+        if (!g_dash.on[k] || !g_hudRoute[k]) continue;
+        float p[2 * (kMaxColumns + 1)][3];  // top and bottom of each column
+        int cols;
+        bandColumns(k, p, cols);
+        WORD first = (WORD)verts.size();
+        bool in = true;
+        for (int j = 0; j <= cols; j++)
+        {
+            float u = card.u0 + (card.u1 - card.u0) * j / cols;
+            V top = {}, bottom = {};
+            in &= project(p[2 * j], u, card.v0, top) && project(p[2 * j + 1], u, card.v1, bottom);
+            verts.push_back(top), verts.push_back(bottom);
+        }
+        std::vector<WORD>& to = tris[k == kCardRival];
+        for (int j = 0; j < cols && in; j++)
+        {
+            WORD a = (WORD)(first + 2 * j);
+            to.insert(to.end(), { a, (WORD)(a + 2), (WORD)(a + 1), (WORD)(a + 2), (WORD)(a + 3), (WORD)(a + 1) });
+        }
+    }
+    // The controllers' rays and the outline of the card each points at (MoveCockpitCards), over all.
+    std::vector<V> lines;
+    auto line = [&](const float* a, const float* b, DWORD colour, float width, bool world = false) {
+        float pa[3], pb[3], za = 0, zb = 0, nearZ = n * 1.01f;
+        if (world)
+            memcpy(pa, a, sizeof(pa)), memcpy(pb, b, sizeof(pb));
+        else
+            toWorld(a, pa), toWorld(b, pb);
+        for (int i = 0; i < 3; i++) za += (pa[i] - e[12 + i]) * e[8 + i], zb += (pb[i] - e[12 + i]) * e[8 + i];
+        if (za < nearZ && zb < nearZ) return;
+        float* behind = za < nearZ ? pa : zb < nearZ ? pb : nullptr;  // brought up to the near plane
+        float t = behind == pa ? (nearZ - za) / (zb - za) : (nearZ - zb) / (za - zb);
+        if (behind)
+            for (int i = 0; i < 3; i++) behind[i] += ((behind == pa ? pb : pa)[i] - behind[i]) * t;
+        V va, vb;
+        if (!project(pa, 0, 0, va) || !project(pb, 0, 0, vb)) return;
+        float dx = vb.x - va.x, dy = vb.y - va.y, l = sqrtf(dx * dx + dy * dy);
+        if (l < 0.5f) return;
+        float ox = -dy / l * 0.5f * width, oy = dx / l * 0.5f * width;
+        V q[4] = { va, va, vb, vb };
+        q[0].x += ox, q[0].y += oy, q[1].x -= ox, q[1].y -= oy, q[2].x += ox, q[2].y += oy, q[3].x -= ox, q[3].y -= oy;
+        for (V& x : q) x.colour = colour;
+        lines.insert(lines.end(), { q[0], q[1], q[2], q[1], q[3], q[2] });
+    };
+    for (const HandRay& r : g_rays)
+    {
+        if (!r.shown) continue;
+        line(r.from, r.to, 0xB0B0B0B0, 3.0f);  // white (premultiplied)
+        if (r.card < 0) continue;
+        const DWORD blue = r.held ? 0xF0F0C040 : 0xE05AB4E0;  // light blue, or amber while carried
+        float p[2 * (kMaxColumns + 1)][3];  // along the band
+        int cols;
+        bandColumns(r.card, p, cols);
+        for (int j = 0; j < cols; j++) line(p[2 * j], p[2 * j + 2], blue, 4.0f, true), line(p[2 * j + 1], p[2 * j + 3], blue, 4.0f, true);
+        line(p[0], p[1], blue, 4.0f, true), line(p[2 * cols], p[2 * cols + 1], blue, 4.0f, true);
+    }
+    if (tris[0].empty() && tris[1].empty() && lines.empty()) return;
+
+    IDirect3DStateBlock9* saved = nullptr;
+    if (FAILED(dev->CreateStateBlock(D3DSBT_ALL, &saved))) return;
+    IDirect3DSurface9 *oldRT = nullptr, *oldDS = nullptr;
+    dev->GetRenderTarget(0, &oldRT);
+    dev->GetDepthStencilSurface(&oldDS);
+    dev->SetRenderTarget(0, g_vrt.rt[eye]);
+    dev->SetDepthStencilSurface(g_vrt.ds[eye]);
+    D3DVIEWPORT9 vp = { 0, 0, g_vrt.w, g_vrt.h, 0.0f, 1.0f };
+    dev->SetViewport(&vp);
+    dev->SetVertexShader(nullptr);
+    dev->SetPixelShader(nullptr);
+    dev->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
+    dev->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_MODULATE);
+    dev->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+    dev->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
+    dev->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_MODULATE);
+    dev->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+    dev->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE);
+    dev->SetTextureStageState(0, D3DTSS_TEXCOORDINDEX, 0);
+    dev->SetTextureStageState(0, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
+    dev->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
+    dev->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
+    dev->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+    dev->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+    dev->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+    dev->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+    dev->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+    dev->SetSamplerState(0, D3DSAMP_SRGBTEXTURE, FALSE);
+    dev->SetRenderState(D3DRS_ZENABLE, D3DZB_TRUE);
+    dev->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+    dev->SetRenderState(D3DRS_ZFUNC, D3DCMP_LESSEQUAL);
+    dev->SetRenderState(D3DRS_STENCILENABLE, FALSE);
+    dev->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+    dev->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_ONE);
+    dev->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+    dev->SetRenderState(D3DRS_BLENDOP, D3DBLENDOP_ADD);
+    dev->SetRenderState(D3DRS_SEPARATEALPHABLENDENABLE, FALSE);
+    dev->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+    dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    dev->SetRenderState(D3DRS_FILLMODE, D3DFILL_SOLID);
+    dev->SetRenderState(D3DRS_LIGHTING, FALSE);
+    dev->SetRenderState(D3DRS_FOGENABLE, FALSE);
+    dev->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
+    dev->SetRenderState(D3DRS_COLORWRITEENABLE, 0xF);
+    dev->SetRenderState(D3DRS_SRGBWRITEENABLE, FALSE);
+    for (int i = 0; i < 2; i++)
+    {
+        if (tris[i].empty()) continue;
+        dev->SetTexture(0, g_hud.cards[i]);
+        dev->DrawIndexedPrimitiveUP(D3DPT_TRIANGLELIST, 0, (UINT)verts.size(), (UINT)(tris[i].size() / 3), tris[i].data(), D3DFMT_INDEX16,
+                                    verts.data(), sizeof(V));
+    }
+    if (!lines.empty())
+    {
+        dev->SetTexture(0, nullptr);
+        dev->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG2);
+        dev->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG2);
+        dev->SetRenderState(D3DRS_ZENABLE, D3DZB_FALSE);
+        dev->DrawPrimitiveUP(D3DPT_TRIANGLELIST, (UINT)(lines.size() / 3), lines.data(), sizeof(V));
+    }
+
+    dev->SetRenderTarget(0, oldRT);
+    dev->SetDepthStencilSurface(oldDS);
+    if (oldRT) oldRT->Release();
+    if (oldDS) oldDS->Release();
+    saved->Apply();
+    saved->Release();
+}
+
 // The engine's back buffer size (DeviceD3d fields), which its post-processing uses for the
 // target of its final passes.
 int* EngineScreenSize() { return (int*)(*(BYTE**)fo2::kDeviceD3d + fo2::kDevWidth); }
@@ -2047,12 +3472,1349 @@ void EndHudCapture(IDirect3DDevice9* dev)
     if (world >> 24) FadeTarget(dev, nullptr, world, false);
     if (g_fade[0] >> 24) FadeTarget(dev, g_hud.rt, g_fade[0], true);
     DrawScreenQuad(dev, g_hud.tex, 0.0f, 0.0f, 1.0f, 1.0f, true);
+    // The monitor shows the cockpit's instruments too (in the headset they are in the car, not on the panel).
+    if (HudCardsRouted())
+        for (IDirect3DTexture9* card : g_hud.cards) DrawScreenQuad(dev, card, 0.0f, 0.0f, 1.0f, 1.0f, true);
     IDirect3DSurface9* panel = nullptr;
     if (SUCCEEDED(g_hud.panel->GetSurfaceLevel(0, &panel)))
     {
         g_hud.captured = SUCCEEDED(oStretchRect(dev, g_hud.rt, nullptr, panel, nullptr, D3DTEXF_LINEAR));
         panel->Release();
     }
+}
+
+// ---- side mirrors ([VR] Mirrors) ---------------------------------------------------------------------
+// The game has no mirrors: a car's side mirror is a housing whose flat back shows a texture of dark glass (see
+// game.h, kCarSceneRoot). In the cockpit each mirror in view shows what is behind: the scene is rendered once more
+// (RenderViews, as for an eye, before the eyes) from the eyes reflected in the mirror's plane, through the glass as
+// through a window (the camera looks along the mirror's normal, its frustum off-centre through the glass, its near
+// plane on the mirror, so that nothing behind the mirror shows), into a small target of its own. That picture is laid
+// over the glass in each eye with the eye's depth (the hands and the pillars go in front of it), as the eye draws, under
+// the car's windows; seen from the eyes it comes out turned left for right, as in a mirror. Mirrors=1 renders one picture from the eyes' middle for both eyes
+// (it lies on the glass, flat); Mirrors=2 one from each eye for that eye (what the mirror shows stands at its depth
+// behind the glass, as in a real one, for twice the cost). Moving the head moves what the mirror shows. A mirror's
+// render is kept small: the objects are picked for the glass alone (CullViewHook), the cars' shadows are the eyes' of
+// the frame before (CarShadowHook), the world and the grass end where the game ends them, and there is no lens flare
+// or post-processing (the eyes' takes the mirrors in).
+//
+// The models' glass is not set for the driver's eyes: the Chili's looks straight back and 17 degrees down, and
+// shows the road beside the car. The mirror is set as a driver sets it, turned on its housing (once a car, for the
+// eyes at rest): the car's side in sight at its inner edge, over kMirrorCarShare of its width, and its middle
+// kMirrorAimDown below level. It stays so in the housing, and moves with it when the door swings open or the
+// mirror is bent or knocked loose; only a mirror knocked off (its part's state, see game.h kCarParts) shows nothing.
+//
+// The face found for the glass is often the housing's whole back with its frame painted on it around the glass (the
+// Sunray's): where the glass is comes from the texture (MakeGlassMask), and the picture shows there alone.
+constexpr UINT kMirrorW = 512, kMirrorH = 256;  // a mirror's glass is some 3:2 to 5:2, and 2 to 10 degrees across
+constexpr float kMirrorAimDown = 1.0f * 3.14159265f / 180.0f;
+constexpr float kMirrorCarShare = 0.15f;
+constexpr float kMirrorShade = 0.85f;       // a mirror gives back some 85% of the light
+constexpr float kMirrorDepthPull = 0.003f;  // metres nearer in depth than the glass, not to fight with it
+
+struct SideMirror
+{
+    BYTE* node = nullptr;
+    BYTE* part = nullptr;  // its part (see game.h, kCarParts; null: not found)
+    int state = 0;         // the part's state as last seen
+    std::string name;
+    BYTE* batch = nullptr;        // the batch of the housing's mesh that holds the glass
+    std::vector<int> vertices;    // the glass's vertices: indices into the batch's (from its first vertex)
+    std::vector<float> model;     // their places in the model's axes as found (before the crashes bend them)
+    std::vector<float> skinUv;    // their texture coordinates (2 floats each)
+    std::vector<WORD> triangles;  // the glass's triangles: indices into `vertices`
+    float aim[3] = {};            // the mirror's normal as set (towards the eyes), in the model's axes
+    float rest[3] = {};           // the glass's middle in the car's axes as found
+    bool away = false;            // knocked off (or, its part not found, far from its place)
+    const char* why = "";         // why it was not shown the last time (for the log)
+    int whyLogged = 0;
+    // Where the glass is on the face (MakeGlassMask): the housing's texture as the eyes draw it (until the mask is
+    // made from it), and the mask (in its alpha) over the face's texture coordinates maskBox (u0, v0, u1, v1); no
+    // mask: the whole face.
+    IDirect3DTexture9* skin = nullptr;
+    bool maskDone = false;
+    IDirect3DTexture9* mask = nullptr;
+    float maskBox[4] = {};
+    // A picture for each eye (Mirrors=2; else the first for both).
+    IDirect3DTexture9* tex[2] = {};
+    IDirect3DSurface9* rt[2] = {};
+    // This frame: whether each picture was rendered; the glass's vertices in the world (3 floats each), and where each
+    // lies in the pictures (u, v).
+    bool shown[2] = {};
+    std::vector<float> world, uv[2];
+};
+
+struct MirrorState
+{
+    BYTE* car = nullptr;  // the car the mirrors were looked for in
+    std::vector<SideMirror> list;
+    IDirect3DSurface9* ds = nullptr;    // their depth (they render one after the other)
+    IDirect3DTexture9* filter[2] = {};  // the colour filter's textures of their size (see FilterTextures)
+    bool failed = false;
+    int pictures = 0;    // the targets made: 1 or 2 pictures a mirror
+    Timing time;         // the frames' mirror work (CPU)
+    int renders = 0;
+    double lastLog = 0;
+} g_mirrors;
+
+void ReleaseMirrorTargets()
+{
+    for (SideMirror& m : g_mirrors.list)
+        for (int i = 0; i < 2; i++)
+        {
+            if (m.rt[i]) m.rt[i]->Release();
+            if (m.tex[i]) m.tex[i]->Release();
+            m.rt[i] = nullptr;
+            m.tex[i] = nullptr;
+            m.shown[i] = false;
+        }
+    if (g_mirrors.ds) g_mirrors.ds->Release();
+    g_mirrors.ds = nullptr;
+    for (IDirect3DTexture9*& t : g_mirrors.filter)
+    {
+        if (t) t->Release();
+        t = nullptr;
+    }
+    g_mirrors.pictures = 0;
+}
+
+// The car's mirrors forgotten (for another car's): their targets, textures and masks let go.
+void ForgetMirrors()
+{
+    ReleaseMirrorTargets();
+    for (SideMirror& m : g_mirrors.list)
+    {
+        if (m.skin) m.skin->Release();
+        if (m.mask) m.mask->Release();
+    }
+    g_mirrors.list.clear();
+    g_mirrorSkinWanted = false;
+}
+
+// The mirrors' targets: a texture for each picture, with mipmaps that make themselves (D3DUSAGE_AUTOGENMIPMAP): a
+// mirror's picture is shown some 50 to 200 of the eye's pixels across, and without them it would shimmer.
+bool EnsureMirrorTargets(IDirect3DDevice9* dev, int pictures)
+{
+    if (g_mirrors.failed) return false;
+    if (g_mirrors.pictures != pictures) ReleaseMirrorTargets();
+    g_mirrors.pictures = pictures;
+    bool ok = true, made = false, mips = true;
+    if (!g_mirrors.ds)
+        ok = SUCCEEDED(dev->CreateDepthStencilSurface(kMirrorW, kMirrorH, D3DFMT_D24S8, D3DMULTISAMPLE_NONE, 0, TRUE, &g_mirrors.ds, nullptr));
+    for (SideMirror& m : g_mirrors.list)
+        for (int i = 0; i < pictures; i++)
+        {
+            if (!ok || m.tex[i]) continue;
+            made = true;
+            if (FAILED(dev->CreateTexture(kMirrorW, kMirrorH, 0, D3DUSAGE_RENDERTARGET | D3DUSAGE_AUTOGENMIPMAP, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT,
+                                          &m.tex[i], nullptr)))
+            {
+                mips = false;
+                ok = SUCCEEDED(dev->CreateTexture(kMirrorW, kMirrorH, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &m.tex[i], nullptr));
+            }
+            ok = ok && SUCCEEDED(m.tex[i]->GetSurfaceLevel(0, &m.rt[i]));
+        }
+    if (!ok)
+    {
+        Log("mirrors: render targets %ux%u FAILED", kMirrorW, kMirrorH);
+        ReleaseMirrorTargets();
+        g_mirrors.failed = true;
+        return false;
+    }
+    if (made)
+    {
+        PrepareScreenshots(dev, kMirrorW, kMirrorH, D3DFMT_A8R8G8B8, pictures * (int)g_mirrors.list.size());
+        Log("mirrors: render targets %ux%u%s, %s", kMirrorW, kMirrorH, mips ? ", with mipmaps" : ", without mipmaps",
+            pictures == 2 ? "a picture for each eye" : "one picture for both eyes");
+    }
+    return true;
+}
+
+// A mesh node's name (see game.h, kNodeName).
+std::string NodeName(BYTE* node)
+{
+    const BYTE* s = node + fo2::kNodeName;
+    const char* text = *(const unsigned*)(s + 0x14) >= 16 ? *(const char* const*)s : (const char*)s;
+    return text ? std::string(text, strnlen(text, 64)) : std::string();
+}
+
+float Dot3(const float* a, const float* b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
+
+void Cross3(const float* a, const float* b, float* out)
+{
+    out[0] = a[1] * b[2] - a[2] * b[1];
+    out[1] = a[2] * b[0] - a[0] * b[2];
+    out[2] = a[0] * b[1] - a[1] * b[0];
+}
+
+bool Normalize3(float* v)
+{
+    float l = sqrtf(Dot3(v, v));
+    if (l < 1e-9f) return false;
+    for (int i = 0; i < 3; i++) v[i] /= l;
+    return true;
+}
+
+// The glass of a mirror's housing (its nearest model): the largest flat face that looks backwards and towards the
+// driver's eyes (eyes: their place in the car's axes), and the mirror set for them (body: the car's body's triangles
+// in its axes, see ReadMesh). The housing's faces are told apart by their direction (within 5 degrees) and their
+// plane (within 4 mm); a face looks the way its triangles' winding says (clockwise in front, as Direct3D draws
+// them). out[8], for the log: the glass's width and height (metres), the way it looks (degrees out from straight
+// back and up), how far the mirror was turned, how wide an angle it shows, how far out its middle looks and how far
+// out the car's side reaches (degrees).
+bool FindGlass(BYTE* car, SideMirror& m, const float* eyes, const std::vector<float>& body, float* out)
+{
+    BYTE* model = *(BYTE**)(m.node + fo2::kNodeModels);
+    if (!model) return false;
+    // The model's axes in the car's (as ReadMesh).
+    const float* c = (const float*)(car + fo2::kCarMatrix);
+    const float* w = (const float*)(m.node + fo2::kNodeWorld);
+    float toCar[12];
+    for (int r = 0; r < 4; r++)
+    {
+        float d[3] = { w[4 * r], w[4 * r + 1], w[4 * r + 2] };
+        if (r == 3)
+            for (int k = 0; k < 3; k++) d[k] -= c[12 + k];
+        for (int i = 0; i < 3; i++) toCar[3 * r + i] = d[0] * c[4 * i] + d[1] * c[4 * i + 1] + d[2] * c[4 * i + 2];
+    }
+    auto inCar = [&](const float* p, float* q, bool direction) {
+        for (int j = 0; j < 3; j++) q[j] = p[0] * toCar[j] + p[1] * toCar[3 + j] + p[2] * toCar[6 + j] + (direction ? 0.0f : toCar[9 + j]);
+    };
+    struct Face
+    {
+        float n[3], offset, area = 0;
+        std::vector<int> tris;  // 3 vertex indices each
+    };
+    float bestArea = 0.0015f;  // at least some 5 by 3 cm
+    BYTE** begin = *(BYTE***)(model + fo2::kModelBatches);
+    BYTE** end = *(BYTE***)(model + fo2::kModelBatches + 4);
+    for (BYTE** it = begin; it && it < end && it - begin < 16; it++)
+    {
+        BYTE* b = *it;
+        if (!b) continue;
+        DWORD prim = *(DWORD*)(b + fo2::kBatchPrimType);
+        int stride = *(int*)(b + fo2::kBatchStride);
+        int count = *(WORD*)(b + fo2::kBatchVertexCount), nidx = *(WORD*)(b + fo2::kBatchIndexCount);
+        int base = *(WORD*)(b + fo2::kBatchBaseVertex), first = *(WORD*)(b + fo2::kBatchFirstVertex);
+        int start = *(WORD*)(b + fo2::kBatchFirstIndex);
+        BYTE* ibo = *(BYTE**)(b + fo2::kBatchIndexBuffer);
+        BYTE* vbo = *(BYTE**)(b + fo2::kBatchVertexBuffer);
+        auto* ib = ibo ? *(IDirect3DIndexBuffer9**)(ibo + fo2::kIndexBufferD3D) : nullptr;
+        auto* vb = vbo ? *(IDirect3DVertexBuffer9**)(vbo + fo2::kVertexBufferD3D) : nullptr;
+        const BYTE* cpu = *(const BYTE**)(b + fo2::kBatchVertices);
+        if (!ib || nidx < 3 || count <= 0 || stride < 12 || (prim != D3DPT_TRIANGLELIST && prim != D3DPT_TRIANGLESTRIP)) continue;
+        D3DINDEXBUFFER_DESC idesc;
+        if (FAILED(ib->GetDesc(&idesc)) || idesc.Format != D3DFMT_INDEX16 || (start + nidx) * 2u > idesc.Size) continue;
+        // The vertices' places, the model's axes.
+        std::vector<float> pos(3 * count);
+        const BYTE* verts = cpu;
+        void* vdata = nullptr;
+        if (!verts)
+        {
+            D3DVERTEXBUFFER_DESC vdesc;
+            if (!vb || FAILED(vb->GetDesc(&vdesc)) || (unsigned)(base + first + count) * stride > vdesc.Size ||
+                FAILED(vb->Lock((base + first) * stride, count * stride, &vdata, D3DLOCK_READONLY)) || !vdata)
+                continue;
+            verts = (const BYTE*)vdata;
+        }
+        for (int k = 0; k < count; k++) memcpy(&pos[3 * k], verts + k * stride, 12);
+        // And their texture coordinates (see game.h, kBatchFvf).
+        DWORD fvf = *(DWORD*)(b + fo2::kBatchFvf);
+        int uvAt = 12 + (fvf & D3DFVF_NORMAL ? 12 : 0) + (fvf & D3DFVF_DIFFUSE ? 4 : 0) + (fvf & D3DFVF_SPECULAR ? 4 : 0);
+        std::vector<float> tex(2 * count);
+        if ((fvf & D3DFVF_TEXCOUNT_MASK) && uvAt + 8 <= stride)
+            for (int k = 0; k < count; k++) memcpy(&tex[2 * k], verts + k * stride + uvAt, 8);
+        if (vdata) vb->Unlock();
+        // The triangles, clockwise in front.
+        std::vector<int> tris;
+        void* idata = nullptr;
+        if (FAILED(ib->Lock(start * 2, nidx * 2, &idata, D3DLOCK_READONLY)) || !idata) continue;
+        const WORD* idx = (const WORD*)idata;
+        int triCount = prim == D3DPT_TRIANGLELIST ? nidx / 3 : nidx - 2;
+        for (int t = 0; t < triCount; t++)
+        {
+            int i0 = prim == D3DPT_TRIANGLELIST ? 3 * t : t;
+            int v[3] = { idx[i0] - first, idx[i0 + 1] - first, idx[i0 + 2] - first };
+            if (v[0] == v[1] || v[1] == v[2] || v[0] == v[2]) continue;  // a strip's joints
+            if (prim == D3DPT_TRIANGLESTRIP && (t & 1)) std::swap(v[1], v[2]);
+            if (std::min({ v[0], v[1], v[2] }) < 0 || std::max({ v[0], v[1], v[2] }) >= count) continue;
+            tris.insert(tris.end(), v, v + 3);
+        }
+        ib->Unlock();
+        // The flat faces, the largest triangles first.
+        struct Tri
+        {
+            int at;
+            float n[3], area;
+        };
+        std::vector<Tri> order;
+        for (size_t t = 0; t < tris.size(); t += 3)
+        {
+            const float* p0 = &pos[3 * tris[t]];
+            const float* p1 = &pos[3 * tris[t + 1]];
+            const float* p2 = &pos[3 * tris[t + 2]];
+            float e1[3] = { p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2] }, e2[3] = { p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2] };
+            Tri x = { (int)t };
+            Cross3(e1, e2, x.n);
+            x.area = 0.5f * sqrtf(Dot3(x.n, x.n));
+            if (x.area > 1e-8f && Normalize3(x.n)) order.push_back(x);
+        }
+        std::sort(order.begin(), order.end(), [](const Tri& a, const Tri& b) { return a.area > b.area; });
+        std::vector<Face> faces;
+        for (const Tri& x : order)
+        {
+            float offset = Dot3(x.n, &pos[3 * tris[x.at]]);
+            Face* in = nullptr;
+            for (Face& f : faces)
+                if (Dot3(f.n, x.n) > 0.9962f && fabsf(offset - f.offset) < 0.004f) in = &f;
+            if (!in)
+            {
+                faces.emplace_back();
+                in = &faces.back();
+                memcpy(in->n, x.n, sizeof(x.n));
+                in->offset = offset;
+            }
+            in->area += x.area;
+            in->tris.insert(in->tris.end(), &tris[x.at], &tris[x.at] + 3);
+        }
+        for (const Face& f : faces)
+        {
+            if (f.area <= bestArea) continue;
+            // Backwards (within some 70 degrees) and towards the eyes, in the car's axes.
+            float n[3], mid[3] = {}, p[3];
+            inCar(f.n, n, true);
+            Normalize3(n);
+            for (int v : f.tris)
+            {
+                inCar(&pos[3 * v], p, false);
+                for (int k = 0; k < 3; k++) mid[k] += p[k] / f.tris.size();
+            }
+            float toGlass[3] = { mid[0] - eyes[0], mid[1] - eyes[1], mid[2] - eyes[2] };
+            if (n[2] > -0.35f || Dot3(n, toGlass) >= 0.0f) continue;
+            bestArea = f.area;
+            m.batch = b;
+            m.vertices.clear();
+            m.triangles.clear();
+            m.model.clear();
+            m.skinUv.clear();
+            for (int v : f.tris)
+            {
+                size_t k = std::find(m.vertices.begin(), m.vertices.end(), v) - m.vertices.begin();
+                if (k == m.vertices.size())
+                {
+                    m.vertices.push_back(v);
+                    m.model.insert(m.model.end(), &pos[3 * v], &pos[3 * v] + 3);
+                    m.skinUv.insert(m.skinUv.end(), &tex[2 * v], &tex[2 * v] + 2);
+                }
+                m.triangles.push_back((WORD)k);
+            }
+            memcpy(m.rest, mid, sizeof(mid));
+            // Its width and height: across the car's up and along it, in the glass's plane.
+            float up[3] = { 0.0f, 1.0f, 0.0f }, side[3];
+            for (int k = 0; k < 3; k++) up[k] -= n[1] * n[k];
+            Normalize3(up);
+            Cross3(up, n, side);
+            float lo[2] = { 1e9f, 1e9f }, hi[2] = { -1e9f, -1e9f };
+            for (int v : f.tris)
+            {
+                inCar(&pos[3 * v], p, false);
+                float a = Dot3(p, side), h = Dot3(p, up);
+                lo[0] = std::min(lo[0], a), hi[0] = std::max(hi[0], a), lo[1] = std::min(lo[1], h), hi[1] = std::max(hi[1], h);
+            }
+            out[0] = hi[0] - lo[0];
+            out[1] = hi[1] - lo[1];
+            out[2] = (mid[0] < 0.0f ? -1.0f : 1.0f) * atan2f(n[0], -n[2]) * 57.29578f;
+            out[3] = asinf(std::clamp(n[1], -1.0f, 1.0f)) * 57.29578f;
+            // The mirror set (see above): its normal halfway between the way back to the eyes and the way it shows. It
+            // shows as wide and high an angle as the glass takes up in sight (halfW, halfH: halves of it).
+            Normalize3(toGlass);
+            float sign = mid[0] < 0.0f ? -1.0f : 1.0f, down = kMirrorAimDown, inner = 1e9f, az[2] = { 1e9f, -1e9f }, el[2] = { 1e9f, -1e9f };
+            for (int v : f.tris)
+            {
+                inCar(&pos[3 * v], p, false);
+                inner = std::min(inner, sign * p[0]);
+                float d[3] = { p[0] - eyes[0], p[1] - eyes[1], p[2] - eyes[2] }, a = atan2f(d[0], d[2]), e = atan2f(d[1], sqrtf(d[0] * d[0] + d[2] * d[2]));
+                az[0] = std::min(az[0], a), az[1] = std::max(az[1], a), el[0] = std::min(el[0], e), el[1] = std::max(el[1], e);
+            }
+            float halfW = 0.5f * (az[1] - az[0]), halfH = 0.5f * (el[1] - el[0]), flank = 0.0f;
+            // How far out the car's side reaches behind the glass, as seen from its inner edge within the mirror's
+            // height: the mirror shows that much of it there.
+            for (size_t k = 0; k + 2 < body.size(); k += 3)
+            {
+                float back = mid[2] - body[k + 2];
+                if (back > 0.3f && fabsf(atan2f(body[k + 1] - mid[1], back) + down) < halfH + 0.05f)
+                    flank = std::max(flank, atan2f(sign * body[k] - inner, back));
+            }
+            float outward = std::clamp(flank + (1.0f - 2.0f * kMirrorCarShare) * halfW, 0.5f * halfW, 0.5f);
+            float shows[3] = { sign * sinf(outward) * cosf(down), -sinf(down), -cosf(outward) * cosf(down) };
+            float aim[3] = { shows[0] - toGlass[0], shows[1] - toGlass[1], shows[2] - toGlass[2] };
+            Normalize3(aim);
+            for (int r = 0; r < 3; r++)  // into the model's axes (toCar's rows)
+                m.aim[r] = Dot3(aim, toCar + 3 * r) / std::max(Dot3(toCar + 3 * r, toCar + 3 * r), 1e-6f);
+            out[4] = acosf(std::clamp(Dot3(aim, n), -1.0f, 1.0f)) * 57.29578f;
+            out[5] = 2.0f * halfW * 57.29578f;
+            out[6] = outward * 57.29578f;
+            out[7] = flank * 57.29578f;
+        }
+    }
+    return m.batch != nullptr;
+}
+
+// The player's car's side mirrors (once a car, when it has its driver's eyes), logged.
+void FindMirrors(BYTE* car)
+{
+    ForgetMirrors();
+    g_mirrors.car = car;
+    g_mirrors.failed = false;
+    // The eyes at rest (the headset centred), in the car's axes.
+    const float* seat = (const float*)(car + fo2::kCarDriverLoc);
+    float eyes[3];
+    DriverEyeFromSeat(car, eyes);
+    for (int i = 0; i < 3; i++) eyes[i] += seat[i] + g_cfg.vrCameraOffset[i];
+    std::vector<float> body;  // (the cockpit's cards read it for their layout, see LayCockpitCards)
+    std::vector<int> batches;
+    if (g_cabin.car == car)
+        body = g_cabin.body;
+    else
+        ReadMesh(car, *(BYTE**)(car + fo2::kCarBody), body, batches);
+    BYTE* root = *(BYTE**)(car + fo2::kCarSceneRoot);
+    std::vector<BYTE*> next;  // the tree, depth first: the lists of siblings still to go
+    if (root && *(BYTE**)(root + fo2::kNodeFirstChild)) next.push_back(*(BYTE**)(root + fo2::kNodeFirstChild));
+    int nodes = 0, found = 0;
+    std::string log;
+    while (!next.empty() && nodes < 1024)
+    {
+        BYTE* node = next.back();
+        next.pop_back();
+        for (; node && nodes < 1024; node = *(BYTE**)(node + fo2::kNodeNextSibling), nodes++)
+        {
+            if (BYTE* child = *(BYTE**)(node + fo2::kNodeFirstChild)) next.push_back(child);
+            if (*(uintptr_t*)node != fo2::kMeshNodeVtbl || *(int*)(node + fo2::kNodeModelCount) <= 0) continue;
+            std::string name = NodeName(node);
+            if (name.size() < 8 || (name.compare(name.size() - 8, 8, "mirror_l") && name.compare(name.size() - 8, 8, "mirror_r"))) continue;
+            found++;
+            SideMirror m;
+            m.node = node;
+            m.name = name;
+            BYTE** parts = *(BYTE***)(car + fo2::kCarParts);
+            BYTE** partsEnd = *(BYTE***)(car + fo2::kCarParts + 4);
+            for (BYTE** it = parts; it && it < partsEnd && it - parts < 256 && !m.part; it++)
+                if (*it && *(BYTE**)(*it + fo2::kPartNode) == node) m.part = *it;
+            if (m.part) m.state = *(const int*)(m.part + fo2::kPartState);
+            float about[8] = {};
+            char buf[320];
+            if (FindGlass(car, m, eyes, body, about))
+            {
+                snprintf(buf, sizeof(buf),
+                         "; %s: glass %.3f x %.3f m (%d triangles) at %.2f %.2f %.2f looking %+.0f deg out from straight back and %+.0f up, "
+                         "set turned %.0f deg: %.1f deg across, its middle %.1f deg out (the car's side to %.1f)%s",
+                         name.c_str(), about[0], about[1], (int)m.triangles.size() / 3, m.rest[0], m.rest[1], m.rest[2], about[2], about[3], about[4],
+                         about[5], about[6], about[7], m.part ? "" : " (its part not found)");
+                g_mirrors.list.push_back(std::move(m));
+            }
+            else
+                snprintf(buf, sizeof(buf), "; %s: no glass found", name.c_str());
+            log += buf;
+        }
+    }
+    Log("mirrors: %ls (%.32s): %d of %d mirrors with their glass%s", CarModel(car).c_str(), (const char*)(car + fo2::kCarName),
+        (int)g_mirrors.list.size(), found, log.c_str());
+}
+
+// While the housings' textures are looked for (MakeGlassMask), the one an eye draws a housing with (DynamicBatchDraw,
+// for each dynamic batch the eyes draw: its textures are set).
+void NoteMirrorSkin(BYTE* batch)
+{
+    if (g_vrEye.mirror) return;
+    IDirect3DDevice9* dev = *(IDirect3DDevice9**)fo2::kD3DDevice;
+    for (SideMirror& m : g_mirrors.list)
+    {
+        if (m.batch != batch || m.skin || m.maskDone) continue;
+        IDirect3DBaseTexture9* t = nullptr;
+        if (FAILED(dev->GetTexture(0, &t)) || !t) continue;
+        if (t->GetType() == D3DRTYPE_TEXTURE)
+            m.skin = (IDirect3DTexture9*)t;
+        else
+            t->Release();
+    }
+}
+
+// Where on the face the glass is, from the housing's texture as the eyes draw it: the face's part of it is drawn into a
+// small target and read back. A frame painted round the glass is of one colour, the face's edge's, from the edge in to
+// the glass's dark rim; the glass inside is painted with a reflection, sky and ground. So the frame is what is of the
+// edge's colour (within kFrameColour) and reached from the edge, and the glass the convex hull of the rest's pieces
+// of some size that keep off the edge (the painted ground may be of the frame's colour too, a frame's foot of another).
+// That is kept as a mask when most of the edge is of its colour (kFramed) and the glass covers between kGlassLeast and
+// kGlassMost of the face; else the whole
+// face is glass (the glass painted out to the face's edges). Once a mirror; it stalls the GPU for the read back.
+constexpr float kGlassLeast = 0.2f, kGlassMost = 0.93f, kFramed = 0.7f;
+constexpr int kFrameColour = 24;  // of 255, in any channel
+
+void MakeGlassMask(IDirect3DDevice9* dev, SideMirror& m)
+{
+    m.maskDone = true;
+    IDirect3DTexture9* skin = m.skin;
+    m.skin = nullptr;
+    if (!skin) return;
+    size_t nv = m.skinUv.size() / 2;
+    float box[4] = { 1e9f, 1e9f, -1e9f, -1e9f };
+    for (size_t i = 0; i < nv; i++)
+    {
+        box[0] = std::min(box[0], m.skinUv[2 * i]), box[1] = std::min(box[1], m.skinUv[2 * i + 1]);
+        box[2] = std::max(box[2], m.skinUv[2 * i]), box[3] = std::max(box[3], m.skinUv[2 * i + 1]);
+    }
+    D3DSURFACE_DESC td = {};
+    skin->GetLevelDesc(0, &td);
+    float texels[2] = { (box[2] - box[0]) * td.Width, (box[3] - box[1]) * td.Height };
+    if (nv < 3 || texels[0] < 6.0f || texels[1] < 6.0f)
+    {
+        skin->Release();
+        Log("mirrors: %s: its glass takes up %.0f x %.0f texels: all the face", m.name.c_str(), texels[0], texels[1]);
+        return;
+    }
+    // Two samples a texel, at most 256 a side.
+    int W = std::clamp((int)lroundf(2.0f * texels[0]), 16, 256), H = std::clamp((int)lroundf(2.0f * texels[1]), 16, 256);
+    IDirect3DSurface9 *rt = nullptr, *sys = nullptr, *oldRT = nullptr, *oldDS = nullptr;
+    IDirect3DStateBlock9* saved = nullptr;
+    std::vector<unsigned> px;
+    if (SUCCEEDED(dev->CreateRenderTarget(W, H, D3DFMT_A8R8G8B8, D3DMULTISAMPLE_NONE, 0, FALSE, &rt, nullptr)) &&
+        SUCCEEDED(dev->CreateOffscreenPlainSurface(W, H, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM, &sys, nullptr)) &&
+        SUCCEEDED(dev->CreateStateBlock(D3DSBT_ALL, &saved)))
+    {
+        dev->GetRenderTarget(0, &oldRT);
+        dev->GetDepthStencilSurface(&oldDS);
+        dev->SetRenderTarget(0, rt);
+        dev->SetDepthStencilSurface(nullptr);
+        D3DVIEWPORT9 vp = { 0, 0, (DWORD)W, (DWORD)H, 0.0f, 1.0f };
+        dev->SetViewport(&vp);
+        dev->SetVertexShader(nullptr);
+        dev->SetPixelShader(nullptr);
+        dev->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
+        dev->SetTexture(0, skin);
+        dev->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+        dev->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+        dev->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+        dev->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+        dev->SetTextureStageState(0, D3DTSS_TEXCOORDINDEX, 0);
+        dev->SetTextureStageState(0, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
+        dev->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
+        dev->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
+        dev->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+        dev->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+        dev->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+        dev->SetSamplerState(0, D3DSAMP_MAXMIPLEVEL, 0);
+        dev->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
+        dev->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
+        dev->SetSamplerState(0, D3DSAMP_SRGBTEXTURE, FALSE);
+        dev->SetRenderState(D3DRS_ZENABLE, D3DZB_FALSE);
+        dev->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+        dev->SetRenderState(D3DRS_STENCILENABLE, FALSE);
+        dev->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+        dev->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+        dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+        dev->SetRenderState(D3DRS_FILLMODE, D3DFILL_SOLID);
+        dev->SetRenderState(D3DRS_LIGHTING, FALSE);
+        dev->SetRenderState(D3DRS_FOGENABLE, FALSE);
+        dev->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
+        dev->SetRenderState(D3DRS_COLORWRITEENABLE, 0xF);
+        dev->SetRenderState(D3DRS_SRGBWRITEENABLE, FALSE);
+        struct V { float x, y, z, rhw, u, v; };
+        const V quad[4] = { { -0.5f, -0.5f, 0, 1, box[0], box[1] }, { W - 0.5f, -0.5f, 0, 1, box[2], box[1] },
+                            { -0.5f, H - 0.5f, 0, 1, box[0], box[3] }, { W - 0.5f, H - 0.5f, 0, 1, box[2], box[3] } };
+        dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, sizeof(V));
+        dev->SetRenderTarget(0, oldRT);
+        dev->SetDepthStencilSurface(oldDS);
+        saved->Apply();
+        D3DLOCKED_RECT lr;
+        if (SUCCEEDED(dev->GetRenderTargetData(rt, sys)) && SUCCEEDED(sys->LockRect(&lr, nullptr, D3DLOCK_READONLY)))
+        {
+            px.resize((size_t)W * H);
+            for (int y = 0; y < H; y++) memcpy(&px[(size_t)y * W], (const BYTE*)lr.pBits + (size_t)y * lr.Pitch, 4 * W);
+            sys->UnlockRect();
+        }
+    }
+    if (oldRT) oldRT->Release();
+    if (oldDS) oldDS->Release();
+    if (saved) saved->Release();
+    if (sys) sys->Release();
+    if (rt) rt->Release();
+    skin->Release();
+    if (px.empty())
+    {
+        Log("mirrors: %s: its texture could not be read: all the face is glass", m.name.c_str());
+        return;
+    }
+    // The face in the samples (its triangles).
+    std::vector<BYTE> inside((size_t)W * H);
+    float sx = W / (box[2] - box[0]), sy = H / (box[3] - box[1]);
+    for (size_t t = 0; t + 2 < m.triangles.size(); t += 3)
+    {
+        float p[3][2];
+        for (int j = 0; j < 3; j++)
+        {
+            const float* uv = &m.skinUv[2 * m.triangles[t + j]];
+            p[j][0] = (uv[0] - box[0]) * sx, p[j][1] = (uv[1] - box[1]) * sy;
+        }
+        int x0 = std::max(0, (int)floorf(std::min({ p[0][0], p[1][0], p[2][0] }))), x1 = std::min(W - 1, (int)ceilf(std::max({ p[0][0], p[1][0], p[2][0] })));
+        int y0 = std::max(0, (int)floorf(std::min({ p[0][1], p[1][1], p[2][1] }))), y1 = std::min(H - 1, (int)ceilf(std::max({ p[0][1], p[1][1], p[2][1] })));
+        for (int y = y0; y <= y1; y++)
+            for (int x = x0; x <= x1; x++)
+            {
+                float q[2] = { x + 0.5f, y + 0.5f }, s[3];
+                for (int j = 0; j < 3; j++)
+                {
+                    const float *a0 = p[j], *a1 = p[(j + 1) % 3];
+                    s[j] = (a1[0] - a0[0]) * (q[1] - a0[1]) - (a1[1] - a0[1]) * (q[0] - a0[0]);
+                }
+                if ((s[0] >= 0 && s[1] >= 0 && s[2] >= 0) || (s[0] <= 0 && s[1] <= 0 && s[2] <= 0)) inside[(size_t)y * W + x] = 1;
+            }
+    }
+    auto channel = [&](size_t i, int c) { return (int)((px[i] >> (8 * c)) & 0xFF); };
+    // The face's edge, and its colour (the middle one of each channel's): the frame's, if it has one.
+    std::vector<size_t> edge;
+    for (int y = 0; y < H; y++)
+        for (int x = 0; x < W; x++)
+        {
+            size_t i = (size_t)y * W + x;
+            if (inside[i] && (x == 0 || y == 0 || x == W - 1 || y == H - 1 || !inside[i - 1] || !inside[i + 1] || !inside[i - W] || !inside[i + W]))
+                edge.push_back(i);
+        }
+    if (edge.empty()) return;
+    int frameColour[3];
+    for (int c = 0; c < 3; c++)
+    {
+        std::vector<int> v;
+        for (size_t i : edge) v.push_back(channel(i, c));
+        std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
+        frameColour[c] = v[v.size() / 2];
+    }
+    auto frameLike = [&](size_t i) {
+        return std::max({ abs(channel(i, 0) - frameColour[0]), abs(channel(i, 1) - frameColour[1]), abs(channel(i, 2) - frameColour[2]) }) <=
+               kFrameColour;
+    };
+    // 0: not the face, 1: the face (glass), 2: the frame: of its colour, reached from the edge.
+    std::vector<BYTE> cls(inside);
+    std::vector<size_t> todo;
+    int edgeLike = 0;
+    for (size_t i : edge)
+        if (frameLike(i))
+        {
+            edgeLike++;
+            cls[i] = 2;
+            todo.push_back(i);
+        }
+    auto neighbours = [&](size_t i, auto&& visit) {
+        int x = (int)(i % W), y = (int)(i / W);
+        if (x > 0) visit(i - 1);
+        if (x < W - 1) visit(i + 1);
+        if (y > 0) visit(i - W);
+        if (y < H - 1) visit(i + W);
+    };
+    while (!todo.empty())
+    {
+        size_t i = todo.back();
+        todo.pop_back();
+        neighbours(i, [&](size_t j) {
+            if (cls[j] != 1 || !frameLike(j)) return;
+            cls[j] = 2;
+            todo.push_back(j);
+        });
+    }
+    // The rest in pieces; the glass is what the pieces of a size that keep (mostly) off the face's edge take in (their
+    // convex hull: the glass's painted ground may be of the frame's colour too; a strip along the edge is frame).
+    std::vector<BYTE> atEdge(cls.size());
+    for (size_t i : edge) atEdge[i] = 1;
+    std::vector<int> piece(cls.size(), -1), pieceSize;
+    int face = 0;
+    for (size_t s0 = 0; s0 < cls.size(); s0++)
+    {
+        face += cls[s0] != 0;
+        if (cls[s0] != 1 || piece[s0] >= 0) continue;
+        int id = (int)pieceSize.size(), size = 0, onEdge = 0;
+        piece[s0] = id;
+        todo.push_back(s0);
+        while (!todo.empty())
+        {
+            size_t i = todo.back();
+            todo.pop_back();
+            size++;
+            onEdge += atEdge[i];
+            neighbours(i, [&](size_t j) {
+                if (cls[j] != 1 || piece[j] >= 0) return;
+                piece[j] = id;
+                todo.push_back(j);
+            });
+        }
+        pieceSize.push_back(onEdge > 0.15f * size ? 0 : size);
+    }
+    std::vector<std::pair<int, int>> corners;
+    for (size_t i = 0; i < cls.size(); i++)
+        if (cls[i] == 1 && pieceSize[piece[i]] >= 0.02f * face)
+        {
+            int x = (int)(i % W), y = (int)(i / W);
+            corners.insert(corners.end(), { { x, y }, { x + 1, y }, { x, y + 1 }, { x + 1, y + 1 } });
+        }
+    std::sort(corners.begin(), corners.end());
+    corners.erase(std::unique(corners.begin(), corners.end()), corners.end());
+    auto cross = [](std::pair<int, int> o, std::pair<int, int> a, std::pair<int, int> b) {
+        return (long long)(a.first - o.first) * (b.second - o.second) - (long long)(a.second - o.second) * (b.first - o.first);
+    };
+    std::vector<std::pair<int, int>> hull;  // counter-clockwise (in the samples' x right, y down: clockwise on screen)
+    for (int pass = 0; pass < 2 && corners.size() >= 3; pass++)
+    {
+        size_t start = hull.size();
+        for (size_t k = 0; k < corners.size(); k++)
+        {
+            auto p = pass ? corners[corners.size() - 1 - k] : corners[k];
+            while (hull.size() >= start + 2 && cross(hull[hull.size() - 2], hull.back(), p) <= 0) hull.pop_back();
+            hull.push_back(p);
+        }
+        hull.pop_back();
+    }
+    int glass = 0;
+    for (size_t i = 0; i < cls.size(); i++)
+    {
+        if (!cls[i]) continue;
+        // (x2, y2: the sample's middle, doubled)
+        int x2 = 2 * (int)(i % W) + 1, y2 = 2 * (int)(i / W) + 1;
+        bool in = hull.size() >= 3;
+        for (size_t k = 0; k < hull.size() && in; k++)
+        {
+            auto a = hull[k], b = hull[(k + 1) % hull.size()];
+            in = (long long)(2 * b.first - 2 * a.first) * (y2 - 2 * a.second) - (long long)(2 * b.second - 2 * a.second) * (x2 - 2 * a.first) >= 0;
+        }
+        cls[i] = in ? 1 : 2;
+        glass += in;
+    }
+    float share = face ? (float)glass / face : 0.0f, framed = (float)edgeLike / edge.size();
+    if (g_cfg.testBackground)
+    {
+        // For checking it: the face's part of the texture, and the same with the frame darkened.
+        std::vector<unsigned> look(px);
+        for (size_t i = 0; i < look.size(); i++)
+            if (cls[i] != 1) look[i] = 0xFF000000 | ((look[i] >> 2) & 0x3F3F3F);
+        std::string tag = "mirror_skin_" + m.name;
+        SavePixelsPng(ShotPath(tag.c_str()).c_str(), px.data(), W, H);
+        SavePixelsPng(ShotPath((tag + "_glass").c_str()).c_str(), look.data(), W, H);
+    }
+    if (share < kGlassLeast || share > kGlassMost || framed < kFramed)
+    {
+        Log("mirrors: %s: no frame round the glass in its texture (%dx%d samples: the edge's colour along %.0f%% of it, inside it %.0f%% of the "
+            "face): all the face is glass", m.name.c_str(), W, H, 100.0f * framed, 100.0f * share);
+        return;
+    }
+    // The mask, its edge softened over a sample.
+    if (FAILED(dev->CreateTexture(W, H, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &m.mask, nullptr)))
+    {
+        m.mask = nullptr;
+        return;
+    }
+    D3DLOCKED_RECT lr;
+    if (FAILED(m.mask->LockRect(0, &lr, nullptr, 0)))
+    {
+        m.mask->Release();
+        m.mask = nullptr;
+        return;
+    }
+    for (int y = 0; y < H; y++)
+        for (int x = 0; x < W; x++)
+        {
+            int sum = 0, n = 0;
+            for (int dy = -1; dy <= 1; dy++)
+                for (int dx = -1; dx <= 1; dx++)
+                {
+                    int qx = std::clamp(x + dx, 0, W - 1), qy = std::clamp(y + dy, 0, H - 1);
+                    sum += cls[(size_t)qy * W + qx] == 1 ? 255 : 0;
+                    n++;
+                }
+            ((unsigned*)((BYTE*)lr.pBits + (size_t)y * lr.Pitch))[x] = (unsigned)(sum / n) << 24 | 0xFFFFFF;
+        }
+    m.mask->UnlockRect(0);
+    memcpy(m.maskBox, box, sizeof(box));
+    Log("mirrors: %s: the glass in its texture (%dx%d samples) takes up %.0f%% of the face, inside a frame (of the edge's colour along %.0f%% of it)",
+        m.name.c_str(), W, H, 100.0f * share, 100.0f * framed);
+}
+
+// For tests (the background mode's "mirror"): the player's car's mirror on that side knocked loose (state 1) or off
+// (2), as the hits do (its part's own calls, see game.h kCarParts).
+void KnockMirror(char side, int state)
+{
+    for (SideMirror& m : g_mirrors.list)
+    {
+        if (m.name.empty() || m.name.back() != side) continue;
+        if (!m.part)
+        {
+            Log("mirrors: %s: no part to knock", m.name.c_str());
+            return;
+        }
+        using PartFn = void(__thiscall*)(BYTE*);
+        PartFn* vt = *(PartFn**)m.part;
+        vt[state == 2 ? fo2::kPartKnockOff : fo2::kPartKnockLoose](m.part);
+        Log("mirrors: %s knocked %s for the test (its part's state now %d)", m.name.c_str(), state == 2 ? "off" : "loose",
+            *(const int*)(m.part + fo2::kPartState));
+        return;
+    }
+    Log("mirrors: no %s mirror to knock", side == 'l' ? "left" : "right");
+}
+
+// The colour filter's textures (see FilterTextures) while a mirror renders: of the mirrors' size.
+struct FilterSwap
+{
+    BYTE* wrapper[2] = {};
+    int size[2][2] = {};
+    IDirect3DTexture9* tex[2] = {};
+};
+
+bool UseMirrorFilterTextures(IDirect3DDevice9* dev, FilterSwap& saved)
+{
+    BYTE* engine = *(BYTE**)fo2::kDeviceD3d;
+    BYTE* post = engine ? *(BYTE**)(engine + fo2::kDevPost) : nullptr;
+    if (!post) return false;
+    BYTE** wrappers = (BYTE**)(post + fo2::kPostFilterTex);
+    for (int i = 0; i < 2; i++)
+    {
+        IDirect3DTexture9* game = wrappers[i] ? *(IDirect3DTexture9**)(wrappers[i] + fo2::kTexD3D) : nullptr;
+        D3DSURFACE_DESC d;
+        if (!game || FAILED(game->GetLevelDesc(0, &d))) return false;
+        if (!g_mirrors.filter[i] &&
+            FAILED(dev->CreateTexture(kMirrorW, kMirrorH, 1, D3DUSAGE_RENDERTARGET, d.Format, D3DPOOL_DEFAULT, &g_mirrors.filter[i], nullptr)))
+            return false;
+    }
+    for (int i = 0; i < 2; i++)
+    {
+        BYTE* w = saved.wrapper[i] = wrappers[i];
+        saved.size[i][0] = *(int*)(w + fo2::kTexWidth);
+        saved.size[i][1] = *(int*)(w + fo2::kTexHeight);
+        saved.tex[i] = *(IDirect3DTexture9**)(w + fo2::kTexD3D);
+        *(int*)(w + fo2::kTexWidth) = (int)kMirrorW;
+        *(int*)(w + fo2::kTexHeight) = (int)kMirrorH;
+        *(IDirect3DTexture9**)(w + fo2::kTexD3D) = g_mirrors.filter[i];
+    }
+    return true;
+}
+
+void RestoreFilterTextures(const FilterSwap& saved)
+{
+    for (int i = 0; i < 2; i++)
+    {
+        BYTE* w = saved.wrapper[i];
+        if (!w) continue;
+        *(int*)(w + fo2::kTexWidth) = saved.size[i][0];
+        *(int*)(w + fo2::kTexHeight) = saved.size[i][1];
+        *(IDirect3DTexture9**)(w + fo2::kTexD3D) = saved.tex[i];
+    }
+}
+
+// A mirror's camera looks along the mirror's normal, at the glass well off to the side, and its frustum is off
+// centre; the engine picks the objects a view shows with a frustum about the camera's direction, wide enough to
+// take the glass in (some 50 degrees for a glass of 6): hundreds of objects outside the glass were drawn for
+// nothing. While a mirror's objects are picked (kCullView), the camera looks straight at the glass, with a frustum
+// just around it.
+struct MirrorCull
+{
+    bool on = false;
+    float matrix[16], frustum[7], fov;
+} g_mirrorCull;
+
+using CullViewFn = void(__stdcall*)(BYTE* ctx, BYTE* cam, int view);
+const auto oCullView = (CullViewFn)fo2::kCullView;
+
+void __stdcall CullViewHook(BYTE* ctx, BYTE* cam, int view)
+{
+    if (!g_mirrorCull.on)
+    {
+        oCullView(ctx, cam, view);
+        return;
+    }
+    float* m = (float*)(cam + fo2::kCamMatrix);
+    float* m2 = (float*)(cam + fo2::kCamMatrixCopy2);
+    float* fr = (float*)(cam + fo2::kCamFrustum);
+    float* fov = (float*)(cam + fo2::kCamFov);
+    float saved[16], saved2[16], savedFr[7], savedFov = *fov;
+    memcpy(saved, m, sizeof(saved));
+    memcpy(saved2, m2, sizeof(saved2));
+    memcpy(savedFr, fr, sizeof(savedFr));
+    memcpy(m, g_mirrorCull.matrix, sizeof(saved));
+    memcpy(m2, g_mirrorCull.matrix, sizeof(saved2));
+    memcpy(fr, g_mirrorCull.frustum, sizeof(savedFr));
+    *fov = g_mirrorCull.fov;
+    oCullView(ctx, cam, view);
+    memcpy(m, saved, sizeof(saved));
+    memcpy(m2, saved2, sizeof(saved2));
+    memcpy(fr, savedFr, sizeof(savedFr));
+    *fov = savedFov;
+}
+
+// The mirrors render before the eyes, with the cars' shadows (kCarShadow) the eyes rendered the frame before.
+static uintptr_t g_carShadowFn = fo2::kCarShadow;
+static bool g_keepCarShadows;
+
+// At kCarShadowCall, instead of kCarShadow (the car's shadow in eax).
+static __declspec(naked) void CarShadowHook()
+{
+    __asm {
+        cmp byte ptr [g_keepCarShadows], 0
+        jne keep
+        jmp dword ptr [g_carShadowFn]
+    keep:
+        ret
+    }
+}
+
+// Before the eyes (RenderVrEyes, the cockpit; anchor, pose and fov as the eyes have them, pastAnchor the camera's past
+// placements moved along with it): the pictures of the mirrors the eyes may see, with the cars' shadows of the frame
+// before (CarShadowHook) and without the post-processing (PostProcessHook). Each eye then lays them on their glass as
+// it draws, just before the player's windows (DynamicBatchDraw: the windows' tint, shine and cracks lie over them as
+// over the rest of the view) or, in a car without them, before its own post-processing (its colour filter, glow and
+// blur take the mirrors in with the rest of the view): MirrorsIntoEye. What the eyes set is put back after.
+void RenderMirrors(IDirect3DDevice9* dev, BYTE* ctx, BYTE** cams, float* fovScale, BYTE* cam, const float* anchor, const xr::EyePose* pose,
+                   const xr::EyeFov* fov, const float (*pastAnchor)[16])
+{
+    for (SideMirror& m : g_mirrors.list) m.shown[0] = m.shown[1] = false;
+    BYTE* player = *(BYTE**)fo2::kLocalPlayer;
+    BYTE* car = player ? *(BYTE**)(player + fo2::kPlayerCar) : nullptr;
+    g_mirrorSkinWanted = false;
+    if (!g_cfg.vrMirrors || !car || car != g_eyeCar) return;  // once the car has its driver's eyes
+    if (g_mirrors.car != car) FindMirrors(car);
+    int pictures = g_cfg.vrMirrors == 2 ? 2 : 1;
+    if (g_mirrors.list.empty() || !EnsureMirrorTargets(dev, pictures)) return;
+    double t0 = NowSeconds();
+    // Where the glass is on the faces: from the housings' textures as the eyes drew them (see MakeGlassMask).
+    for (SideMirror& m : g_mirrors.list)
+        if (!m.maskDone)
+        {
+            if (m.skin)
+                MakeGlassMask(dev, m);
+            else
+                g_mirrorSkinWanted = true;
+        }
+    const float* c = (const float*)(car + fo2::kCarMatrix);
+    float e[2][16], mid[3];  // the eyes, and their middle
+    for (int i = 0; i < 2; i++) BuildEyeMatrix(anchor, pose[i], e[i]);
+    for (int k = 0; k < 3; k++) mid[k] = 0.5f * (e[0][12 + k] + e[1][12 + k]);
+
+    float* camM = (float*)(cam + fo2::kCamMatrix);
+    float* camM2 = (float*)(cam + fo2::kCamMatrixCopy2);
+    float* camViews = (float*)(cam + fo2::kCamViews);
+    float* camFov = (float*)(cam + fo2::kCamFov);
+    float* camNear = (float*)(cam + fo2::kCamNear);
+    float* camFar = (float*)(cam + fo2::kCamFar);
+    float* grass = (float*)(ctx + fo2::kCtxPlantFar);
+    int* screenSize = EngineScreenSize();
+    float* screenShape = (float*)fo2::kScreenShape;
+    float* blurSpeed = (float*)fo2::kRadialBlurSpeed;
+    // What the eyes set (RenderVrEyes), put back after the mirrors.
+    float savedNear = *camNear, savedFar = *camFar, savedGrass[2] = { grass[0], grass[1] }, savedShape[2] = { screenShape[0], screenShape[1] }, savedBlur[4];
+    float savedCam[16], savedCam2[16], savedViews[fo2::kCamViewCount * 16], savedFov = *camFov;
+    int savedScreen[2] = { screenSize[0], screenSize[1] };
+    memcpy(savedBlur, blurSpeed, sizeof(savedBlur));
+    memcpy(savedCam, camM, sizeof(savedCam));
+    memcpy(savedCam2, camM2, sizeof(savedCam2));
+    memcpy(savedViews, camViews, sizeof(savedViews));
+    VrEye savedEye = g_vrEye;
+    FilterSwap filter;
+    float relative[16], anchorView[16];  // a mirror's camera = relative * anchor
+    InvertCamera(anchor, anchorView);
+    int rendered = 0;
+    std::vector<float> window, flat;
+    for (SideMirror& m : g_mirrors.list)
+    {
+        if (!m.rt[0]) continue;
+        // The glass in the world: as found (flat), moved with the housing (with its door, or as it hangs knocked loose),
+        // which the mirror's picture is worked out for; and as the crashes have bent it (the batch's vertices on the
+        // CPU), where the picture is drawn, so that it stays on the glass however bent. Its middle, and the mirror's
+        // normal as set.
+        const float* w = (const float*)(m.node + fo2::kNodeWorld);
+        const BYTE* cpu = *(const BYTE**)(m.batch + fo2::kBatchVertices);
+        int stride = *(int*)(m.batch + fo2::kBatchStride);
+        size_t nv = m.vertices.size();
+        m.world.resize(3 * nv);
+        flat.resize(3 * nv);
+        window.resize(3 * nv);
+        float C[3] = {}, n[3];
+        for (size_t i = 0; i < nv; i++)
+        {
+            const float* p = &m.model[3 * i];
+            const float* b = cpu ? (const float*)(cpu + m.vertices[i] * stride) : p;
+            float* q = &flat[3 * i];
+            float* bent = &m.world[3 * i];
+            for (int k = 0; k < 3; k++)
+            {
+                q[k] = p[0] * w[k] + p[1] * w[4 + k] + p[2] * w[8 + k] + w[12 + k], C[k] += q[k] / nv;
+                bent[k] = b[0] * w[k] + b[1] * w[4 + k] + b[2] * w[8 + k] + w[12 + k];
+            }
+        }
+        for (int k = 0; k < 3; k++) n[k] = m.aim[0] * w[k] + m.aim[1] * w[4 + k] + m.aim[2] * w[8 + k];
+        if (!Normalize3(n)) continue;
+        // Knocked off: its part's state (without its part: the glass far from its place in the car).
+        bool away;
+        if (m.part)
+        {
+            int state = *(const int*)(m.part + fo2::kPartState);
+            if (state != m.state)
+                Log("mirrors: %s %s", m.name.c_str(), state >= fo2::kPartKnockedOff ? "knocked off" : state ? "knocked loose (it still shows)" : "on the car");
+            m.state = state;
+            away = state >= fo2::kPartKnockedOff;
+        }
+        else
+        {
+            float moved = 0;
+            for (int i = 0; i < 3; i++)
+            {
+                float x = (C[0] - c[12]) * c[4 * i] + (C[1] - c[13]) * c[4 * i + 1] + (C[2] - c[14]) * c[4 * i + 2] - m.rest[i];
+                moved += x * x;
+            }
+            away = moved > 0.3f * 0.3f;
+            if (away != m.away) Log("mirrors: %s %s", m.name.c_str(), away ? "knocked away" : "back in its place");
+        }
+        m.away = away;
+        if (away) continue;
+        const char* why = "";  // why it is not shown (out of view: nothing to say)
+        for (int k = 0; k < pictures; k++)
+        {
+            // Seen from the eyes' middle (one picture for both), or from eye k: in front of the mirror by d.
+            const float* from = pictures == 2 ? e[k] + 12 : mid;
+            float toFrom[3] = { from[0] - C[0], from[1] - C[1], from[2] - C[2] };
+            float d = Dot3(toFrom, n);
+            if (d < 0.05f)
+            {
+                why = "the eyes are behind its glass";
+                continue;
+            }
+            // In view of the eye (either eye, for one picture).
+            bool inView = false;
+            for (int i = pictures == 2 ? k : 0; i < (pictures == 2 ? k + 1 : 2) && !inView; i++)
+            {
+                float lo[2] = { 1e9f, 1e9f }, hi[2] = { -1e9f, -1e9f };
+                bool behind = false;
+                for (size_t v = 0; v < nv; v++)
+                {
+                    const float* q = &m.world[3 * v];
+                    float dq[3] = { q[0] - e[i][12], q[1] - e[i][13], q[2] - e[i][14] };
+                    float z = Dot3(dq, e[i] + 8);
+                    if (z < 0.01f)
+                    {
+                        behind = true;
+                        continue;
+                    }
+                    float x = Dot3(dq, e[i]) / z, y = Dot3(dq, e[i] + 4) / z;
+                    lo[0] = std::min(lo[0], x), hi[0] = std::max(hi[0], x), lo[1] = std::min(lo[1], y), hi[1] = std::max(hi[1], y);
+                }
+                inView = lo[0] <= hi[0] && (behind || (hi[0] > fov[i].left && lo[0] < fov[i].right && hi[1] > fov[i].down && lo[1] < fov[i].up));
+            }
+            if (!inView) continue;
+            // The window: the glass as seen from there, on the mirror's plane (through the glass's middle).
+            bool edgeOn = false;
+            for (size_t v = 0; v < nv && !edgeOn; v++)
+            {
+                const float* q = &flat[3 * v];
+                float dq[3] = { q[0] - from[0], q[1] - from[1], q[2] - from[2] };
+                float along = Dot3(dq, n);
+                edgeOn = along > -0.01f;
+                for (int j = 0; j < 3 && !edgeOn; j++) window[3 * v + j] = from[j] - d / along * dq[j];
+            }
+            if (edgeOn)
+            {
+                why = "seen edge on";
+                continue;
+            }
+            // The camera: there reflected in the mirror's plane, looking through it along its normal, upright as the car
+            // is.
+            float mc[16] = {};
+            float* r = mc;
+            float* u = mc + 4;
+            float* f = mc + 8;
+            float* at = mc + 12;
+            memcpy(f, n, sizeof(n));
+            for (int j = 0; j < 3; j++) u[j] = c[4 + j] - Dot3(c + 4, n) * n[j], at[j] = from[j] - 2.0f * d * n[j];
+            if (!Normalize3(u))
+            {
+                why = "lying flat";
+                continue;
+            }
+            Cross3(u, f, r);
+            mc[15] = 1.0f;
+            // The window's tangents from there: the frustum through it, and where each vertex lies in the picture.
+            std::vector<float>& uv = m.uv[k];
+            uv.resize(2 * nv);
+            float left = 1e9f, right = -1e9f, down = 1e9f, up = -1e9f;
+            for (size_t v = 0; v < nv; v++)
+            {
+                const float* q = &window[3 * v];
+                float dq[3] = { q[0] - at[0], q[1] - at[1], q[2] - at[2] };
+                float z = std::max(Dot3(dq, f), 0.01f), x = Dot3(dq, r) / z, y = Dot3(dq, u) / z;
+                uv[2 * v] = x, uv[2 * v + 1] = y;
+                left = std::min(left, x), right = std::max(right, x), down = std::min(down, y), up = std::max(up, y);
+            }
+            float aspect = (float)kMirrorW / (float)kMirrorH;
+            float cover = std::max({ -left, right, up * aspect, -down * aspect }) * 1.02f;
+            if (right - left < 1e-4f || up - down < 1e-4f || cover > 6.0f)
+            {
+                why = "seen edge on";
+                continue;
+            }
+            for (size_t v = 0; v < nv; v++)
+            {
+                uv[2 * v] = (uv[2 * v] - left) / (right - left);
+                uv[2 * v + 1] = (up - uv[2 * v + 1]) / (up - down);
+            }
+            // The camera the objects are picked with (CullViewHook): from there straight at the window, upright, its
+            // frustum just around it.
+            float* o = g_mirrorCull.matrix;
+            float* of = o + 8;
+            float* ou = o + 4;
+            for (int j = 0; j < 3; j++) of[j] = f[j] + 0.5f * (left + right) * r[j] + 0.5f * (up + down) * u[j];
+            Normalize3(of);
+            for (int j = 0; j < 3; j++) ou[j] = c[4 + j] - Dot3(c + 4, of) * of[j];
+            Normalize3(ou);
+            Cross3(ou, of, o);
+            memcpy(o + 12, at, 3 * sizeof(float));
+            o[3] = o[7] = o[11] = 0.0f;
+            o[15] = 1.0f;
+            float around = 0.0f, nearest = 1e9f;
+            for (size_t v = 0; v < nv; v++)
+            {
+                const float* q = &window[3 * v];
+                float dq[3] = { q[0] - at[0], q[1] - at[1], q[2] - at[2] };
+                float z = std::max(Dot3(dq, of), 0.01f);
+                around = std::max({ around, fabsf(Dot3(dq, o)) / z, fabsf(Dot3(dq, ou)) / z * aspect });
+                nearest = std::min(nearest, z);
+            }
+            around *= 1.05f;
+            float cullNear = 0.9f * nearest;
+            const float cullFrustum[7] = { -cullNear * around, cullNear * around, -cullNear * around / aspect, cullNear * around / aspect, cullNear,
+                                           *camFar, 0.0f };
+            if (!rendered)
+            {
+                share::EndEyes();
+                UseMirrorFilterTextures(dev, filter);
+                memset(blurSpeed, 0, sizeof(savedBlur));  // no speed blur
+                // The world and the grass as far out as the game draws them ([VR] ViewDistance and GrassDistance are for
+                // the eyes): far away things are small in a mirror, and cost as much as near ones.
+                if (g_cfg.vrViewDistance > 0.0f) *camFar = savedFar / g_cfg.vrViewDistance;
+                if (g_cfg.vrGrassDistance > 0.0f) grass[0] = savedGrass[0] / g_cfg.vrGrassDistance, grass[1] = savedGrass[1] / g_cfg.vrGrassDistance;
+                screenSize[0] = (int)kMirrorW;
+                screenSize[1] = (int)kMirrorH;
+                screenShape[0] = (float)kMirrorW;
+                screenShape[1] = (float)kMirrorH;
+            }
+            // Every copy of the camera's placement; its past ones moved along as the eyes' are.
+            memcpy(camM, mc, sizeof(mc));
+            memcpy(camM2, mc, sizeof(mc));
+            InvertCamera(mc, camViews);
+            MulMatrix(mc, anchorView, relative);
+            for (int i = 1; i < fo2::kCamViewCount; i++)
+            {
+                float past[16];
+                MulMatrix(relative, pastAnchor[i], past);
+                InvertCamera(past, camViews + 16 * i);
+            }
+            *camFov = 2.0f * atanf(cover);
+            *camNear = 0.995f * d;
+            SetFullViewportGlobals();
+            dev->SetRenderTarget(0, m.rt[k]);
+            dev->SetDepthStencilSurface(g_mirrors.ds);
+            dev->Clear(0, nullptr, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL, 0, 1.0f, 0);
+            g_vrEye.active = true;
+            g_vrEye.index = 0;
+            g_vrEye.cockpit = false;
+            g_vrEye.mirror = true;
+            g_vrEye.w = kMirrorW;
+            g_vrEye.h = kMirrorH;
+            g_vrEye.coverTan = cover;
+            g_vrEye.fov = { left, right, up, down };
+            // The mirror's own housing is left out of its picture (it lies about the mirror's plane as set).
+            DWORD* flags = (DWORD*)(m.node + fo2::kNodeFlags);
+            DWORD savedFlags = *flags;
+            *flags |= fo2::kNodeHidden;
+            memcpy(g_mirrorCull.frustum, cullFrustum, sizeof(cullFrustum));
+            g_mirrorCull.frustum[5] = *camFar;
+            g_mirrorCull.fov = 2.0f * atanf(around);
+            g_mirrorCull.on = true;
+            g_keepCarShadows = true;
+            oRenderViews(ctx, cams, fovScale);
+            g_keepCarShadows = false;
+            g_mirrorCull.on = false;
+            *flags = savedFlags;
+            g_vrEye.active = false;
+            g_vrEye.mirror = false;
+            m.shown[k] = true;
+            rendered++;
+            m.tex[k]->GenerateMipSubLevels();
+            if (g_saveEyesThisFrame)
+            {
+                std::string tag = std::string("vr_mirror_") + m.name.back() + (pictures == 2 ? (k ? "_right" : "_left") : "");
+                SaveSurfacePng(dev, m.rt[k], ShotPath(tag.c_str()).c_str());
+            }
+        }
+        if (m.shown[0] || m.shown[1]) why = "";
+        if (why != m.why && why[0] && m.whyLogged < 20)
+        {
+            Log("mirrors: %s not shown: %s", m.name.c_str(), why);
+            m.whyLogged++;
+        }
+        m.why = why;
+    }
+    if (rendered)
+    {
+        RestoreFilterTextures(filter);
+        memcpy(blurSpeed, savedBlur, sizeof(savedBlur));
+        screenSize[0] = savedScreen[0];
+        screenSize[1] = savedScreen[1];
+        screenShape[0] = savedShape[0];
+        screenShape[1] = savedShape[1];
+        *camNear = savedNear;
+        *camFar = savedFar;
+        grass[0] = savedGrass[0];
+        grass[1] = savedGrass[1];
+        memcpy(camM, savedCam, sizeof(savedCam));
+        memcpy(camM2, savedCam2, sizeof(savedCam2));
+        memcpy(camViews, savedViews, sizeof(savedViews));
+        *camFov = savedFov;
+        g_vrEye = savedEye;
+    }
+    double now = NowSeconds();
+    g_mirrors.time.Add(now - t0);
+    g_mirrors.renders += rendered;
+    if (now - g_mirrors.lastLog >= g_cfg.logIntervalSeconds)
+    {
+        if (g_mirrors.lastLog > 0)
+            Log("mirrors: %.2f pictures rendered a frame, %.2f/%.2f ms avg/max", (double)g_mirrors.renders / std::max(g_mirrors.time.n, 1),
+                g_mirrors.time.AvgMs(), g_mirrors.time.MaxMs());
+        g_mirrors.time = Timing();
+        g_mirrors.renders = 0;
+        g_mirrors.lastLog = now;
+    }
+}
+
+// In an eye (after its RenderViews): the mirrors' pictures over their glass, with the eye's depth (and where the glass
+// is on the face, see MakeGlassMask).
+void DrawMirrors(IDirect3DDevice9* dev, BYTE* cam, int eye)
+{
+    struct V { float x, y, z, rhw; DWORD colour; float u, v, mu, mv; };
+    const float* e = (const float*)(cam + fo2::kCamMatrix);  // the eye's
+    float n = *(const float*)(cam + fo2::kCamNear), f = *(const float*)(cam + fo2::kCamFar);
+    const xr::EyeFov& fov = g_vrEye.fov;
+    float W = (float)g_vrt.w, H = (float)g_vrt.h;
+    DWORD shade = (DWORD)lroundf(255.0f * kMirrorShade);
+    DWORD colour = 0xFF000000 | shade << 16 | shade << 8 | shade;
+    int k = g_mirrors.pictures == 2 ? eye : 0;
+    IDirect3DStateBlock9* saved = nullptr;
+    IDirect3DSurface9 *oldRT = nullptr, *oldDS = nullptr;
+    std::vector<V> verts;
+    for (const SideMirror& m : g_mirrors.list)
+    {
+        if (!m.shown[k]) continue;
+        verts.clear();
+        const float* box = m.maskBox;
+        for (size_t i = 0; i < m.vertices.size(); i++)
+        {
+            const float* p = &m.world[3 * i];
+            float d[3] = { p[0] - e[12], p[1] - e[13], p[2] - e[14] };
+            float x = Dot3(d, e), y = Dot3(d, e + 4), z = Dot3(d, e + 8);
+            if (z < n * 1.01f) break;  // (not clipped: left out)
+            float zd = std::max(z - kMirrorDepthPull, n * 1.001f);
+            float mu = m.mask ? (m.skinUv[2 * i] - box[0]) / (box[2] - box[0]) : 0.0f, mv = m.mask ? (m.skinUv[2 * i + 1] - box[1]) / (box[3] - box[1]) : 0.0f;
+            verts.push_back({ (x / z - fov.left) / (fov.right - fov.left) * W - 0.5f, (fov.up - y / z) / (fov.up - fov.down) * H - 0.5f,
+                              f / (f - n) * (1.0f - n / zd), 1.0f / z, colour, m.uv[k][2 * i], m.uv[k][2 * i + 1], mu, mv });
+        }
+        if (verts.size() != m.vertices.size()) continue;
+        if (!saved)
+        {
+            if (FAILED(dev->CreateStateBlock(D3DSBT_ALL, &saved))) return;
+            dev->GetRenderTarget(0, &oldRT);
+            dev->GetDepthStencilSurface(&oldDS);
+            dev->SetRenderTarget(0, g_vrt.rt[eye]);
+            dev->SetDepthStencilSurface(g_vrt.ds[eye]);
+            D3DVIEWPORT9 vp = { 0, 0, g_vrt.w, g_vrt.h, 0.0f, 1.0f };
+            dev->SetViewport(&vp);
+            dev->SetVertexShader(nullptr);
+            dev->SetPixelShader(nullptr);
+            dev->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX2);
+            dev->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_MODULATE);
+            dev->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+            dev->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
+            dev->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+            dev->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_DIFFUSE);
+            dev->SetTextureStageState(0, D3DTSS_TEXCOORDINDEX, 0);
+            dev->SetTextureStageState(0, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
+            // The glass's mask (when it has one): its alpha.
+            dev->SetTextureStageState(1, D3DTSS_COLORARG2, D3DTA_CURRENT);
+            dev->SetTextureStageState(1, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+            dev->SetTextureStageState(1, D3DTSS_TEXCOORDINDEX, 1);
+            dev->SetTextureStageState(1, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
+            dev->SetTextureStageState(2, D3DTSS_COLOROP, D3DTOP_DISABLE);
+            dev->SetTextureStageState(2, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
+            for (DWORD s = 0; s < 2; s++)
+            {
+                dev->SetSamplerState(s, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+                dev->SetSamplerState(s, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+                dev->SetSamplerState(s, D3DSAMP_MIPFILTER, s ? D3DTEXF_NONE : D3DTEXF_LINEAR);
+                dev->SetSamplerState(s, D3DSAMP_MAXMIPLEVEL, 0);
+                dev->SetSamplerState(s, D3DSAMP_MIPMAPLODBIAS, 0);
+                dev->SetSamplerState(s, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+                dev->SetSamplerState(s, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+                dev->SetSamplerState(s, D3DSAMP_SRGBTEXTURE, FALSE);
+            }
+            dev->SetRenderState(D3DRS_ZENABLE, D3DZB_TRUE);
+            dev->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+            dev->SetRenderState(D3DRS_ZFUNC, D3DCMP_LESSEQUAL);
+            dev->SetRenderState(D3DRS_STENCILENABLE, FALSE);
+            dev->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+            dev->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+            dev->SetRenderState(D3DRS_BLENDOP, D3DBLENDOP_ADD);
+            dev->SetRenderState(D3DRS_SEPARATEALPHABLENDENABLE, FALSE);
+            dev->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+            dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+            dev->SetRenderState(D3DRS_FILLMODE, D3DFILL_SOLID);
+            dev->SetRenderState(D3DRS_LIGHTING, FALSE);
+            dev->SetRenderState(D3DRS_FOGENABLE, FALSE);
+            dev->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
+            dev->SetRenderState(D3DRS_COLORWRITEENABLE, 0xF);
+            dev->SetRenderState(D3DRS_SRGBWRITEENABLE, FALSE);
+        }
+        dev->SetTexture(0, m.tex[k]);
+        dev->SetTexture(1, m.mask);
+        dev->SetTextureStageState(1, D3DTSS_COLOROP, m.mask ? D3DTOP_SELECTARG2 : D3DTOP_DISABLE);
+        dev->SetTextureStageState(1, D3DTSS_ALPHAOP, m.mask ? D3DTOP_SELECTARG1 : D3DTOP_DISABLE);
+        dev->SetRenderState(D3DRS_ALPHABLENDENABLE, m.mask ? TRUE : FALSE);
+        dev->DrawIndexedPrimitiveUP(D3DPT_TRIANGLELIST, 0, (UINT)verts.size(), (UINT)(m.triangles.size() / 3), m.triangles.data(), D3DFMT_INDEX16,
+                                    verts.data(), sizeof(V));
+    }
+    if (!saved) return;
+    dev->SetRenderTarget(0, oldRT);
+    dev->SetDepthStencilSurface(oldDS);
+    if (oldRT) oldRT->Release();
+    if (oldDS) oldDS->Release();
+    saved->Apply();
+    saved->Release();
+}
+
+// The eye being rendered, for its mirrors (MirrorsIntoEye): its camera (null: not the cockpit's), and whether they are
+// on its picture yet.
+struct MirrorEye
+{
+    BYTE* cam = nullptr;
+    int index = 0;
+    bool drawn = false;
+} g_mirrorEye;
+
+void MirrorsIntoEye()
+{
+    if (!g_mirrorEye.cam || g_mirrorEye.drawn || g_vrEye.mirror) return;
+    g_mirrorEye.drawn = true;
+    DrawMirrors(*(IDirect3DDevice9**)fo2::kD3DDevice, g_mirrorEye.cam, g_mirrorEye.index);
+}
+
+// The renderer's post-processing (see game.h, kSlotPostProcess): none in the mirrors' pictures (the eye's takes them in);
+// in the cockpit's eyes the mirrors go on before it, if the car's windows have not brought them on yet.
+using PostProcessFn = void(__thiscall*)(void* self);
+const auto oPostProcess = (PostProcessFn)fo2::kPostProcess;
+
+static void __fastcall PostProcessHook(void* self, void*)
+{
+    if (g_vrEye.active && g_vrEye.mirror) return;
+    if (g_vrEye.active) MirrorsIntoEye();
+    oPostProcess(self);
 }
 
 // Renders both eyes for the headset (they are submitted at Present, with the HUD). Returns true
@@ -2090,7 +4852,9 @@ bool RenderVrEyes(IDirect3DDevice9* dev, BYTE* ctx, BYTE** cams, float* fovScale
     float savedCam[16];
     memcpy(savedCam, camM, sizeof(savedCam));
     memcpy(anchor, camM, sizeof(anchor));
-    bool cockpit = CockpitEye(anchor);
+    bool flying = FlightEye(anchor);  // the driver thrown out: the eyes in his head ([VR] EjectView)
+    bool cockpit = !flying && CockpitEye(anchor);
+    FlightSeen(anchor, cockpit);
     memcpy(anchor2, camM2, sizeof(anchor2));
     memcpy(views, camViews, sizeof(views));
     float savedFov = *camFov;
@@ -2110,12 +4874,13 @@ bool RenderVrEyes(IDirect3DDevice9* dev, BYTE* ctx, BYTE** cams, float* fovScale
     ApplyHeadOffsets(pose[1]);
     SameDirection(pose);
     if (!rec::ReplayView(pose, fov)) rec::RecordView(pose, fov);
+    if (cockpit) MoveCockpitCards(anchor);
     // The speed zoom ([VR] SpeedZoom): at speed the game widens its horizontal field of view (by fovScale,
     // up to some 1.3 times the angle) and stretches its picture sideways by half as much, and the world
     // shrinks into the distance. The headset's field of view is its own: instead the eyes are rendered
     // with their angles widened as the monitor's are, and shown in the headset as they are, so the
     // world shrinks the same. The game's own widening stays off in the eyes (fovScale 1, below).
-    float zoom = 1.0f + (savedScale - 1.0f) * g_cfg.vrSpeedZoom;
+    float zoom = flying ? 1.0f : 1.0f + (savedScale - 1.0f) * g_cfg.vrSpeedZoom;
     if (zoom > 1.0f)
     {
         float half = 0.5f * savedFov;
@@ -2162,6 +4927,7 @@ bool RenderVrEyes(IDirect3DDevice9* dev, BYTE* ctx, BYTE** cams, float* fovScale
     float* camNear = (float*)(cam + fo2::kCamNear);
     float savedNear = *camNear;
     if (cockpit && g_cfg.vrNearClip > 0.0f) *camNear = CockpitNear(anchor, pose, fov, savedNear);
+    if (flying) *camNear = std::min(savedNear, kFlightNear);
     // Grass ends (fading out) a fixed distance ahead, which in the headset is plainly in view:
     // [VR] GrassDistance moves both ends of it.
     float* grass = (float*)(ctx + fo2::kCtxPlantFar);
@@ -2197,7 +4963,9 @@ bool RenderVrEyes(IDirect3DDevice9* dev, BYTE* ctx, BYTE** cams, float* fovScale
     float savedBlurSpeed[4], savedBlurCenter[2] = {};
     bool blurCenterSaved = false;
     memcpy(savedBlurSpeed, blurSpeed, sizeof(savedBlurSpeed));
-    if (!g_cfg.vrSpeedBlur) memset(blurSpeed, 0, sizeof(savedBlurSpeed));
+    if (!g_cfg.vrSpeedBlur || flying) memset(blurSpeed, 0, sizeof(savedBlurSpeed));
+    // The side mirrors' pictures for this frame, laid on their glass in each eye as it renders (MirrorsIntoEye).
+    if (cockpit) RenderMirrors(dev, ctx, cams, fovScale, cam, anchor, pose, fov, pastAnchor);
     for (int eye = 0; eye < 2; eye++)
     {
         float e[16];
@@ -2228,11 +4996,18 @@ bool RenderVrEyes(IDirect3DDevice9* dev, BYTE* ctx, BYTE** cams, float* fovScale
         g_vrEye.active = true;
         g_vrEye.index = eye;
         g_vrEye.cockpit = cockpit;
+        g_vrEye.mirror = false;
+        g_vrEye.w = g_vrt.w;
+        g_vrEye.h = g_vrt.h;
         g_vrEye.coverTan = cover;
         g_vrEye.fov = fov[eye];
         share::BeginEye(eye);
+        g_mirrorEye = { cockpit ? cam : nullptr, eye, false };
         oRenderViews(ctx, cams, fovScale);
+        MirrorsIntoEye();  // (if neither the windows nor the post-processing brought them on)
+        g_mirrorEye.cam = nullptr;
         prof::TraceDraws(false);  // a frame trace lists the left eye's draws only
+        if (cockpit) DrawCockpitCards(dev, cam, eye);
         g_vrEye.active = false;
         IDirect3DSurface9* s = nullptr;
         if (SUCCEEDED(g_vrt.tex[eye]->GetSurfaceLevel(0, &s)))
@@ -2242,6 +5017,7 @@ bool RenderVrEyes(IDirect3DDevice9* dev, BYTE* ctx, BYTE** cams, float* fovScale
         }
     }
     share::EndEyes();
+    if (flying) FlightDriverBack();
     RestoreFilterTextures();
     memcpy(blurSpeed, savedBlurSpeed, sizeof(savedBlurSpeed));
     if (blurCenterSaved) memcpy(blurCenter, savedBlurCenter, sizeof(savedBlurCenter));
@@ -2263,7 +5039,7 @@ bool RenderVrEyes(IDirect3DDevice9* dev, BYTE* ctx, BYTE** cams, float* fovScale
         g_saveEyesThisFrame = false;
         g_eyeShotPending = true;  // saved at Present, as they go to the headset
         Log("VR eye fov: left %.3f %.3f %.3f %.3f, right %.3f %.3f %.3f %.3f (tan l r u d), cover %.3f%s", fov[0].left, fov[0].right,
-            fov[0].up, fov[0].down, fov[1].left, fov[1].right, fov[1].up, fov[1].down, cover, cockpit ? ", cockpit" : "");
+            fov[0].up, fov[0].down, fov[1].left, fov[1].right, fov[1].up, fov[1].down, cover, cockpit ? ", cockpit" : flying ? ", in the thrown driver's head" : "");
         if (cockpit) Log("cockpit: the sun's share past the car %.2f, near clipping plane %.3f m", g_sunShare, g_cockpitNear);
     }
     memcpy(camM, savedCam, sizeof(savedCam));
@@ -2293,6 +5069,9 @@ void __stdcall RenderViewsHook(BYTE* ctx, BYTE** cams, float* fovScale)
     bool race = InRace();
     int views = *(int*)(ctx + fo2::kCtxViewCount);
     BYTE* cam = views == 1 && cams ? cams[0] : nullptr;
+    // The cockpit's eyes and instruments are worked out once a car, and the next race may have its car
+    // where the last one's was.
+    if (!race) g_eyeCar = g_dash.car = g_cabin.car = g_mirrors.car = nullptr;
 
     if (dev && g_screenW == 0)
     {
@@ -2391,8 +5170,20 @@ bool InstallRenderHooks()
     if (!PatchTrailFill()) Log("particles: trail fill differs - not patched");
     if (g_cfg.vrEnabled && !PatchLodDistance(g_cfg.vrLodDistance)) Log("level of detail: code differs - distances unchanged");
     if (g_cfg.vrEnabled) Log(share::Install() ? "eyes: the right eye reuses the left eye's leaf and grass cards" : "eyes: leaf pass differs - each eye builds its own");
+    if (g_cfg.vrEnabled && !PatchCall(fo2::kCullViewCall, fo2::kCullView, (const void*)&CullViewHook))
+        Log("mirrors: the culling call differs - a mirror draws what a wide frustum takes in");
+    if (g_cfg.vrEnabled && !PatchCall(fo2::kCarShadowCall, fo2::kCarShadow, (const void*)&CarShadowHook))
+        Log("mirrors: the car shadow call differs - each mirror renders the shadows again");
+    if (g_cfg.vrEnabled && !PatchPointer(fo2::kSlotPostProcess, fo2::kPostProcess, (const void*)&PostProcessHook))
+        Log("mirrors: the post-processing differs - the mirrors go on after the eyes' windows");
     if (g_cfg.vrEnabled && !PatchCall(fo2::kCarViewCall, fo2::kSetCarView, (const void*)&CarViewHook))
         Log("cockpit: the car view call differs - the camera inside the car shows no driver");
+    if (g_cfg.vrEnabled && !PatchCall(fo2::kDynamicBatchDrawCall, fo2::kBatchDraw, (const void*)&DynamicBatchDrawHook))
+        Log("cockpit: the batch draw call differs - the windows are drawn as the game draws them");
+    if (g_cfg.vrEnabled)
+        Log("eject: %s", g_cfg.vrEjectView == 0 ? "the game's camera when the driver is thrown out (EjectView=0)"
+                         : g_cfg.vrEjectView == 1 ? "the eyes stay in the driver's head when he is thrown out of the cockpit"
+                                                  : "the eyes go into the driver's head when he is thrown out (EjectView=2)");
     if (g_cfg.vrEnabled && !PatchCall(fo2::kSampleAnimCall, fo2::kSampleAnim, (const void*)&SampleAnimHook))
         Log("drivers: the animation call differs - the hands move in the animation's steps");
     ok &= PatchPointer(fo2::kSlotSetViewport, fo2::kSetViewport, (const void*)&SetViewportHook);

@@ -180,6 +180,12 @@ void ScreenshotTick()
     }
 }
 
+void SavePixelsPng(const wchar_t* path, const unsigned* bgra, unsigned w, unsigned h)
+{
+    std::vector<BYTE> px((const BYTE*)bgra, (const BYTE*)(bgra + (size_t)w * h));
+    std::thread(WritePng, std::wstring(path), std::move(px), w, h).detach();
+}
+
 void SaveBackBufferPng(IDirect3DDevice9* dev, const wchar_t* path)
 {
     IDirect3DSurface9* bb = nullptr;

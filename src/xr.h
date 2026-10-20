@@ -56,6 +56,20 @@ void EndFrameEmpty();
 // The current head position and direction become "straight ahead" on the next frame.
 void Recenter();
 
+// A Touch controller (OpenXR actions, read with the eyes in BeginFrame; only while the session has the
+// focus): where it points (its aim pose, relative to the recenter origin like the eyes) and its buttons.
+struct Controller
+{
+    bool tracked = false;
+    EyePose aim = {};               // forward: the pointing ray
+    float trigger = 0, grip = 0;    // the index trigger, the grip (0 to 1)
+    bool button = false;            // B (right) or Y (left)
+    float stick[2] = {};            // the thumbstick: x right, y up
+};
+Controller Hand(int hand);  // 0 left, 1 right
+// [Test] without a headset: a controller given by hand (the background command "hand").
+void SetTestHand(int hand, const Controller& c);
+
 // Where the time of handing images to the runtime goes (seconds, summed since the last call).
 struct SubmitTimes
 {

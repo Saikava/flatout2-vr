@@ -1,7 +1,10 @@
 #include "util.h"
 
+#include "game.h"
+
 #include <windows.h>
 
+#include <algorithm>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -115,6 +118,7 @@ void LoadConfig()
     GetPrivateProfileStringW(L"Test", L"HeadOffset", L"0 0 0", offset, 64, p);
     swscanf(offset, L"%f %f %f", &g_cfg.testHeadOffset[0], &g_cfg.testHeadOffset[1], &g_cfg.testHeadOffset[2]);
     g_cfg.testFakeHeadset = GetPrivateProfileIntW(L"Test", L"FakeHeadset", d.testFakeHeadset, p) != 0;
+    g_cfg.testMoveCards = GetPrivateProfileIntW(L"Test", L"MoveCards", d.testMoveCards, p) != 0;
     g_cfg.testRecord = GetPrivateProfileIntW(L"Test", L"Record", d.testRecord, p) != 0;
     g_cfg.testReplay = GetPrivateProfileIntW(L"Test", L"Replay", d.testReplay, p) != 0;
     g_cfg.testFrameTimes = GetPrivateProfileIntW(L"Test", L"FrameTimes", d.testFrameTimes, p) != 0;
@@ -161,7 +165,13 @@ void LoadConfig()
         swscanf(buf, L"%f %f %f", &o[0], &o[1], &o[2]);
     }
     g_cfg.vrCockpit = GetPrivateProfileIntW(L"VR", L"Cockpit", d.vrCockpit, p) != 0;
+    g_cfg.vrStartInCockpit = GetPrivateProfileIntW(L"VR", L"StartInCockpit", d.vrStartInCockpit, p) != 0;
+    g_cfg.vrCockpitHud = GetPrivateProfileIntW(L"VR", L"CockpitHud", d.vrCockpitHud, p) != 0;
     g_cfg.vrNearClip = IniFloat(p, L"VR", L"NearClip", d.vrNearClip);
+    g_cfg.vrCockpitGlass = std::clamp(IniFloat(p, L"VR", L"CockpitGlass", d.vrCockpitGlass), 0.0f, 1.0f);
+    int eject = GetPrivateProfileIntW(L"VR", L"EjectView", d.vrEjectView, p);
+    g_cfg.vrEjectView = eject >= 0 && eject <= 2 ? eject : d.vrEjectView;
+    g_cfg.vrMirrors = std::clamp((int)GetPrivateProfileIntW(L"VR", L"Mirrors", d.vrMirrors, p), 0, 2);
     g_cfg.keyRecenter = GetPrivateProfileIntW(L"Keys", L"Recenter", d.keyRecenter, p);
     g_cfg.logIntervalSeconds = IniFloat(p, L"Log", L"IntervalSeconds", d.logIntervalSeconds);
     g_cfg.keyScreenshot = GetPrivateProfileIntW(L"Keys", L"Screenshot", d.keyScreenshot, p);
@@ -183,6 +193,91 @@ void SaveCameraOffset()
     swprintf(buf, 64, L"%.3f %.3f %.3f", o[0], o[1], o[2]);
     // Replaces the whole line (an ini without the key gets it at the end of [VR]).
     WritePrivateProfileStringW(L"VR", L"CameraOffset", buf, ini.c_str());
+}
+
+// The value goes between the key's '=' and its comment (';'), padded so that the comment keeps its column; a key not in the
+// file is added at the end of its section (WritePrivateProfileString, which on its own would write the comment off).
+void SaveIniValue(const char* section, const char* key, const char* value)
+{
+    std::wstring path = ModuleDir() + L"FO2VR.ini";
+    std::string text;
+    if (FILE* f = _wfopen(path.c_str(), L"rb"))
+    {
+        char buf[4096];
+        for (size_t n; (n = fread(buf, 1, sizeof(buf), f)) > 0;) text.append(buf, n);
+        fclose(f);
+    }
+    std::string sec, k = std::string(key) + "=";
+    size_t at = 0;
+    bool done = false;
+    while (at < text.size() && !done)
+    {
+        size_t end = text.find('\n', at);
+        if (end == std::string::npos) end = text.size();
+        size_t lineEnd = end > at && text[end - 1] == '\r' ? end - 1 : end;
+        std::string line = text.substr(at, lineEnd - at);
+        if (!line.empty() && line[0] == '[')
+            sec = line.substr(1, line.find(']') - 1);
+        else if (_stricmp(sec.c_str(), section) == 0 && line.size() >= k.size() && _strnicmp(line.c_str(), k.c_str(), k.size()) == 0)
+        {
+            size_t semi = line.find(';', k.size());
+            std::string out = line.substr(0, k.size()) + value;
+            if (semi != std::string::npos)
+            {
+                out.append(std::max<size_t>(1, semi > out.size() ? semi - out.size() : 1), ' ');
+                out += line.substr(semi);
+            }
+            text.replace(at, lineEnd - at, out);
+            done = true;
+        }
+        at = end + 1;
+    }
+    if (!done)
+    {
+        std::wstring s(section, section + strlen(section)), kk(key, key + strlen(key)), v(value, value + strlen(value));
+        WritePrivateProfileStringW(s.c_str(), kk.c_str(), v.c_str(), path.c_str());
+        return;
+    }
+    std::wstring tmp = path + L".tmp";
+    FILE* f = _wfopen(tmp.c_str(), L"wb");
+    if (!f) return;
+    bool ok = fwrite(text.data(), 1, text.size(), f) == text.size();
+    ok = fclose(f) == 0 && ok;
+    if (!ok || !MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) DeleteFileW(tmp.c_str());
+}
+
+// The game keeps its race camera in its settings (see game.h, kSettingCamera), read from Savegame\options.cfg at its
+// start: the first start with the mod puts it inside the car, in the file and in the game's default (an options.cfg
+// not made yet). After that the camera chosen with C is the game's to keep.
+void StartInCockpit()
+{
+    if (!g_cfg.vrEnabled || !g_cfg.vrStartInCockpit || g_cfg.testReplay) return;
+    *(int*)fo2::kSettingCamera = fo2::kCameraInside;
+    std::wstring path = ModuleDir() + L"..\\Savegame\\options.cfg";
+    std::string text;
+    if (FILE* f = _wfopen(path.c_str(), L"rb"))
+    {
+        char buf[4096];
+        for (size_t n; (n = fread(buf, 1, sizeof(buf), f)) > 0;) text.append(buf, n);
+        fclose(f);
+    }
+    const char* key = "Settings.Game.Camera = ";
+    size_t at = text.find(key);
+    const char* how = "no Savegame\\options.cfg yet: the game's default";
+    if (at != std::string::npos)
+    {
+        at += strlen(key);
+        size_t end = at;
+        while (end < text.size() && text[end] >= '0' && text[end] <= '9') end++;
+        text.replace(at, end - at, std::to_string(fo2::kCameraInside));
+        FILE* f = _wfopen(path.c_str(), L"wb");
+        bool ok = f && fwrite(text.data(), 1, text.size(), f) == text.size();
+        if (f) ok = fclose(f) == 0 && ok;
+        how = ok ? "Savegame\\options.cfg" : "Savegame\\options.cfg could not be written";
+    }
+    g_cfg.vrStartInCockpit = false;
+    SaveIniValue("VR", "StartInCockpit", "0");
+    Log("cockpit: the race camera set inside the car (%s); StartInCockpit=0 from now on", how);
 }
 
 double NowSeconds()

@@ -10,6 +10,8 @@
 //                                 (degrees up)
 //   camera X Y Z                  [VR] CameraOffset (metres), written to the ini as the camera keys do
 //   trace                         log one frame of render calls
+//   eject                         throw the player's driver out of the car, as a heavy crash does
+//   mirror L|R loose|off          knock the player's car's left or right mirror loose or off, as hits do
 //   log TEXT                      a line in FO2VR.log
 // Lines appended to the file are carried out once a frame.
 struct _D3DPRESENT_PARAMETERS_;
@@ -25,13 +27,16 @@ bool BackgroundMode();
 void BackgroundBeforeDevice(_D3DPRESENT_PARAMETERS_* pp);
 void BackgroundAfterDevice(HWND__* window);
 
-// Once a frame: carries out new commands. Returns kPollShot / kPollTrace / kPollHud (the Hud key)
-// when asked for.
-constexpr int kPollShot = 1, kPollTrace = 2, kPollHud = 4;
+// Once a frame: carries out new commands. Returns kPollShot / kPollTrace / kPollHud (the Hud key) /
+// kPollEject when asked for.
+constexpr int kPollShot = 1, kPollTrace = 2, kPollHud = 4, kPollEject = 8;
 int BackgroundPoll();
 
 // The mod's own hotkeys: in background mode only while the game's window has the focus.
 bool HotkeysAllowed();
+
+// The "mirror" command's knock, once: the side ('l' or 'r') and the part's state to give it (1 loose, 2 off).
+bool TakeMirrorKnock(char* side, int* state);
 
 // A screenshot at the next Present (background mode), like the "shot" command.
 void RequestShot();

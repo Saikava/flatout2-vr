@@ -39,6 +39,10 @@ constexpr uintptr_t kSetCamera = 0x5A6F50;
 // calls IDirect3DDevice9::SetTransform(D3DTS_PROJECTION), ret 4
 constexpr uintptr_t kSlotSetFrustum = kDeviceD3dVtbl + 0xB0;
 constexpr uintptr_t kSetFrustum = 0x5A7130;
+// __thiscall(): the post-processing RenderViews runs once its views are drawn (at 0x4CBB2C): the colour filter, the
+// copy of the view into the screen texture, the glow and the speed blur (see kDevScreenTex, kDevPost)
+constexpr uintptr_t kSlotPostProcess = kDeviceD3dVtbl + 0x150;
+constexpr uintptr_t kPostProcess = 0x5AA390;
 
 // Screen sprites: queued and drawn in batches as vertices in the back buffer's pixel space (x from 0
 // to its width, y to its height), whatever the render target. __thiscall(const void*), ret 4:
@@ -47,6 +51,25 @@ constexpr uintptr_t kSlotSpriteRect = kDeviceD3dVtbl + 0xD8;
 constexpr uintptr_t kSpriteRect = 0x5AB510;
 constexpr uintptr_t kSlotSpriteQuad = kDeviceD3dVtbl + 0xD4;
 constexpr uintptr_t kSpriteQuad = 0x5AB4C0;
+// The queue: the number of sprites in it (int). It is drawn (0x5AB5D0) when the sprites' texture changes,
+// when it is full (256, before the next is queued) and at the end, as one triangle list from index 0 with
+// 4 vertices and 6 indices for each sprite in the queue's order, by an IDirect3DDevice9::DrawIndexedPrimitive
+// that returns to kSpriteBatchDraw (once for each pass of the sprites' effect).
+constexpr uintptr_t kSpriteQueueCount = 0x8DA44C;
+constexpr uintptr_t kSpriteBatchDraw = 0x5AB6E7;
+// The HUD's 2D particles (the nitro's flames by the gauges, ...): each a sprite quad queued from one of
+// these return addresses (0x4C4xxx draws them all, a batch for each of their textures).
+constexpr uintptr_t kHudParticleSprite[2] = { 0x4C4B14, 0x4C4D54 };
+// Turned and scaled sprites (0x4B4D90: the needle, the crash bonus's icon, ...) are queued from here.
+constexpr uintptr_t kHudTurnedSprite = 0x4B500A;
+// The crash bonus by the rival's card: its icon, which grows and spins as it comes, drawn by the function
+// from 0x4C0FC0 to 0x4C13E0 (it reads Settings.HUD CrashIconYOffset).
+constexpr uintptr_t kHudCrashBonus = 0x4C0FC0;
+constexpr uintptr_t kHudCrashBonusEnd = 0x4C13E0;
+// Text in the big font (0x552B90: the music's title box at the top, the crash bonus's "SLAM" by the rival's
+// card, which comes in large): each letter a screen sprite queued by 0x552E40, upright from the first of
+// these return addresses, turned or scaled from the second.
+constexpr uintptr_t kHudBigTextSprite[2] = { 0x552F16, 0x552FD4 };
 
 // DeviceD3d fields: back buffer size (int). The post-processing in RenderViews draws its passes
 // into the bound render target as pre-transformed quads of this size (and RenderViews ends with
@@ -108,6 +131,16 @@ constexpr uintptr_t kLodConstantUse2 = 0x4CBDAB;
 // tan(fov / 2); this is the operand of the fmul by 0.5 (the constant's address).
 constexpr uintptr_t kVisibilityHalf = 0x67DB78;
 constexpr uintptr_t kVisibilityHalfUse = 0x4C9D55;
+// For each view RenderViews hands the camera to the renderer (SetCamera with its matrix, SetFrustum with its
+// frustum) and then picks the objects the view shows (0x4C9B80, __stdcall(ctx, camera, view), ret 0xC, called at
+// kCullViewCall): the culling above, with the camera's own matrix, frustum and field of view.
+constexpr uintptr_t kCullViewCall = 0x4CA1CA;
+constexpr uintptr_t kCullView = 0x4C9B80;
+// Before its views RenderViews renders each car's shadow into a texture of its own (a view from above, 8 cars by 5
+// draws), the same for every view of a frame: 0x4C3CE0 (the car's shadow in eax) for each in its list, called at
+// kCarShadowCall.
+constexpr uintptr_t kCarShadowCall = 0x4C9FE3;
+constexpr uintptr_t kCarShadow = 0x4C3CE0;
 
 // The trees' leaf pass (0x5548A0, per view and bucket of trees) builds the leaf cards of up to 64
 // trees at a time into a dynamic vertex buffer: it locks the buffer (kLeafLock: the buffer in eax,
@@ -301,6 +334,15 @@ constexpr ParticleAddCall kBulkParticleAdds[] = {
 // ---- players and cars ------------------------------------------------------------------------
 constexpr uintptr_t kLocalPlayer = 0x6B21F8;  // Player*
 constexpr int kPlayerCar = 0x33C;             // Car*
+// kLocalPlayer is the first of the race's local players (entries of 0x1C bytes), listed as the players are
+// made (0x46B670: those of kPlayerType 1) except in the stunt events (kStuntEvent), where the list stays empty.
+// There the player at this PC is found in the race's own list of players (GameFlow +kGfRace).
+constexpr uintptr_t kStuntEvent = 0x8DA516;   // bool
+constexpr int kGfRace = 0x9B8;
+constexpr int kRacePlayers = 0x14;            // Player** begin, end
+constexpr int kPlayerType = 0x36C;            // 1: the player at this PC
+constexpr int kCarName = 0x40;                // char[], the car's name ("Venom")
+constexpr int kCarFolder = 0x78;              // const char*, its data folder ("data/Cars/Car_18/")
 constexpr int kCarMatrix = 0x1B0;             // float[16], rows right, up, forward, position
 constexpr int kCarVelocity = 0x280;           // float[3], m/s
 // Each frame the race renderer (0x4C9B80, per view) shows every car as the view needs it: at 0x4C9D23 it
@@ -340,6 +382,19 @@ constexpr int kRagdollMatrices = 0x50;
 constexpr int kRagdollHeadBone = 6;
 constexpr int kRagdollSegments = 0x0;    // the head's segment first
 constexpr int kSegmentBoxMiddle = 0x30;  // float[3], the model's axes
+// When the driver is thrown out (a heavy crash, or launched in the stunts) the ragdoll is let loose
+// (kRagdollOut set) until the car is reset with him back in it. While it is out the segments are bodies of
+// the world's physics, and each segment's matrix (0x170 bytes apart) is its box's place in the world: the
+// player's camera follows the head's (0x4D37A0: the ragdoll camera, data/drivers/ragdoll/camera.ini, 4 m
+// behind and 2 m above), the car step no longer poses the driver from the driving animation (0x4294D9) and
+// the renderer adds his shadow under the third segment (0x4CB495).
+constexpr int kRagdollOut = 0x20;        // int, the car's +0x2AB0
+constexpr int kSegmentStride = 0x170;
+// The crashes throw him out with __stdcall(car, the car's int at kCarCrashArg), ret 8 (called at 0x43859F and
+// 0x438C3B; with the game's Ragdoll setting on): the ragdoll put where the driver sits, given the car's speed and
+// let loose (0x57C2A0). The stunts' launch is 0x425900.
+constexpr uintptr_t kThrowDriverOut = 0x424EF0;
+constexpr int kCarCrashArg = 0x2A84;
 constexpr uintptr_t kSampleAnimCall = 0x57CA2F;
 constexpr uintptr_t kSampleAnim = 0x57ADA0;
 // An animation: its bone count (+0), start and end time (+4, +8), time per frame (+0x14).
@@ -348,7 +403,95 @@ constexpr int kAnimStart = 0x4;
 constexpr int kAnimEnd = 0x8;
 constexpr int kAnimFrameTime = 0x14;
 constexpr int kCarSteeringWheel = 0x32F0;  // scene node*
+// A scene node's world matrix (float[16], rows right, up, forward, position); its local one is at +0x40.
+constexpr int kNodeWorld = 0x80;
+// Its flags: kNodeHidden leaves it out (SetCarView sets it on the driver for the camera inside the car).
+constexpr int kNodeFlags = 0x10;
+constexpr unsigned kNodeHidden = 2;
+// The car's body: the scene node of the "body" mesh of its body.bgm, the outside and the inside of the
+// cabin (its material "interior": the dashboard, the seats, the doors' insides), in the model's axes. A
+// mesh node keeps its models (one a level of detail, the nearest first) from +0xF0, 8 bytes apart; a
+// model the begin and end of its batches' pointers at +0x30. A batch (drawn by 0x5AD450) has its vertices'
+// FVF at +0xC (position, normal, colour, then the texture coordinates), their size at +0x10, the primitive type
+// at +0x14 (4 list, 5 strip), the words vertex count +0x18,
+// index count +0x1C (0: not indexed), base vertex +0x1E, first vertex +0x20 and first index +0x22, its
+// vertex buffer at +0x24 and index buffer at +0x28 (objects with the D3D9 buffer at +0x24 and +0x1C) and
+// its vertices on the CPU at +0x2C (the body's, which the crashes bend; from the first vertex). A vertex
+// has its position first.
+constexpr int kCarBody = 0x1980;           // scene node*
+constexpr int kNodeModels = 0xF0;
+constexpr int kModelBatches = 0x30;
+constexpr int kBatchFvf = 0xC;
+constexpr int kBatchStride = 0x10;
+constexpr int kBatchPrimType = 0x14;
+constexpr int kBatchVertexCount = 0x18;
+constexpr int kBatchIndexCount = 0x1C;
+constexpr int kBatchBaseVertex = 0x1E;
+constexpr int kBatchFirstVertex = 0x20;
+constexpr int kBatchFirstIndex = 0x22;
+constexpr int kBatchVertexBuffer = 0x24;
+constexpr int kBatchIndexBuffer = 0x28;
+constexpr int kVertexBufferD3D = 0x24;
+constexpr int kIndexBufferD3D = 0x1C;
+constexpr int kBatchVertices = 0x2C;
 constexpr int kCarWindows = 0x45BC;        // begin, end of an array of pointers
+// The car's glass: the batches listed from kCarWindows (their materials have shader 6, "car window", which draws
+// with pro_car_window.sha) come last of the scene, blended (ONE, SRCALPHA) with the depth written and the faces
+// turned away culled (each window of the Boxer, Car_3, is two layers, one facing out and one in). The shader
+// reflects the track's environment cube map by a Fresnel term f = c33.x + c33.y * (1 - |N.V|)^5 (the technique
+// sets 0.25 and 0.5) and adds the specular colour (c22, 0.8) times the map's alpha (the sun); what lies behind is
+// kept times (1 - f) * c32.w, the car's WindowBrightness (kCarWindowConstant, float[4]: 0.5 0.5 0.5 0.75 in most
+// cars; the batch's +4 points to it). Its vertex shader takes the world matrix's rows from c4 and the eye's place
+// from c8 for the reflection and f, the projection from c0 alone. The maps have the ground black: from inside the
+// car the windscreen reflects downwards and only darkens the picture, while the side windows, seen at a glancing
+// angle, reflect the bright horizon.
+// The dynamic shader class's batch draw (0x5B10C0) sets a batch's constants, then draws its geometry (kBatchDraw,
+// the batch in esi) at kDynamicBatchDrawCall.
+constexpr uintptr_t kBatchDraw = 0x5AD450;
+constexpr uintptr_t kDynamicBatchDrawCall = 0x5B115C;
+constexpr int kCarWindowConstant = 0x4620;
+// The car's four windows (front, rear, left, right), kWindowSlotSize bytes apart: the material (window_front or
+// windows, window_rear, ...), its texture, windows_damaged.tga and whether the window is broken (byte). A window
+// that breaks (0x425898 for the front) gets windows_damaged.tga and the shader "car window damaged"
+// (pro_default_dynamic.sha: cracked glass with holes); a repair (0x427590) gives it its glass back.
+constexpr int kCarWindowSlots = 0x45C8;
+constexpr int kWindowSlotSize = 0x14;
+constexpr int kWindowBroken = 0xC;
+// The car's scene tree (the meshes of its body.bgm): its root node, and each node's first child and next
+// sibling. Mesh nodes (vtable kMeshNodeVtbl) have their name at kNodeName (an MSVC std::string: the text in place
+// below 16 characters, else a pointer to it; its capacity at +0x14) and kNodeModelCount models from kNodeModels.
+// The parts that come off in crashes are named part_<n>_<what>; the side mirrors part_<n>_mirror_l and _r
+// ("part_11_mirror_l"), placed in the tree under the root or their door, and in the car's parts ini under their
+// door (Parent = "door_l"): they move with it, swing when they are knocked loose and fly off when knocked away.
+// A mirror has no glass of its own: its housing is one batch in the car's body material, and the glass is that
+// mesh's largest flat face looking back, textured as dark glass (in the Chili the glass looks 17 degrees down, in the
+// Venom straight back: set for no one's eyes).
+constexpr int kCarSceneRoot = 0x338;
+constexpr int kNodeFirstChild = 0xC4;
+constexpr int kNodeNextSibling = 0xC8;
+constexpr uintptr_t kMeshNodeVtbl = 0x67AE30;
+constexpr int kNodeName = 0xD0;
+constexpr int kNodeModelCount = 0x108;
+// The parts that come off (bumpers, doors, the hood, mirrors, ...) are objects of their own, listed from kCarParts
+// (begin and end of their pointers; made from the car's parts ini at 0x43305B), each with its scene node at kPartNode
+// and its state at kPartState. Every hit adds to the part's momentum: past its UnlockMomentum it is knocked loose
+// (state 1: a door or the hood swings on its hinge, 0x4289A0; a mirror or a bumper is given the car's speed,
+// 0x436600), past its ReleaseMomentum it is knocked off (state 2: it flies with a body of its own, which its node
+// follows from then on: 0x4366F0, 0x428C6E).
+constexpr int kCarParts = 0x1BEC;
+constexpr int kPartState = 0x10;
+constexpr int kPartNode = 0x2B0;
+constexpr int kPartKnockedOff = 2;
+// The part's virtual calls (thiscall, no arguments) that knock it loose and off: the slots of 0x436600 and 0x4366F0.
+constexpr int kPartKnockLoose = 10;
+constexpr int kPartKnockOff = 11;
+
+// ---- the game's settings ----------------------------------------------------------------------
+// "Settings.Game.Camera" (Savegame\options.cfg, read at the game's start, written back when it is left): the race
+// camera's index in the car's list, which the race takes for the player at its start (0x478CA7; the last one in a car
+// with fewer) and the C key's choice sets (0x4796D9). Index 4 is the camera inside the car.
+constexpr uintptr_t kSettingCamera = 0x69C2A0;  // int
+constexpr int kCameraInside = 4;
 
 // ---- game state -----------------------------------------------------------------------------
 constexpr uintptr_t kGameFlow = 0x8E8410;  // GameFlow*

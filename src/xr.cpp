@@ -84,6 +84,13 @@ float g_originYaw;
 bool g_loggedImage;
 SubmitTimes g_times;
 
+// The controllers' actions (CreateInput) and their state for the open frame (ReadInput).
+XrActionSet g_actionSet = XR_NULL_HANDLE;
+XrAction g_aimAction, g_triggerAction, g_gripAction, g_buttonAction, g_stickAction;
+XrPath g_handPath[2];
+XrSpace g_aimSpace[2];
+Controller g_hands[2], g_testHands[2];
+
 // No tracking (headset asleep, or no frame located yet): eyes straight ahead with a Quest 3-like
 // field of view, for test renders.
 void DefaultViews()
@@ -131,6 +138,23 @@ void ToGame(const float v[3], float out[3])
     out[0] = v[0] * c + v[2] * s;
     out[1] = v[1];
     out[2] = -(-v[0] * s + v[2] * c);
+}
+
+// A pose in the LOCAL space relative to the recenter origin, in game axes.
+EyePose ToGamePose(const XrPosef& p)
+{
+    const float x[3] = { 1, 0, 0 }, y[3] = { 0, 1, 0 }, fwd[3] = { 0, 0, -1 };
+    float r[3], u[3], f[3];
+    Rotate(p.orientation, x, r);
+    Rotate(p.orientation, y, u);
+    Rotate(p.orientation, fwd, f);
+    float pos[3] = { p.position.x - g_originPos[0], p.position.y - g_originPos[1], p.position.z - g_originPos[2] };
+    EyePose out;
+    ToGame(r, out.right);
+    ToGame(u, out.up);
+    ToGame(f, out.forward);
+    ToGame(pos, out.position);
+    return out;
 }
 
 void ApplyRecenter()
@@ -481,6 +505,118 @@ void PrepareDxvkExtensions()
     set(instList.c_str(), devList.c_str());
 }
 
+// The controllers: one action set with the aim pose, the trigger, the grip, B/Y and the thumbstick of
+// either hand, bound for the Touch controllers (and the trigger and pose of any controller through the
+// simple profile).
+void CreateInput()
+{
+    XrActionSetCreateInfo si = { XR_TYPE_ACTION_SET_CREATE_INFO };
+    strcpy(si.actionSetName, "cockpit");
+    strcpy(si.localizedActionSetName, "Cockpit");
+    if (!Check(xrCreateActionSet(g_instance, &si, &g_actionSet), "xrCreateActionSet")) return;
+    xrStringToPath(g_instance, "/user/hand/left", &g_handPath[0]);
+    xrStringToPath(g_instance, "/user/hand/right", &g_handPath[1]);
+    struct
+    {
+        XrAction* action;
+        const char *name, *label;
+        XrActionType type;
+    } actions[] = {
+        { &g_aimAction, "aim", "Aim", XR_ACTION_TYPE_POSE_INPUT },
+        { &g_triggerAction, "trigger", "Trigger", XR_ACTION_TYPE_FLOAT_INPUT },
+        { &g_gripAction, "grip", "Grip", XR_ACTION_TYPE_FLOAT_INPUT },
+        { &g_buttonAction, "reset", "Reset", XR_ACTION_TYPE_BOOLEAN_INPUT },
+        { &g_stickAction, "stick", "Thumbstick", XR_ACTION_TYPE_VECTOR2F_INPUT },
+    };
+    for (auto& a : actions)
+    {
+        XrActionCreateInfo ai = { XR_TYPE_ACTION_CREATE_INFO };
+        ai.actionType = a.type;
+        strcpy(ai.actionName, a.name);
+        strcpy(ai.localizedActionName, a.label);
+        ai.countSubactionPaths = 2;
+        ai.subactionPaths = g_handPath;
+        if (!Check(xrCreateAction(g_actionSet, &ai, a.action), "xrCreateAction")) return;
+    }
+    auto suggest = [](const char* profile, std::initializer_list<std::pair<XrAction, const char*>> list) {
+        std::vector<XrActionSuggestedBinding> b;
+        for (auto& [action, path] : list)
+        {
+            XrPath p;
+            if (XR_SUCCEEDED(xrStringToPath(g_instance, path, &p))) b.push_back({ action, p });
+        }
+        XrPath p;
+        xrStringToPath(g_instance, profile, &p);
+        XrInteractionProfileSuggestedBinding sb = { XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING };
+        sb.interactionProfile = p;
+        sb.countSuggestedBindings = (uint32_t)b.size();
+        sb.suggestedBindings = b.data();
+        Check(xrSuggestInteractionProfileBindings(g_instance, &sb), profile);
+    };
+    suggest("/interaction_profiles/oculus/touch_controller",
+            { { g_aimAction, "/user/hand/left/input/aim/pose" }, { g_aimAction, "/user/hand/right/input/aim/pose" },
+              { g_triggerAction, "/user/hand/left/input/trigger/value" }, { g_triggerAction, "/user/hand/right/input/trigger/value" },
+              { g_gripAction, "/user/hand/left/input/squeeze/value" }, { g_gripAction, "/user/hand/right/input/squeeze/value" },
+              { g_buttonAction, "/user/hand/left/input/y/click" }, { g_buttonAction, "/user/hand/right/input/b/click" },
+              { g_stickAction, "/user/hand/left/input/thumbstick" }, { g_stickAction, "/user/hand/right/input/thumbstick" } });
+    suggest("/interaction_profiles/khr/simple_controller",
+            { { g_aimAction, "/user/hand/left/input/aim/pose" }, { g_aimAction, "/user/hand/right/input/aim/pose" },
+              { g_triggerAction, "/user/hand/left/input/select/click" }, { g_triggerAction, "/user/hand/right/input/select/click" } });
+    for (int h = 0; h < 2; h++)
+    {
+        XrActionSpaceCreateInfo ci = { XR_TYPE_ACTION_SPACE_CREATE_INFO };
+        ci.action = g_aimAction;
+        ci.subactionPath = g_handPath[h];
+        ci.poseInActionSpace.orientation.w = 1.0f;
+        Check(xrCreateActionSpace(g_session, &ci, &g_aimSpace[h]), "xrCreateActionSpace");
+    }
+    XrSessionActionSetsAttachInfo ai = { XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO };
+    ai.countActionSets = 1;
+    ai.actionSets = &g_actionSet;
+    if (Check(xrAttachSessionActionSets(g_session, &ai), "xrAttachSessionActionSets")) Log("xr: controller actions ready");
+}
+
+// The controllers at the open frame's display time.
+void ReadInput()
+{
+    if (!g_actionSet) return;
+    XrActiveActionSet active = { g_actionSet, XR_NULL_PATH };
+    XrActionsSyncInfo sync = { XR_TYPE_ACTIONS_SYNC_INFO };
+    sync.countActiveActionSets = 1;
+    sync.activeActionSets = &active;
+    XrResult r = xrSyncActions(g_session, &sync);
+    for (int h = 0; h < 2; h++)
+    {
+        Controller c;
+        if (r == XR_SUCCESS)  // (XR_SESSION_NOT_FOCUSED: the system has the controllers)
+        {
+            XrSpaceLocation loc = { XR_TYPE_SPACE_LOCATION };
+            const XrSpaceLocationFlags valid = XR_SPACE_LOCATION_ORIENTATION_VALID_BIT | XR_SPACE_LOCATION_POSITION_VALID_BIT;
+            if (g_aimSpace[h] && XR_SUCCEEDED(xrLocateSpace(g_aimSpace[h], g_local, g_frameState.predictedDisplayTime, &loc)) &&
+                (loc.locationFlags & valid) == valid)
+            {
+                c.tracked = true;
+                c.aim = ToGamePose(loc.pose);
+            }
+            XrActionStateGetInfo gi = { XR_TYPE_ACTION_STATE_GET_INFO };
+            gi.subactionPath = g_handPath[h];
+            XrActionStateFloat f = { XR_TYPE_ACTION_STATE_FLOAT };
+            gi.action = g_triggerAction;
+            if (XR_SUCCEEDED(xrGetActionStateFloat(g_session, &gi, &f)) && f.isActive) c.trigger = f.currentState;
+            f = { XR_TYPE_ACTION_STATE_FLOAT };
+            gi.action = g_gripAction;
+            if (XR_SUCCEEDED(xrGetActionStateFloat(g_session, &gi, &f)) && f.isActive) c.grip = f.currentState;
+            XrActionStateBoolean b = { XR_TYPE_ACTION_STATE_BOOLEAN };
+            gi.action = g_buttonAction;
+            if (XR_SUCCEEDED(xrGetActionStateBoolean(g_session, &gi, &b)) && b.isActive) c.button = b.currentState != XR_FALSE;
+            XrActionStateVector2f v = { XR_TYPE_ACTION_STATE_VECTOR2F };
+            gi.action = g_stickAction;
+            if (XR_SUCCEEDED(xrGetActionStateVector2f(g_session, &gi, &v)) && v.isActive) c.stick[0] = v.currentState.x, c.stick[1] = v.currentState.y;
+        }
+        g_hands[h] = c;
+    }
+}
+
 void EndFrame(const XrCompositionLayerBaseHeader* layer, const XrCompositionLayerBaseHeader* overlay = nullptr)
 {
     const XrCompositionLayerBaseHeader* layers[2] = { layer, overlay };
@@ -663,6 +799,7 @@ void OnDevice(IDirect3DDevice9* dev)
     CreateSwapchain(g_eyeSc[0], g_eyeW, g_eyeH, "left eye");
     CreateSwapchain(g_eyeSc[1], g_eyeW, g_eyeH, "right eye");
     Log("xr: session created");
+    CreateInput();
 }
 
 void PollEvents()
@@ -747,27 +884,17 @@ bool BeginFrame()
         g_recenterPending = false;
         ApplyRecenter();
     }
+    ReadInput();
     return g_frameState.shouldRender && g_viewsValid;
 }
 
 bool FrameOpen() { return g_frameOpen; }
 
-EyePose Pose(int eye)
-{
-    const XrPosef& p = g_views[eye].pose;
-    const float x[3] = { 1, 0, 0 }, y[3] = { 0, 1, 0 }, fwd[3] = { 0, 0, -1 };
-    float r[3], u[3], f[3];
-    Rotate(p.orientation, x, r);
-    Rotate(p.orientation, y, u);
-    Rotate(p.orientation, fwd, f);
-    float pos[3] = { p.position.x - g_originPos[0], p.position.y - g_originPos[1], p.position.z - g_originPos[2] };
-    EyePose out;
-    ToGame(r, out.right);
-    ToGame(u, out.up);
-    ToGame(f, out.forward);
-    ToGame(pos, out.position);
-    return out;
-}
+EyePose Pose(int eye) { return ToGamePose(g_views[eye].pose); }
+
+Controller Hand(int hand) { return g_fake ? g_testHands[hand] : g_hands[hand]; }
+
+void SetTestHand(int hand, const Controller& c) { g_testHands[hand] = c; }
 
 EyeFov Fov(int eye)
 {

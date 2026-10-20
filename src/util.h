@@ -27,6 +27,7 @@ struct Config
     float testHeadYawDeg = 0;      // the head turned right by this much (background mode command "head")
     float testHeadPitchDeg = 0;    // and up by this much
     bool testFakeHeadset = false;  // no runtime: races render the eyes straight ahead (with PaceHz, VrEyesWithoutHeadset)
+    bool testMoveCards = false;    // the Touch controllers move the cockpit's cards (MoveCockpitCards)
     bool testBackground = false;  // window on another monitor, no sound, keys from a file (background.h)
     bool testSampling = false;    // profiler: sample where the game thread runs (slow frames are logged)
     bool testShareEyes = true;     // the right eye copies the left eye's leaf and grass cards (0: each eye builds its own)
@@ -58,7 +59,14 @@ struct Config
     float vrSpeedZoom = 1.0f;      // races: the game's widening of the field of view at speed, times this
     float vrCameraOffset[3] = {};  // races: metres the eyes are moved against the car (x right, y up, z forward)
     bool vrCockpit = true;         // the camera inside the car shows the driver, the steering wheel and the windows
+    bool vrStartInCockpit = true;  // once: the game's race camera set to the one inside the car (the ini is then set to 0)
+    bool vrCockpitHud = true;      // the cockpit: the HUD's gauges, position, lap and map on the dashboard (not on the panel)
     float vrNearClip = 0.05f;      // the cockpit: the eyes' near clipping distance, metres (0: the camera's own)
+    float vrCockpitGlass = 0.3f;   // the cockpit: how much of the game's glass the windows show (0: none, 1: all of it)
+    int vrEjectView = 1;           // the driver thrown out: the eyes in his head (1: when they were in the cockpit, 2: from any
+                                   // camera, 0: the game's cut to the camera behind him)
+    int vrMirrors = 2;             // the cockpit: the side mirrors show what is behind (1: one picture for both eyes,
+                                   // 2: one for each eye, 0: the game's dark glass)
     // [Log]
     float logIntervalSeconds = 2.0f;
     // [Keys]
@@ -73,6 +81,10 @@ extern Config g_cfg;
 void LoadConfig();
 // Writes [VR] CameraOffset to the ini (the camera keys changed it).
 void SaveCameraOffset();
+// Sets a key's value in FO2VR.ini where it stands, keeping the comment after it.
+void SaveIniValue(const char* section, const char* key, const char* value);
+// [VR] StartInCockpit: the game's race camera put inside the car, once (at the start, before the game reads its settings).
+void StartInCockpit();
 
 double NowSeconds();
 

@@ -58,6 +58,7 @@ static void Init()
     if (!InstallPacingHooks()) Log("frame gate hook FAILED");
     InstallBackground();
     rec::Install();
+    StartInCockpit();
     if (g_cfg.vrEnabled || BackgroundMode()) Log("Direct3DCreate9 hook %s", InstallCreateHook() ? "installed" : "FAILED");
 }
 
