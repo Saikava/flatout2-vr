@@ -67,6 +67,7 @@ struct Config
                                    // camera, 0: the game's cut to the camera behind him)
     int vrMirrors = 2;             // the cockpit: the side mirrors show what is behind (1: one picture for both eyes,
                                    // 2: one for each eye, 0: the game's dark glass)
+    float vrMirrorRadius = 1.4f;   // the mirrors' glass is convex, of this radius (metres): it shows more, smaller (0: flat)
     // [Log]
     float logIntervalSeconds = 2.0f;
     // [Keys]

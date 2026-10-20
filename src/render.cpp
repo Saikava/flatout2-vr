@@ -1918,6 +1918,8 @@ void MirrorsIntoEye();
 static void __stdcall DynamicBatchDraw(BYTE* batch)
 {
     if (g_mirrorSkinWanted && g_vrEye.active) NoteMirrorSkin(batch);
+    // The mirrors look along the car's side, its windows edge on: drawn, a dark streak (real glass is hardly seen so).
+    if (g_vrEye.active && g_vrEye.mirror && GlassOf(batch) != Glass::None) return;
     Glass glass = g_vrEye.active && g_vrEye.cockpit ? GlassOf(batch) : Glass::None;
     if (glass == Glass::None)
     {
@@ -3492,7 +3494,10 @@ void EndHudCapture(IDirect3DDevice9* dev)
 // over the glass in each eye with the eye's depth (the hands and the pillars go in front of it), as the eye draws, under
 // the car's windows; seen from the eyes it comes out turned left for right, as in a mirror. Mirrors=1 renders one picture from the eyes' middle for both eyes
 // (it lies on the glass, flat); Mirrors=2 one from each eye for that eye (what the mirror shows stands at its depth
-// behind the glass, as in a real one, for twice the cost). Moving the head moves what the mirror shows. A mirror's
+// behind the glass, as in a real one, for twice the cost). Moving the head moves what the mirror shows. The glass is
+// convex as real side mirrors are ([VR] MirrorRadius): the picture takes in a wider view about the glass's middle,
+// laid on the same glass, so what it shows is smaller, and with a picture for each eye it stands nearer behind the
+// glass (the far away within about half the radius), as in a convex mirror. A mirror's
 // render is kept small: the objects are picked for the glass alone (CullViewHook), the cars' shadows are the eyes' of
 // the frame before (CarShadowHook), the world and the grass end where the game ends them, and there is no lens flare
 // or post-processing (the eyes' takes the mirrors in).
@@ -3504,12 +3509,18 @@ void EndHudCapture(IDirect3DDevice9* dev)
 // mirror is bent or knocked loose; only a mirror knocked off (its part's state, see game.h kCarParts) shows nothing.
 //
 // The face found for the glass is often the housing's whole back with its frame painted on it around the glass (the
-// Sunray's): where the glass is comes from the texture (MakeGlassMask), and the picture shows there alone.
-constexpr UINT kMirrorW = 512, kMirrorH = 256;  // a mirror's glass is some 3:2 to 5:2, and 2 to 10 degrees across
+// Sunray's), and the glass may be painted on past it, across the faces next to it (the Venom's housing's back is bent
+// in three): where the glass is comes from the texture (MakeGlassMask), and the picture shows there alone.
+// A mirror's picture has as many pixels as its glass takes up in the eye (kMirrorSharp times as many each way, in steps
+// of kMirrorStep), up to kMirrorMax a side: its targets are that big, and a picture takes up their top left corner.
+constexpr UINT kMirrorMax = 1024, kMirrorStep = 32, kMirrorLeast = 64;
+constexpr float kMirrorSharp = 1.25f;
 constexpr float kMirrorAimDown = 1.0f * 3.14159265f / 180.0f;
 constexpr float kMirrorCarShare = 0.15f;
 constexpr float kMirrorShade = 0.85f;       // a mirror gives back some 85% of the light
 constexpr float kMirrorDepthPull = 0.003f;  // metres nearer in depth than the glass, not to fight with it
+constexpr float kGlassBend = 0.707f;        // the cosine of the most a face next to the glass's may turn from it, its glass painted on
+constexpr float kGlassReach = 0.6f;         // and how far off its texture may be, of the glass's face's in the texture
 
 struct SideMirror
 {
@@ -3522,6 +3533,7 @@ struct SideMirror
     std::vector<float> model;     // their places in the model's axes as found (before the crashes bend them)
     std::vector<float> skinUv;    // their texture coordinates (2 floats each)
     std::vector<WORD> triangles;  // the glass's triangles: indices into `vertices`
+    int faceTriangles = 0;        // of them (3 a triangle) the face found for it, first; the rest the faces next to it
     float aim[3] = {};            // the mirror's normal as set (towards the eyes), in the model's axes
     float rest[3] = {};           // the glass's middle in the car's axes as found
     bool away = false;            // knocked off (or, its part not found, far from its place)
@@ -3537,9 +3549,10 @@ struct SideMirror
     // A picture for each eye (Mirrors=2; else the first for both).
     IDirect3DTexture9* tex[2] = {};
     IDirect3DSurface9* rt[2] = {};
-    // This frame: whether each picture was rendered; the glass's vertices in the world (3 floats each), and where each
-    // lies in the pictures (u, v).
+    // This frame: whether each picture was rendered, and its size; the glass's vertices in the world (3 floats each),
+    // and where each lies in the pictures' targets (u, v).
     bool shown[2] = {};
+    UINT size[2][2] = {};
     std::vector<float> world, uv[2];
 };
 
@@ -3553,6 +3566,7 @@ struct MirrorState
     int pictures = 0;    // the targets made: 1 or 2 pictures a mirror
     Timing time;         // the frames' mirror work (CPU)
     int renders = 0;
+    double pixels = 0;   // (and theirs, for the log)
     double lastLog = 0;
 } g_mirrors;
 
@@ -3599,31 +3613,31 @@ bool EnsureMirrorTargets(IDirect3DDevice9* dev, int pictures)
     g_mirrors.pictures = pictures;
     bool ok = true, made = false, mips = true;
     if (!g_mirrors.ds)
-        ok = SUCCEEDED(dev->CreateDepthStencilSurface(kMirrorW, kMirrorH, D3DFMT_D24S8, D3DMULTISAMPLE_NONE, 0, TRUE, &g_mirrors.ds, nullptr));
+        ok = SUCCEEDED(dev->CreateDepthStencilSurface(kMirrorMax, kMirrorMax, D3DFMT_D24S8, D3DMULTISAMPLE_NONE, 0, TRUE, &g_mirrors.ds, nullptr));
     for (SideMirror& m : g_mirrors.list)
         for (int i = 0; i < pictures; i++)
         {
             if (!ok || m.tex[i]) continue;
             made = true;
-            if (FAILED(dev->CreateTexture(kMirrorW, kMirrorH, 0, D3DUSAGE_RENDERTARGET | D3DUSAGE_AUTOGENMIPMAP, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT,
+            if (FAILED(dev->CreateTexture(kMirrorMax, kMirrorMax, 0, D3DUSAGE_RENDERTARGET | D3DUSAGE_AUTOGENMIPMAP, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT,
                                           &m.tex[i], nullptr)))
             {
                 mips = false;
-                ok = SUCCEEDED(dev->CreateTexture(kMirrorW, kMirrorH, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &m.tex[i], nullptr));
+                ok = SUCCEEDED(dev->CreateTexture(kMirrorMax, kMirrorMax, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &m.tex[i], nullptr));
             }
             ok = ok && SUCCEEDED(m.tex[i]->GetSurfaceLevel(0, &m.rt[i]));
         }
     if (!ok)
     {
-        Log("mirrors: render targets %ux%u FAILED", kMirrorW, kMirrorH);
+        Log("mirrors: render targets %ux%u FAILED", kMirrorMax, kMirrorMax);
         ReleaseMirrorTargets();
         g_mirrors.failed = true;
         return false;
     }
     if (made)
     {
-        PrepareScreenshots(dev, kMirrorW, kMirrorH, D3DFMT_A8R8G8B8, pictures * (int)g_mirrors.list.size());
-        Log("mirrors: render targets %ux%u%s, %s", kMirrorW, kMirrorH, mips ? ", with mipmaps" : ", without mipmaps",
+        PrepareScreenshots(dev, kMirrorMax, kMirrorMax, D3DFMT_A8R8G8B8, pictures * (int)g_mirrors.list.size());
+        Log("mirrors: render targets %ux%u%s, %s", kMirrorMax, kMirrorMax, mips ? ", with mipmaps" : ", without mipmaps",
             pictures == 2 ? "a picture for each eye" : "one picture for both eyes");
     }
     return true;
@@ -3655,10 +3669,11 @@ bool Normalize3(float* v)
 }
 
 // The glass of a mirror's housing (its nearest model): the largest flat face that looks backwards and towards the
-// driver's eyes (eyes: their place in the car's axes), and the mirror set for them (body: the car's body's triangles
-// in its axes, see ReadMesh). The housing's faces are told apart by their direction (within 5 degrees) and their
-// plane (within 4 mm); a face looks the way its triangles' winding says (clockwise in front, as Direct3D draws
-// them). out[8], for the log: the glass's width and height (metres), the way it looks (degrees out from straight
+// driver's eyes (eyes: their place in the car's axes), with the faces next to it that its texture goes on across, and
+// the mirror set for them as that face looks (body: the car's body's triangles in its axes, see ReadMesh). The
+// housing's faces are told apart by their direction (within 5 degrees) and their plane (within 4 mm); a face looks the
+// way its triangles' winding says (clockwise in front, as Direct3D draws them). out[8], for the log, of that face: the
+// glass's width and height (metres), the way it looks (degrees out from straight
 // back and up), how far the mirror was turned, how wide an angle it shows, how far out its middle looks and how far
 // out the car's side reaches (degrees).
 bool FindGlass(BYTE* car, SideMirror& m, const float* eyes, const std::vector<float>& body, float* out)
@@ -3776,27 +3791,90 @@ bool FindGlass(BYTE* car, SideMirror& m, const float* eyes, const std::vector<fl
             in->area += x.area;
             in->tris.insert(in->tris.end(), &tris[x.at], &tris[x.at] + 3);
         }
+        // Triangles (vertex indices, 3 a triangle) backwards (within some 70 degrees) and towards the eyes, in the car's
+        // axes (normal: theirs in the model's): their normal, middle and the way to it from the eyes.
+        auto towardsEyes = [&](const float* normal, const int* v, size_t count, float* n, float* mid, float* toGlass) {
+            float p[3];
+            inCar(normal, n, true);
+            Normalize3(n);
+            for (int k = 0; k < 3; k++) mid[k] = 0.0f;
+            for (size_t i = 0; i < count; i++)
+            {
+                inCar(&pos[3 * v[i]], p, false);
+                for (int k = 0; k < 3; k++) mid[k] += p[k] / count;
+            }
+            for (int k = 0; k < 3; k++) toGlass[k] = mid[k] - eyes[k];
+            return n[2] <= -0.35f && Dot3(n, toGlass) < 0.0f;
+        };
+        // Whether a triangle has an edge of the triangles: the same two vertices, in place and texture coordinates (the
+        // texture goes on across it).
+        auto same = [&](int a, int b) {
+            for (int k = 0; k < 3; k++)
+                if (fabsf(pos[3 * a + k] - pos[3 * b + k]) > 1e-4f) return false;
+            return fabsf(tex[2 * a] - tex[2 * b]) <= 1e-4f && fabsf(tex[2 * a + 1] - tex[2 * b + 1]) <= 1e-4f;
+        };
+        auto touches = [&](const int* t, const std::vector<int>& to) {
+            for (int e = 0; e < 3; e++)
+                for (size_t u = 0; u < to.size(); u += 3)
+                    for (int g = 0; g < 3; g++)
+                    {
+                        int a0 = t[e], a1 = t[(e + 1) % 3], b0 = to[u + g], b1 = to[u + (g + 1) % 3];
+                        if ((same(a0, b0) && same(a1, b1)) || (same(a0, b1) && same(a1, b0))) return true;
+                    }
+            return false;
+        };
         for (const Face& f : faces)
         {
             if (f.area <= bestArea) continue;
-            // Backwards (within some 70 degrees) and towards the eyes, in the car's axes.
-            float n[3], mid[3] = {}, p[3];
-            inCar(f.n, n, true);
-            Normalize3(n);
-            for (int v : f.tris)
-            {
-                inCar(&pos[3 * v], p, false);
-                for (int k = 0; k < 3; k++) mid[k] += p[k] / f.tris.size();
-            }
-            float toGlass[3] = { mid[0] - eyes[0], mid[1] - eyes[1], mid[2] - eyes[2] };
-            if (n[2] > -0.35f || Dot3(n, toGlass) >= 0.0f) continue;
+            float n[3], mid[3], p[3], toGlass[3];
+            if (!towardsEyes(f.n, f.tris.data(), f.tris.size(), n, mid, toGlass)) continue;
             bestArea = f.area;
             m.batch = b;
             m.vertices.clear();
             m.triangles.clear();
             m.model.clear();
             m.skinUv.clear();
+            // The glass painted on past the face: the triangles joined to it (the texture going on across their edges)
+            // that look within kGlassBend of its way, backwards towards the eyes, their texture next to the face's
+            // (within kGlassReach of its size: the Venom's housing's back is bent in three, its glass painted across
+            // them all); where on them the glass is MakeGlassMask finds.
+            float uvLo[2] = { 1e9f, 1e9f }, uvHi[2] = { -1e9f, -1e9f };
             for (int v : f.tris)
+                for (int k = 0; k < 2; k++) uvLo[k] = std::min(uvLo[k], tex[2 * v + k]), uvHi[k] = std::max(uvHi[k], tex[2 * v + k]);
+            auto nearFace = [&](const int* t) {
+                for (int j = 0; j < 3; j++)
+                    for (int k = 0; k < 2; k++)
+                    {
+                        float reach = kGlassReach * (uvHi[k] - uvLo[k]), uv = tex[2 * t[j] + k];
+                        if (uv < uvLo[k] - reach || uv > uvHi[k] + reach) return false;
+                    }
+                return true;
+            };
+            std::vector<int> glassTris = f.tris;
+            std::vector<BYTE> taken(tris.size() / 3);
+            for (size_t t = 0; t < tris.size(); t += 3)
+                for (size_t u = 0; u < f.tris.size() && !taken[t / 3]; u += 3)
+                    taken[t / 3] = tris[t] == f.tris[u] && tris[t + 1] == f.tris[u + 1] && tris[t + 2] == f.tris[u + 2];
+            for (bool grew = true; grew;)
+            {
+                grew = false;
+                for (size_t t = 0; t < tris.size(); t += 3)
+                {
+                    if (taken[t / 3]) continue;
+                    const float *p0 = &pos[3 * tris[t]], *p1 = &pos[3 * tris[t + 1]], *p2 = &pos[3 * tris[t + 2]];
+                    float e1[3] = { p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2] }, e2[3] = { p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2] };
+                    float tn[3], cn[3], cmid[3], cto[3];
+                    Cross3(e1, e2, tn);
+                    if (!Normalize3(tn) || Dot3(tn, f.n) < kGlassBend || !nearFace(&tris[t]) || !towardsEyes(tn, &tris[t], 3, cn, cmid, cto) ||
+                        !touches(&tris[t], glassTris))
+                        continue;
+                    taken[t / 3] = 1;
+                    glassTris.insert(glassTris.end(), &tris[t], &tris[t] + 3);
+                    grew = true;
+                }
+            }
+            m.faceTriangles = (int)f.tris.size();
+            for (int v : glassTris)
             {
                 size_t k = std::find(m.vertices.begin(), m.vertices.end(), v) - m.vertices.begin();
                 if (k == m.vertices.size())
@@ -3825,7 +3903,8 @@ bool FindGlass(BYTE* car, SideMirror& m, const float* eyes, const std::vector<fl
             out[2] = (mid[0] < 0.0f ? -1.0f : 1.0f) * atan2f(n[0], -n[2]) * 57.29578f;
             out[3] = asinf(std::clamp(n[1], -1.0f, 1.0f)) * 57.29578f;
             // The mirror set (see above): its normal halfway between the way back to the eyes and the way it shows. It
-            // shows as wide and high an angle as the glass takes up in sight (halfW, halfH: halves of it).
+            // shows as wide and high an angle as the glass takes up in sight, and convex ([VR] MirrorRadius) as much
+            // again as its normal turns across it, twice (halfW, halfH: halves of it).
             Normalize3(toGlass);
             float sign = mid[0] < 0.0f ? -1.0f : 1.0f, down = kMirrorAimDown, inner = 1e9f, az[2] = { 1e9f, -1e9f }, el[2] = { 1e9f, -1e9f };
             for (int v : f.tris)
@@ -3835,7 +3914,8 @@ bool FindGlass(BYTE* car, SideMirror& m, const float* eyes, const std::vector<fl
                 float d[3] = { p[0] - eyes[0], p[1] - eyes[1], p[2] - eyes[2] }, a = atan2f(d[0], d[2]), e = atan2f(d[1], sqrtf(d[0] * d[0] + d[2] * d[2]));
                 az[0] = std::min(az[0], a), az[1] = std::max(az[1], a), el[0] = std::min(el[0], e), el[1] = std::max(el[1], e);
             }
-            float halfW = 0.5f * (az[1] - az[0]), halfH = 0.5f * (el[1] - el[0]), flank = 0.0f;
+            float curve = g_cfg.vrMirrorRadius > 0.0f ? 1.0f / g_cfg.vrMirrorRadius : 0.0f;
+            float halfW = 0.5f * (az[1] - az[0]) + out[0] * curve, halfH = 0.5f * (el[1] - el[0]) + out[1] * curve, flank = 0.0f;
             // How far out the car's side reaches behind the glass, as seen from its inner edge within the mirror's
             // height: the mirror shows that much of it there.
             for (size_t k = 0; k + 2 < body.size(); k += 3)
@@ -3901,14 +3981,14 @@ void FindMirrors(BYTE* car)
                 if (*it && *(BYTE**)(*it + fo2::kPartNode) == node) m.part = *it;
             if (m.part) m.state = *(const int*)(m.part + fo2::kPartState);
             float about[8] = {};
-            char buf[320];
+            char buf[400];
             if (FindGlass(car, m, eyes, body, about))
             {
                 snprintf(buf, sizeof(buf),
-                         "; %s: glass %.3f x %.3f m (%d triangles) at %.2f %.2f %.2f looking %+.0f deg out from straight back and %+.0f up, "
-                         "set turned %.0f deg: %.1f deg across, its middle %.1f deg out (the car's side to %.1f)%s",
-                         name.c_str(), about[0], about[1], (int)m.triangles.size() / 3, m.rest[0], m.rest[1], m.rest[2], about[2], about[3], about[4],
-                         about[5], about[6], about[7], m.part ? "" : " (its part not found)");
+                         "; %s: glass %.3f x %.3f m (%d triangles, %d more next to it) at %.2f %.2f %.2f looking %+.0f deg out from straight back "
+                         "and %+.0f up, set turned %.0f deg: %.1f deg across, its middle %.1f deg out (the car's side to %.1f)%s",
+                         name.c_str(), about[0], about[1], m.faceTriangles / 3, ((int)m.triangles.size() - m.faceTriangles) / 3, m.rest[0], m.rest[1],
+                         m.rest[2], about[2], about[3], about[4], about[5], about[6], about[7], m.part ? "" : " (its part not found)");
                 g_mirrors.list.push_back(std::move(m));
             }
             else
@@ -3939,15 +4019,24 @@ void NoteMirrorSkin(BYTE* batch)
 }
 
 // Where on the face the glass is, from the housing's texture as the eyes draw it: the face's part of it is drawn into a
-// small target and read back. A frame painted round the glass is of one colour, the face's edge's, from the edge in to
-// the glass's dark rim; the glass inside is painted with a reflection, sky and ground. So the frame is what is of the
-// edge's colour (within kFrameColour) and reached from the edge, and the glass the convex hull of the rest's pieces
-// of some size that keep off the edge (the painted ground may be of the frame's colour too, a frame's foot of another).
-// That is kept as a mask when most of the edge is of its colour (kFramed) and the glass covers between kGlassLeast and
-// kGlassMost of the face; else the whole
-// face is glass (the glass painted out to the face's edges). Once a mirror; it stalls the GPU for the read back.
-constexpr float kGlassLeast = 0.2f, kGlassMost = 0.93f, kFramed = 0.7f;
-constexpr int kFrameColour = 24;  // of 255, in any channel
+// small target and read back. In every car seen the glass is painted with a rim round it, a line that reflects nothing
+// (the texture's alpha is how much the skin reflects) and darker or lighter than the glass and the frame; the glass
+// inside may be painted whole (a reflection, sky and ground) or broken (cracks running out from a point), the frame
+// one colour, rusty or chromed. So the glass's outline is a closed path round the middle of the face's texture, one
+// radius a direction (kRays of them, kRadii radii each from kRayNear to kRayFar of the way to its edge), through the
+// strongest steps across the rays in the colour and the alpha (the cracks run along the rays), kept smooth (a radius
+// step between neighbouring directions costs kRayCost, and at most kRaySlope of them) and made convex. Where the edge in
+// a direction is of the glass's colour and alpha (within kGlassLike of the middle's) with no rim on the way (alpha
+// below kRimAlpha of the middle's), the glass may run off there, which counts as a strong step (kRunOff): a face with
+// no frame painted on it is glass to its edges (the Venom's middle face alone is cut by its top and bottom). The glass
+// taking up between kGlassLeast and kGlassMost of the face is kept as a mask; else the whole face is glass (and the
+// faces next to it not). Once a mirror; it stalls the GPU for the read back.
+constexpr int kRays = 128, kRadii = 80, kRaySlope = 4, kGlassLike = 40;
+constexpr float kRimAlpha = 0.4f;                 // a rim reflects less than this of the glass's middle
+constexpr float kRayNear = 0.3f, kRayFar = 1.15f;
+constexpr float kRayCost = 0.15f, kRunOff = 2.0f;  // of the 90th percentile of the steps
+constexpr float kNoStep = 0.35f;                  // past the face's edge where it is not like the glass: of the median step
+constexpr float kGlassLeast = 0.35f, kGlassMost = 0.9f;
 
 void MakeGlassMask(IDirect3DDevice9* dev, SideMirror& m)
 {
@@ -4043,7 +4132,7 @@ void MakeGlassMask(IDirect3DDevice9* dev, SideMirror& m)
         Log("mirrors: %s: its texture could not be read: all the face is glass", m.name.c_str());
         return;
     }
-    // The face in the samples (its triangles).
+    // The face in the samples (its triangles): 1 the face found for the glass, 2 the faces next to it.
     std::vector<BYTE> inside((size_t)W * H);
     float sx = W / (box[2] - box[0]), sy = H / (box[3] - box[1]);
     for (size_t t = 0; t + 2 < m.triangles.size(); t += 3)
@@ -4065,127 +4154,183 @@ void MakeGlassMask(IDirect3DDevice9* dev, SideMirror& m)
                     const float *a0 = p[j], *a1 = p[(j + 1) % 3];
                     s[j] = (a1[0] - a0[0]) * (q[1] - a0[1]) - (a1[1] - a0[1]) * (q[0] - a0[0]);
                 }
-                if ((s[0] >= 0 && s[1] >= 0 && s[2] >= 0) || (s[0] <= 0 && s[1] <= 0 && s[2] <= 0)) inside[(size_t)y * W + x] = 1;
+                if (((s[0] >= 0 && s[1] >= 0 && s[2] >= 0) || (s[0] <= 0 && s[1] <= 0 && s[2] <= 0)) && !inside[(size_t)y * W + x])
+                    inside[(size_t)y * W + x] = (int)t < m.faceTriangles ? 1 : 2;
             }
     }
     auto channel = [&](size_t i, int c) { return (int)((px[i] >> (8 * c)) & 0xFF); };
-    // The face's edge, and its colour (the middle one of each channel's): the frame's, if it has one.
-    std::vector<size_t> edge;
-    for (int y = 0; y < H; y++)
-        for (int x = 0; x < W; x++)
-        {
-            size_t i = (size_t)y * W + x;
-            if (inside[i] && (x == 0 || y == 0 || x == W - 1 || y == H - 1 || !inside[i - 1] || !inside[i + 1] || !inside[i - W] || !inside[i + W]))
-                edge.push_back(i);
-        }
-    if (edge.empty()) return;
-    int frameColour[3];
-    for (int c = 0; c < 3; c++)
-    {
-        std::vector<int> v;
-        for (size_t i : edge) v.push_back(channel(i, c));
-        std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
-        frameColour[c] = v[v.size() / 2];
-    }
-    auto frameLike = [&](size_t i) {
-        return std::max({ abs(channel(i, 0) - frameColour[0]), abs(channel(i, 1) - frameColour[1]), abs(channel(i, 2) - frameColour[2]) }) <=
-               kFrameColour;
-    };
-    // 0: not the face, 1: the face (glass), 2: the frame: of its colour, reached from the edge.
-    std::vector<BYTE> cls(inside);
-    std::vector<size_t> todo;
-    int edgeLike = 0;
-    for (size_t i : edge)
-        if (frameLike(i))
-        {
-            edgeLike++;
-            cls[i] = 2;
-            todo.push_back(i);
-        }
-    auto neighbours = [&](size_t i, auto&& visit) {
-        int x = (int)(i % W), y = (int)(i / W);
-        if (x > 0) visit(i - 1);
-        if (x < W - 1) visit(i + 1);
-        if (y > 0) visit(i - W);
-        if (y < H - 1) visit(i + W);
-    };
-    while (!todo.empty())
-    {
-        size_t i = todo.back();
-        todo.pop_back();
-        neighbours(i, [&](size_t j) {
-            if (cls[j] != 1 || !frameLike(j)) return;
-            cls[j] = 2;
-            todo.push_back(j);
-        });
-    }
-    // The rest in pieces; the glass is what the pieces of a size that keep (mostly) off the face's edge take in (their
-    // convex hull: the glass's painted ground may be of the frame's colour too; a strip along the edge is frame).
-    std::vector<BYTE> atEdge(cls.size());
-    for (size_t i : edge) atEdge[i] = 1;
-    std::vector<int> piece(cls.size(), -1), pieceSize;
     int face = 0;
-    for (size_t s0 = 0; s0 < cls.size(); s0++)
-    {
-        face += cls[s0] != 0;
-        if (cls[s0] != 1 || piece[s0] >= 0) continue;
-        int id = (int)pieceSize.size(), size = 0, onEdge = 0;
-        piece[s0] = id;
-        todo.push_back(s0);
-        while (!todo.empty())
+    for (BYTE in : inside) face += in != 0;
+    // 0: not the face, 1: the glass, 2: the frame; the outline's directions that run off the face. Null, or why there
+    // was no outline to find.
+    std::vector<BYTE> cls(inside);
+    int glass = 0, ranOff = 0;
+    auto outline = [&]() -> const char* {
+        // The middle of the face found for the glass (the faces next to it may reach far off in the texture), and the
+        // glass's colour and alpha there (each channel's middle one, the face's middle 30%).
+        int lo[2] = { W, H }, hi[2] = { 0, 0 };
+        for (int y = 0; y < H; y++)
+            for (int x = 0; x < W; x++)
+                if (inside[(size_t)y * W + x] == 1)
+                    lo[0] = std::min(lo[0], x), lo[1] = std::min(lo[1], y), hi[0] = std::max(hi[0], x + 1), hi[1] = std::max(hi[1], y + 1);
+        if (lo[0] >= hi[0]) lo[0] = lo[1] = 0, hi[0] = W, hi[1] = H;
+        std::vector<int> mid[4];
+        float cx = 0.5f * (lo[0] + hi[0]), cy = 0.5f * (lo[1] + hi[1]), glassColour[4] = {};
+        for (int y = 0; y < H; y++)
+            for (int x = 0; x < W; x++)
+                if (fabsf(x + 0.5f - cx) <= 0.15f * (hi[0] - lo[0]) && fabsf(y + 0.5f - cy) <= 0.15f * (hi[1] - lo[1]))
+                    for (int c = 0; c < 4; c++) mid[c].push_back(channel((size_t)y * W + x, c));
+        if (mid[0].empty()) return "its face is too small in its texture";
+        for (int c = 0; c < 4; c++)
         {
-            size_t i = todo.back();
-            todo.pop_back();
-            size++;
-            onEdge += atEdge[i];
-            neighbours(i, [&](size_t j) {
-                if (cls[j] != 1 || piece[j] >= 0) return;
-                piece[j] = id;
-                todo.push_back(j);
-            });
+            std::nth_element(mid[c].begin(), mid[c].begin() + mid[c].size() / 2, mid[c].end());
+            glassColour[c] = (float)mid[c][mid[c].size() / 2];
         }
-        pieceSize.push_back(onEdge > 0.15f * size ? 0 : size);
-    }
-    std::vector<std::pair<int, int>> corners;
-    for (size_t i = 0; i < cls.size(); i++)
-        if (cls[i] == 1 && pieceSize[piece[i]] >= 0.02f * face)
+        // The samples between their middles (x, y in samples, a sample's middle at +0.5).
+        auto at = [&](float x, float y, float* out) {
+            x = std::clamp(x - 0.5f, 0.0f, W - 1.001f), y = std::clamp(y - 0.5f, 0.0f, H - 1.001f);
+            int x0 = (int)x, y0 = (int)y;
+            float fx = x - x0, fy = y - y0;
+            size_t i = (size_t)y0 * W + x0;
+            for (int c = 0; c < 4; c++)
+                out[c] = (channel(i, c) * (1 - fx) + channel(i + 1, c) * fx) * (1 - fy) + (channel(i + W, c) * (1 - fx) + channel(i + W + 1, c) * fx) * fy;
+        };
+        // Each direction's way to the samples' edge (the texture round the face is the housing's too), whether the glass
+        // may run off there, and the steps across the ray at its radii (the largest of a channel's over a sample either
+        // side).
+        std::vector<float> reach(kRays), dirs(2 * kRays), steps((size_t)kRays * kRadii), inner;
+        std::vector<BYTE> past((size_t)kRays * kRadii), glassLike(kRays);
+        auto radius = [](int k) { return kRayNear + (kRayFar - kRayNear) * (k + 0.5f) / kRadii; };
+        for (int i = 0; i < kRays; i++)
         {
-            int x = (int)(i % W), y = (int)(i / W);
-            corners.insert(corners.end(), { { x, y }, { x + 1, y }, { x, y + 1 }, { x + 1, y + 1 } });
+            float a = (i + 0.5f) * 6.2831853f / kRays, dx = cosf(a), dy = sinf(a);
+            float t = std::min(dx > 1e-6f ? (W - cx) / dx : dx < -1e-6f ? cx / -dx : 1e9f, dy > 1e-6f ? (H - cy) / dy : dy < -1e-6f ? cy / -dy : 1e9f);
+            dirs[2 * i] = dx, dirs[2 * i + 1] = dy, reach[i] = t;
+            // At the edge of the glass's colour and alpha, with no rim on the way (a line that reflects nothing).
+            float c[4], d = 0.0f;
+            at(cx + dx * (t - 1.0f), cy + dy * (t - 1.0f), c);
+            for (int ch = 0; ch < 4; ch++) d = std::max(d, fabsf(c[ch] - glassColour[ch]));
+            glassLike[i] = d <= kGlassLike;
+            for (float r = kRayNear * t; r < t - 1.0f && glassLike[i]; r += 0.5f)
+            {
+                at(cx + dx * r, cy + dy * r, c);
+                glassLike[i] = c[3] >= kRimAlpha * glassColour[3];
+            }
+            for (int k = 0; k < kRadii; k++)
+            {
+                size_t j = (size_t)i * kRadii + k;
+                float r = t * radius(k);
+                if (radius(k) >= 1.0f - 0.5f / t)
+                {
+                    past[j] = 1;
+                    continue;
+                }
+                float a0[4], a1[4], s = 0.0f;
+                at(cx + dx * (r - 1.0f), cy + dy * (r - 1.0f), a0);
+                at(cx + dx * (r + 1.0f), cy + dy * (r + 1.0f), a1);
+                for (int ch = 0; ch < 4; ch++) s = std::max(s, fabsf(a1[ch] - a0[ch]));
+                steps[j] = s;
+                inner.push_back(s);
+            }
         }
-    std::sort(corners.begin(), corners.end());
-    corners.erase(std::unique(corners.begin(), corners.end()), corners.end());
-    auto cross = [](std::pair<int, int> o, std::pair<int, int> a, std::pair<int, int> b) {
-        return (long long)(a.first - o.first) * (b.second - o.second) - (long long)(a.second - o.second) * (b.first - o.first);
+        if (inner.size() < (size_t)kRays) return "its face is too small in its texture";
+        std::nth_element(inner.begin(), inner.begin() + inner.size() / 2, inner.end());
+        float median = inner[inner.size() / 2];
+        std::nth_element(inner.begin(), inner.begin() + inner.size() * 9 / 10, inner.end());
+        float high = inner[inner.size() * 9 / 10], cost = kRayCost * high;
+        for (int i = 0; i < kRays; i++)
+            for (int k = 0; k < kRadii; k++)
+                if (past[(size_t)i * kRadii + k]) steps[(size_t)i * kRadii + k] = glassLike[i] ? kRunOff * high : kNoStep * median;
+        // The path of the most steps (less its cost), closed: from each of some radii in the first direction round to
+        // within kRaySlope of it.
+        std::vector<float> score(kRadii), next(kRadii);
+        std::vector<signed char> back((size_t)kRays * kRadii);
+        std::vector<int> path(kRays), best;
+        float bestScore = -1e30f;
+        for (int start = 0; start < kRadii; start += 4)
+        {
+            std::fill(score.begin(), score.end(), -1e30f);
+            score[start] = steps[start];
+            for (int i = 1; i < kRays; i++)
+            {
+                for (int k = 0; k < kRadii; k++)
+                {
+                    float v = -1e30f;
+                    int from = k;
+                    for (int d = -kRaySlope; d <= kRaySlope; d++)
+                    {
+                        int p = k - d;
+                        if (p < 0 || p >= kRadii || score[p] - cost * abs(d) <= v) continue;
+                        v = score[p] - cost * abs(d);
+                        from = p;
+                    }
+                    next[k] = v + steps[(size_t)i * kRadii + k];
+                    back[(size_t)i * kRadii + k] = (signed char)(from - k);
+                }
+                std::swap(score, next);
+            }
+            for (int k = std::max(0, start - kRaySlope); k <= std::min(kRadii - 1, start + kRaySlope); k++)
+            {
+                if (score[k] <= bestScore) continue;
+                bestScore = score[k];
+                path[kRays - 1] = k;
+                for (int i = kRays - 1; i > 0; i--) path[i - 1] = path[i] + back[(size_t)i * kRadii + path[i]];
+                best = path;
+            }
+        }
+        // Its convex hull (counter-clockwise in the samples' x right, y down: clockwise on screen); the glass is the face
+        // within it.
+        std::vector<std::pair<float, float>> points, hull;
+        for (int i = 0; i < kRays && !best.empty(); i++)
+        {
+            float r = reach[i] * radius(best[i]);
+            ranOff += past[(size_t)i * kRadii + best[i]];
+            points.push_back({ cx + dirs[2 * i] * r, cy + dirs[2 * i + 1] * r });
+        }
+        std::sort(points.begin(), points.end());
+        auto cross = [](std::pair<float, float> o, std::pair<float, float> a, std::pair<float, float> b) {
+            return (a.first - o.first) * (b.second - o.second) - (a.second - o.second) * (b.first - o.first);
+        };
+        for (int pass = 0; pass < 2 && points.size() >= 3; pass++)
+        {
+            size_t start = hull.size();
+            for (size_t k = 0; k < points.size(); k++)
+            {
+                auto p = pass ? points[points.size() - 1 - k] : points[k];
+                while (hull.size() >= start + 2 && cross(hull[hull.size() - 2], hull.back(), p) <= 0) hull.pop_back();
+                hull.push_back(p);
+            }
+            hull.pop_back();
+        }
+        for (size_t i = 0; i < cls.size(); i++)
+        {
+            if (!cls[i]) continue;
+            float x = (float)(i % W) + 0.5f, y = (float)(i / W) + 0.5f;
+            bool in = hull.size() >= 3;
+            for (size_t k = 0; k < hull.size() && in; k++)
+            {
+                auto a = hull[k], b = hull[(k + 1) % hull.size()];
+                in = (b.first - a.first) * (y - a.second) - (b.second - a.second) * (x - a.first) >= 0.0f;
+            }
+            cls[i] = in ? 1 : 2;
+            glass += in;
+        }
+        return nullptr;
     };
-    std::vector<std::pair<int, int>> hull;  // counter-clockwise (in the samples' x right, y down: clockwise on screen)
-    for (int pass = 0; pass < 2 && corners.size() >= 3; pass++)
+    const char* failed = outline();
+    float share = face ? (float)glass / face : 0.0f;
+    bool rim = !failed && share >= kGlassLeast && share <= kGlassMost;
+    if (!rim)
     {
-        size_t start = hull.size();
-        for (size_t k = 0; k < corners.size(); k++)
-        {
-            auto p = pass ? corners[corners.size() - 1 - k] : corners[k];
-            while (hull.size() >= start + 2 && cross(hull[hull.size() - 2], hull.back(), p) <= 0) hull.pop_back();
-            hull.push_back(p);
-        }
-        hull.pop_back();
+        // No rim found: the face is glass to its edges, and the faces next to it are not.
+        const char* rest = m.faceTriangles < (int)m.triangles.size() ? ", the faces next to it not" : "";
+        if (failed)
+            Log("mirrors: %s: %s: all its face is glass%s", m.name.c_str(), failed, rest);
+        else
+            Log("mirrors: %s: no rim round the glass in its texture (%dx%d samples: the outline found takes in %.0f%% of the face, running off "
+                "it in %d of %d directions): all its face is glass%s", m.name.c_str(), W, H, 100.0f * share, ranOff, kRays, rest);
+        for (size_t i = 0; i < cls.size(); i++) cls[i] = inside[i] == 1 ? 1 : inside[i] ? 2 : 0;
     }
-    int glass = 0;
-    for (size_t i = 0; i < cls.size(); i++)
-    {
-        if (!cls[i]) continue;
-        // (x2, y2: the sample's middle, doubled)
-        int x2 = 2 * (int)(i % W) + 1, y2 = 2 * (int)(i / W) + 1;
-        bool in = hull.size() >= 3;
-        for (size_t k = 0; k < hull.size() && in; k++)
-        {
-            auto a = hull[k], b = hull[(k + 1) % hull.size()];
-            in = (long long)(2 * b.first - 2 * a.first) * (y2 - 2 * a.second) - (long long)(2 * b.second - 2 * a.second) * (x2 - 2 * a.first) >= 0;
-        }
-        cls[i] = in ? 1 : 2;
-        glass += in;
-    }
-    float share = face ? (float)glass / face : 0.0f, framed = (float)edgeLike / edge.size();
     if (g_cfg.testBackground)
     {
         // For checking it: the face's part of the texture, and the same with the frame darkened.
@@ -4196,12 +4341,7 @@ void MakeGlassMask(IDirect3DDevice9* dev, SideMirror& m)
         SavePixelsPng(ShotPath(tag.c_str()).c_str(), px.data(), W, H);
         SavePixelsPng(ShotPath((tag + "_glass").c_str()).c_str(), look.data(), W, H);
     }
-    if (share < kGlassLeast || share > kGlassMost || framed < kFramed)
-    {
-        Log("mirrors: %s: no frame round the glass in its texture (%dx%d samples: the edge's colour along %.0f%% of it, inside it %.0f%% of the "
-            "face): all the face is glass", m.name.c_str(), W, H, 100.0f * framed, 100.0f * share);
-        return;
-    }
+    if (!rim && m.faceTriangles >= (int)m.triangles.size()) return;
     // The mask, its edge softened over a sample.
     if (FAILED(dev->CreateTexture(W, H, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &m.mask, nullptr)))
     {
@@ -4230,8 +4370,10 @@ void MakeGlassMask(IDirect3DDevice9* dev, SideMirror& m)
         }
     m.mask->UnlockRect(0);
     memcpy(m.maskBox, box, sizeof(box));
-    Log("mirrors: %s: the glass in its texture (%dx%d samples) takes up %.0f%% of the face, inside a frame (of the edge's colour along %.0f%% of it)",
-        m.name.c_str(), W, H, 100.0f * share, 100.0f * framed);
+    if (rim)
+        Log("mirrors: %s: the glass in its texture (%dx%d samples) takes up %.0f%% of the face%s, inside its rim (running off the face in %d of "
+            "%d directions)", m.name.c_str(), W, H, 100.0f * share, m.faceTriangles < (int)m.triangles.size() ? " and the faces next to it" : "",
+            ranOff, kRays);
 }
 
 // For tests (the background mode's "mirror"): the player's car's mirror on that side knocked loose (state 1) or off
@@ -4276,7 +4418,7 @@ bool UseMirrorFilterTextures(IDirect3DDevice9* dev, FilterSwap& saved)
         D3DSURFACE_DESC d;
         if (!game || FAILED(game->GetLevelDesc(0, &d))) return false;
         if (!g_mirrors.filter[i] &&
-            FAILED(dev->CreateTexture(kMirrorW, kMirrorH, 1, D3DUSAGE_RENDERTARGET, d.Format, D3DPOOL_DEFAULT, &g_mirrors.filter[i], nullptr)))
+            FAILED(dev->CreateTexture(kMirrorMax, kMirrorMax, 1, D3DUSAGE_RENDERTARGET, d.Format, D3DPOOL_DEFAULT, &g_mirrors.filter[i], nullptr)))
             return false;
     }
     for (int i = 0; i < 2; i++)
@@ -4285,11 +4427,18 @@ bool UseMirrorFilterTextures(IDirect3DDevice9* dev, FilterSwap& saved)
         saved.size[i][0] = *(int*)(w + fo2::kTexWidth);
         saved.size[i][1] = *(int*)(w + fo2::kTexHeight);
         saved.tex[i] = *(IDirect3DTexture9**)(w + fo2::kTexD3D);
-        *(int*)(w + fo2::kTexWidth) = (int)kMirrorW;
-        *(int*)(w + fo2::kTexHeight) = (int)kMirrorH;
+        *(int*)(w + fo2::kTexWidth) = (int)kMirrorMax;
+        *(int*)(w + fo2::kTexHeight) = (int)kMirrorMax;
         *(IDirect3DTexture9**)(w + fo2::kTexD3D) = g_mirrors.filter[i];
     }
     return true;
+}
+
+// The filter's textures said to be of a picture's size (they are of its target's).
+void SizeMirrorFilterTextures(const FilterSwap& swapped, UINT w, UINT h)
+{
+    for (BYTE* wrapper : swapped.wrapper)
+        if (wrapper) *(int*)(wrapper + fo2::kTexWidth) = (int)w, *(int*)(wrapper + fo2::kTexHeight) = (int)h;
 }
 
 void RestoreFilterTextures(const FilterSwap& saved)
@@ -4480,9 +4629,11 @@ void RenderMirrors(IDirect3DDevice9* dev, BYTE* ctx, BYTE** cams, float* fovScal
                 why = "the eyes are behind its glass";
                 continue;
             }
-            // In view of the eye (either eye, for one picture).
+            // In view of the eye (either eye, for one picture), and how many of its pixels the glass takes up (the
+            // larger of the two for one picture; a glass partly behind the eye as many as a picture has).
             bool inView = false;
-            for (int i = pictures == 2 ? k : 0; i < (pictures == 2 ? k + 1 : 2) && !inView; i++)
+            float pixels[2] = {};
+            for (int i = pictures == 2 ? k : 0; i < (pictures == 2 ? k + 1 : 2); i++)
             {
                 float lo[2] = { 1e9f, 1e9f }, hi[2] = { -1e9f, -1e9f };
                 bool behind = false;
@@ -4499,9 +4650,15 @@ void RenderMirrors(IDirect3DDevice9* dev, BYTE* ctx, BYTE** cams, float* fovScal
                     float x = Dot3(dq, e[i]) / z, y = Dot3(dq, e[i] + 4) / z;
                     lo[0] = std::min(lo[0], x), hi[0] = std::max(hi[0], x), lo[1] = std::min(lo[1], y), hi[1] = std::max(hi[1], y);
                 }
-                inView = lo[0] <= hi[0] && (behind || (hi[0] > fov[i].left && lo[0] < fov[i].right && hi[1] > fov[i].down && lo[1] < fov[i].up));
+                bool seen = lo[0] <= hi[0] && (behind || (hi[0] > fov[i].left && lo[0] < fov[i].right && hi[1] > fov[i].down && lo[1] < fov[i].up));
+                if (!seen) continue;
+                inView = true;
+                pixels[0] = std::max(pixels[0], behind ? (float)kMirrorMax : (hi[0] - lo[0]) / (fov[i].right - fov[i].left) * g_vrt.w);
+                pixels[1] = std::max(pixels[1], behind ? (float)kMirrorMax : (hi[1] - lo[1]) / (fov[i].up - fov[i].down) * g_vrt.h);
             }
             if (!inView) continue;
+            UINT pw = std::clamp((UINT)ceilf(kMirrorSharp * pixels[0] / kMirrorStep) * kMirrorStep, kMirrorLeast, kMirrorMax);
+            UINT ph = std::clamp((UINT)ceilf(kMirrorSharp * pixels[1] / kMirrorStep) * kMirrorStep, kMirrorLeast, kMirrorMax);
             // The window: the glass as seen from there, on the mirror's plane (through the glass's middle).
             bool edgeOn = false;
             for (size_t v = 0; v < nv && !edgeOn; v++)
@@ -4545,18 +4702,37 @@ void RenderMirrors(IDirect3DDevice9* dev, BYTE* ctx, BYTE** cams, float* fovScal
                 uv[2 * v] = x, uv[2 * v + 1] = y;
                 left = std::min(left, x), right = std::max(right, x), down = std::min(down, y), up = std::max(up, y);
             }
-            float aspect = (float)kMirrorW / (float)kMirrorH;
-            float cover = std::max({ -left, right, up * aspect, -down * aspect }) * 1.02f;
+            // A convex glass ([VR] MirrorRadius) shows more about its middle: its normal turns across it by the way off
+            // the middle over the radius, and the ray twice that, so in these tangents what it shows is gx and gy times
+            // as wide as the glass (d the eyes' way to its plane, 1 + tan^2 the tangent's slope there; the two differ
+            // seen aslant, as a sphere's focal lengths do). The rays come off the glass as from its virtual eye, the
+            // reflected one moved towards the glass's middle to 1/g of its way (g the larger): the window is g times
+            // as wide from there, its picture squeezed across the other way to gx and gy, and nothing is seen but
+            // through the glass (not past it, into the car).
+            float aspect = (float)pw / (float)ph, view[4] = { left, right, up, down }, depth = d;
+            if (g_cfg.vrMirrorRadius > 0.0f)
+            {
+                float mx = 0.5f * (left + right), my = 0.5f * (up + down);
+                float gx = 1.0f + 2.0f * d * (1.0f + mx * mx) / g_cfg.vrMirrorRadius, gy = 1.0f + 2.0f * d * (1.0f + my * my) / g_cfg.vrMirrorRadius;
+                float g = std::max(gx, gy);
+                for (int j = 0; j < 3; j++) at[j] += (1.0f - 1.0f / g) * d * (f[j] + mx * r[j] + my * u[j]);
+                depth = d / g;
+                view[0] = mx + gx * (left - mx), view[1] = mx + gx * (right - mx), view[2] = my + gy * (up - my), view[3] = my + gy * (down - my);
+            }
+            float cover = std::max({ -view[0], view[1], view[2] * aspect, -view[3] * aspect }) * 1.02f;
             if (right - left < 1e-4f || up - down < 1e-4f || cover > 6.0f)
             {
                 why = "seen edge on";
                 continue;
             }
+            // (within the picture's corner of its target, from its first pixel's middle to its last's)
             for (size_t v = 0; v < nv; v++)
             {
-                uv[2 * v] = (uv[2 * v] - left) / (right - left);
-                uv[2 * v + 1] = (up - uv[2 * v + 1]) / (up - down);
+                uv[2 * v] = (0.5f + (uv[2 * v] - left) / (right - left) * (pw - 1)) / kMirrorMax;
+                uv[2 * v + 1] = (0.5f + (up - uv[2 * v + 1]) / (up - down) * (ph - 1)) / kMirrorMax;
             }
+            m.size[k][0] = pw, m.size[k][1] = ph;
+            g_mirrors.pixels += (double)pw * ph;
             // The camera the objects are picked with (CullViewHook): from there straight at the window, upright, its
             // frustum just around it.
             float* o = g_mirrorCull.matrix;
@@ -4592,11 +4768,12 @@ void RenderMirrors(IDirect3DDevice9* dev, BYTE* ctx, BYTE** cams, float* fovScal
                 // the eyes): far away things are small in a mirror, and cost as much as near ones.
                 if (g_cfg.vrViewDistance > 0.0f) *camFar = savedFar / g_cfg.vrViewDistance;
                 if (g_cfg.vrGrassDistance > 0.0f) grass[0] = savedGrass[0] / g_cfg.vrGrassDistance, grass[1] = savedGrass[1] / g_cfg.vrGrassDistance;
-                screenSize[0] = (int)kMirrorW;
-                screenSize[1] = (int)kMirrorH;
-                screenShape[0] = (float)kMirrorW;
-                screenShape[1] = (float)kMirrorH;
             }
+            screenSize[0] = (int)pw;
+            screenSize[1] = (int)ph;
+            screenShape[0] = (float)pw;
+            screenShape[1] = (float)ph;
+            SizeMirrorFilterTextures(filter, pw, ph);
             // Every copy of the camera's placement; its past ones moved along as the eyes' are.
             memcpy(camM, mc, sizeof(mc));
             memcpy(camM2, mc, sizeof(mc));
@@ -4609,7 +4786,7 @@ void RenderMirrors(IDirect3DDevice9* dev, BYTE* ctx, BYTE** cams, float* fovScal
                 InvertCamera(past, camViews + 16 * i);
             }
             *camFov = 2.0f * atanf(cover);
-            *camNear = 0.995f * d;
+            *camNear = 0.995f * depth;
             SetFullViewportGlobals();
             dev->SetRenderTarget(0, m.rt[k]);
             dev->SetDepthStencilSurface(g_mirrors.ds);
@@ -4618,10 +4795,10 @@ void RenderMirrors(IDirect3DDevice9* dev, BYTE* ctx, BYTE** cams, float* fovScal
             g_vrEye.index = 0;
             g_vrEye.cockpit = false;
             g_vrEye.mirror = true;
-            g_vrEye.w = kMirrorW;
-            g_vrEye.h = kMirrorH;
+            g_vrEye.w = pw;
+            g_vrEye.h = ph;
             g_vrEye.coverTan = cover;
-            g_vrEye.fov = { left, right, up, down };
+            g_vrEye.fov = { view[0], view[1], view[2], view[3] };
             // The mirror's own housing is left out of its picture (it lies about the mirror's plane as set).
             DWORD* flags = (DWORD*)(m.node + fo2::kNodeFlags);
             DWORD savedFlags = *flags;
@@ -4678,10 +4855,12 @@ void RenderMirrors(IDirect3DDevice9* dev, BYTE* ctx, BYTE** cams, float* fovScal
     if (now - g_mirrors.lastLog >= g_cfg.logIntervalSeconds)
     {
         if (g_mirrors.lastLog > 0)
-            Log("mirrors: %.2f pictures rendered a frame, %.2f/%.2f ms avg/max", (double)g_mirrors.renders / std::max(g_mirrors.time.n, 1),
-                g_mirrors.time.AvgMs(), g_mirrors.time.MaxMs());
+            Log("mirrors: %.2f pictures rendered a frame, of %.0f pixels on average (%.0f a side), %.2f/%.2f ms avg/max",
+                (double)g_mirrors.renders / std::max(g_mirrors.time.n, 1), g_mirrors.pixels / std::max(g_mirrors.renders, 1),
+                sqrt(g_mirrors.pixels / std::max(g_mirrors.renders, 1)), g_mirrors.time.AvgMs(), g_mirrors.time.MaxMs());
         g_mirrors.time = Timing();
         g_mirrors.renders = 0;
+        g_mirrors.pixels = 0;
         g_mirrors.lastLog = now;
     }
 }

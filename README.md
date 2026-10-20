@@ -33,12 +33,12 @@ without SteamVR? Change one line in the settings: see [Runtimes](#runtimes).
 
   <img src="docs/img/stereo.jpg" alt="The left and the right eye's views of the same moment" width="100%">
 
-- **A cockpit**: the game's camera inside the car puts you in the driver's seat, with the driver's hands
-  on the steering wheel, the dashboard, the roof, the pillars and the glass around you (the game itself
-  shows none of it there). The side mirrors show what is behind. The gauges, position, lap, map and the
-  rival's name stand on the dashboard on one curved band, laid out the same in every car. Thrown out
-  through the windscreen, you fly on in the driver's head. The first race with the mod starts in the cockpit;
-  C switches the camera, and the game keeps your choice.
+- **A cockpit**: the game's camera inside the car puts you in the driver's seat, with the driver's hands on
+  the steering wheel, the dashboard, the roof, the pillars and the glass around you (the game itself shows
+  none of it there). The side mirrors, convex as real ones are, show what is behind. The gauges, position,
+  lap, map and the rival's name stand on the dashboard on one curved band, laid out the same in every car.
+  Thrown out through the windscreen, you fly on in the driver's head. The first race with the mod starts in
+  the cockpit; C switches the camera, and the game keeps your choice.
 - **Smooth motion at 72 / 90 / 120 Hz**: the physics steps once per headset frame, so the world moves
   evenly at any refresh rate. The game's own steps are capped at 100 a second.
 - **HUD on a floating panel**: position, laps, speedometer, map and the pause menu. Menus between
@@ -109,6 +109,7 @@ The game's controls are unchanged.
 | `CockpitHud` | 1 | In the cockpit the gauges (with the nitro's flames), position, lap, map and the rival's name (with the crash bonus, "SLAM" and the like) stand on the dashboard as cards on one band curved round the driver's eyes, laid out the same in every car: the gauges in the steering wheel's opening, the position left of the wheel, the lap and the rival's name right of it, the map below; the HUD panel keeps the messages, the countdown and the pause menu (0: all on the panel) |
 | `CameraOffset` | 0 0 0 | The view moved against the car, meters (right, up, forward): in the cockpit from the driver's eyes; the numpad keys set it |
 | `Mirrors` | 2 | In the cockpit the side mirrors show what is behind, as real mirrors do, set for the driver's eyes with the car's side just in sight, on their glass only (not on a frame painted round it), under the car's windows, bent with the mirror and until it is knocked off: 2 one picture for each eye, so what the mirror shows stands at its depth, as in a real mirror (each mirror in view costs two more small renders of the scene, some 0.6-1 ms); 1 one picture for both eyes, flat on the glass (half the cost); 0 the game's dark glass |
+| `MirrorRadius` | 1.4 | The side mirrors' glass is convex, of this radius in metres, as real side mirrors are: they show more of what is behind, smaller (objects in them are closer than they appear), the near one some two and a half times as wide a view as flat glass, the far one five or so; larger is flatter, 0 flat glass |
 | `NearClip` | 0.05 | The cockpit's near clipping plane comes no nearer than this (meters); it is kept as far out as the roof and the sides allow |
 | `CockpitGlass` | 0.3 | How much the car's windows show in the cockpit, 0 to 1: their reflections, the sun's glints on them and their tint (0: no glass, 1: as strong as the game's own glass, which from inside darkens the view through the windscreen by half and turns the side windows into a bright haze). The sun and the dust beyond show through; broken glass looks as in the game |
 | `EjectView` | 1 | When the driver is thrown out of the car (a heavy crash, the stunts' launch) the view stays in his eyes as he flies, from the cockpit: it follows his head without tumbling with it (level, turning with your head only) until the car is reset (2: also from the cameras outside the car, as in the stunts, whose cars have no camera inside; 0: the game's cut to its camera behind him) |
