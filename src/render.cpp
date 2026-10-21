@@ -8,6 +8,7 @@
 #include "dxvk_interop.h"
 #include "eyeshare.h"
 #include "game.h"
+#include "mirrorglass.h"
 #include "pacing.h"
 #include "profile.h"
 #include "record.h"
@@ -4734,18 +4735,46 @@ void MakeGlassMask(IDirect3DDevice9* dev, SideMirror& m)
         }
         return nullptr;
     };
-    const char* failed = outline();
+    // The glass as checked by eye (mirrorglass.h), else as found.
+    const MirrorGlass* hand = nullptr;
+    std::wstring model = g_mirrors.car ? CarModel(g_mirrors.car) : L"";
+    for (const MirrorGlass& g : kMirrorGlass)
+        if (*g.car && model == std::wstring(g.car, g.car + strlen(g.car)) && m.name == g.mirror) hand = &g;
+    const char* failed = nullptr;
+    if (hand)
+        for (size_t i = 0; i < cls.size(); i++)
+        {
+            if (!cls[i]) continue;
+            float u = box[0] + ((float)(i % W) + 0.5f) / sx, v = box[1] + ((float)(i / W) + 0.5f) / sy;
+            // Inside the convex outline: on the same side of all its edges.
+            int sides = 0;
+            for (int k = 0; k < hand->points; k++)
+            {
+                const float *a = &hand->uv[2 * k], *b = &hand->uv[2 * ((k + 1) % hand->points)];
+                float c = (b[0] - a[0]) * (v - a[1]) - (b[1] - a[1]) * (u - a[0]);
+                sides |= c > 0.0f ? 1 : c < 0.0f ? 2 : 0;
+            }
+            bool in = hand->points >= 3 && sides != 3;
+            cls[i] = in ? 1 : 2;
+            glass += in;
+        }
+    else
+        failed = outline();
     float share = face ? (float)glass / face : 0.0f;
-    bool rim = !failed && share >= kGlassLeast && share <= kGlassMost;
+    bool rim = hand ? glass > 0 : !failed && share >= kGlassLeast && share <= kGlassMost;
     if (!rim)
     {
         // No rim found: the face is glass to its edges, and the faces next to it are not.
         const char* rest = m.faceTriangles < (int)m.triangles.size() ? ", the faces next to it not" : "";
-        if (failed)
+        if (hand)
+            Log("mirrors: %s: %s: all its face is glass%s", m.name.c_str(), hand->points ? "the glass checked by eye is not on its faces"
+                : "no glass painted (checked by eye)", rest);
+        else if (failed)
             Log("mirrors: %s: %s: all its face is glass%s", m.name.c_str(), failed, rest);
         else
-            Log("mirrors: %s: no rim round the glass in its texture (%dx%d samples: the outline found takes in %.0f%% of the face, running off "
-                "it in %d of %d directions): all its face is glass%s", m.name.c_str(), W, H, 100.0f * share, ranOff, kRays, rest);
+            Log("mirrors: %s: no rim round the glass in its texture (%dx%d samples over %.4f %.4f .. %.4f %.4f: the outline found takes in %.0f%% "
+                "of the face, running off it in %d of %d directions): all its face is glass%s", m.name.c_str(), W, H, box[0], box[1], box[2], box[3],
+                100.0f * share, ranOff, kRays, rest);
         for (size_t i = 0; i < cls.size(); i++) cls[i] = inside[i] == 1 ? 1 : inside[i] ? 2 : 0;
     }
     if (g_cfg.testBackground)
@@ -4757,6 +4786,11 @@ void MakeGlassMask(IDirect3DDevice9* dev, SideMirror& m)
         std::string tag = "mirror_skin_" + m.name;
         SavePixelsPng(ShotPath(tag.c_str()).c_str(), px.data(), W, H);
         SavePixelsPng(ShotPath((tag + "_glass").c_str()).c_str(), look.data(), W, H);
+        // And where the faces lie on it: the face found for the glass green, the faces next to it blue.
+        for (size_t i = 0; i < look.size(); i++)
+            look[i] = inside[i] == 1 ? 0xFF000000 | ((px[i] >> 1) & 0x7F7F7F) | 0x008000 : inside[i] == 2 ? 0xFF000000 | ((px[i] >> 1) & 0x7F7F7F) | 0x000080
+                                                                                                   : 0xFF000000 | ((px[i] >> 2) & 0x3F3F3F);
+        SavePixelsPng(ShotPath((tag + "_faces").c_str()).c_str(), look.data(), W, H);
     }
     if (!rim && m.faceTriangles >= (int)m.triangles.size()) return;
     // The mask, its edge softened over a sample.
@@ -4787,10 +4821,13 @@ void MakeGlassMask(IDirect3DDevice9* dev, SideMirror& m)
         }
     m.mask->UnlockRect(0);
     memcpy(m.maskBox, box, sizeof(box));
-    if (rim)
-        Log("mirrors: %s: the glass in its texture (%dx%d samples) takes up %.0f%% of the face%s, inside its rim (running off the face in %d of "
-            "%d directions)", m.name.c_str(), W, H, 100.0f * share, m.faceTriangles < (int)m.triangles.size() ? " and the faces next to it" : "",
-            ranOff, kRays);
+    if (hand)
+        Log("mirrors: %s: the glass as checked by eye (%d points) takes up %.0f%% of the face%s", m.name.c_str(), hand->points, 100.0f * share,
+            m.faceTriangles < (int)m.triangles.size() ? " and the faces next to it" : "");
+    else if (rim)
+        Log("mirrors: %s: the glass in its texture (%dx%d samples over %.4f %.4f .. %.4f %.4f) takes up %.0f%% of the face%s, inside its rim "
+            "(running off the face in %d of %d directions)", m.name.c_str(), W, H, box[0], box[1], box[2], box[3], 100.0f * share,
+            m.faceTriangles < (int)m.triangles.size() ? " and the faces next to it" : "", ranOff, kRays);
 }
 
 // For tests (the background mode's "mirror"): the player's car's mirror on that side knocked loose (state 1) or off
