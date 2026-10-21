@@ -120,6 +120,7 @@ The game's controls are unchanged.
 | `LodDistance` | 0 | Level-of-detail distances times this (0 = always full detail) |
 | `GrassDistance` | 5.0 | How far grass is drawn, times this |
 | `ViewDistance` | 3.0 | How far the world is drawn, times this |
+| `FloatDepth` | 1 | The eyes keep depth as 32-bit floats, reversed (near 1, far 0), set in DXVK by the mod: what lies close together far away, such as a turn sign's arrow on its board, stays apart instead of showing through in crawling bands (0: 24-bit depth as the game keeps it) |
 | `SpeedBlur` | 1 | The game's speed blur (0 = off) |
 | `SpeedZoom` | 1.0 | The game's widening of the view at speed: 1 = as on a monitor, 0 = off |
 

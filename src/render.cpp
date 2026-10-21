@@ -179,6 +179,61 @@ struct VrEye
 } g_vrEye;
 float g_sunShare = 1.0f;  // the cockpit: the sun's share seen past the car (MeasureSun)
 float g_cockpitNear;      // and its last near clipping plane (CockpitNear)
+
+// [VR] FloatDepth: the eyes keep depth reversed, 1 at the near clipping plane and 0 at the far one, in 32-bit floats
+// (DXVK's d3d9.useD32forD24, set before Direct3D starts, see d3dcreate.cpp). The engine's 24-bit depth comes in steps
+// of even size in 1 / distance, which crowd far out: with the cockpit's near plane some 0.13 m away they are 0.4 mm
+// apart at 30 m and 2 mm at 70 m, and what lies that close there (a turn sign's arrow on its board) shows through
+// what it covers in bands that crawl as the head moves. Floats, reversed, grow finer as the depth falls towards 0,
+// as the steps of 1 / distance do: far out they part what lies a hair's breadth apart. While the eyes render
+// (ReverseEyeDepth) the projections' depth is turned around (ReverseProjection), depth is cleared to 0 instead of 1
+// (ClearHook) and the depth tests are turned around (SetRenderStateHook); the mod's own drawings take their depth
+// from EyeDepth.
+bool g_depthReversed;
+
+DWORD ReversedDepthTest(DWORD test)
+{
+    switch (test)
+    {
+    case D3DCMP_LESS: return D3DCMP_GREATER;
+    case D3DCMP_LESSEQUAL: return D3DCMP_GREATEREQUAL;
+    case D3DCMP_GREATER: return D3DCMP_LESS;
+    case D3DCMP_GREATEREQUAL: return D3DCMP_LESSEQUAL;
+    default: return test;
+    }
+}
+
+// The engine's projection (and the device's) with its depth turned around: z -> w - z. Done twice it is as it was.
+void ReverseProjection(IDirect3DDevice9* dev)
+{
+    float* p = (float*)fo2::kProjMatrix;
+    for (int r = 0; r < 4; r++) p[4 * r + 2] = p[4 * r + 3] - p[4 * r + 2];
+    *(int*)fo2::kViewProjChanged = 1;
+    dev->SetTransform(D3DTS_PROJECTION, (const D3DMATRIX*)p);
+}
+
+void ReverseEyeDepth(IDirect3DDevice9* dev, bool on)
+{
+    if (!g_cfg.vrFloatDepth || g_depthReversed == on) return;
+    g_depthReversed = on;
+    // The depth test the device has now, turned around (the engine's state cache keeps it as it was asked for).
+    DWORD test = D3DCMP_LESSEQUAL;
+    if (SUCCEEDED(dev->GetRenderState(D3DRS_ZFUNC, &test)))
+        oSetRenderState(dev, D3DRS_ZFUNC, ReversedDepthTest(test));
+    else
+    {
+        static bool logged;
+        if (!logged) Log("FloatDepth: the device's depth test unknown (GetRenderState failed)");
+        logged = true;
+    }
+    ReverseProjection(dev);
+}
+
+// The depth an eye keeps for a point z ahead, between the near plane n and the far plane f.
+float EyeDepth(float n, float f, float z)
+{
+    return g_depthReversed ? n * (f - z) / (z * (f - n)) : f / (f - n) * (1.0f - n / z);
+}
 // VR races: the game draws its HUD (everything after RenderViews until Present: HUD, pause menu,
 // the HUD's own particles) into this target instead of the back buffer, over transparent black, so
 // that it can go to the headset on its own panel and be laid over the monitor's picture. The colours
@@ -675,10 +730,12 @@ void __fastcall SetFrustumHook(void* self, void*, const float* fr)
             f[2] = n * g_vrEye.fov.down;
             f[3] = n * g_vrEye.fov.up;
             oSetFrustum(self, f);
+            if (g_depthReversed) ReverseProjection(*(IDirect3DDevice9**)fo2::kD3DDevice);
             return;
         }
     }
     oSetFrustum(self, fr);
+    if (g_depthReversed) ReverseProjection(*(IDirect3DDevice9**)fo2::kD3DDevice);
 }
 
 // The sun's glow (the moon's on night tracks) is placed with the camera's frustum, which in an eye is
@@ -796,7 +853,7 @@ void ReleaseSunQueries()
 void DrawSunSquare(IDirect3DDevice9* dev, float x, float y, float half, D3DCMPFUNC test)
 {
     struct V { float x, y, z, rhw; };
-    const float z = 0.99999f;
+    const float z = g_depthReversed ? 0.00001f : 0.99999f;
     const V quad[4] = { { x - half, y - half, z, 1 }, { x + half, y - half, z, 1 }, { x - half, y + half, z, 1 }, { x + half, y + half, z, 1 } };
     dev->SetRenderState(D3DRS_ZFUNC, test);
     dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, sizeof(V));
@@ -1045,6 +1102,7 @@ HRESULT __stdcall SetRenderStateHook(IDirect3DDevice9* dev, D3DRENDERSTATETYPE s
             break;
         }
     }
+    if (state == D3DRS_ZFUNC && g_depthReversed) value = ReversedDepthTest(value);
     return oSetRenderState(dev, state, value);
 }
 
@@ -1365,6 +1423,7 @@ HRESULT __stdcall ClearHook(IDirect3DDevice9* dev, DWORD count, const D3DRECT* r
         TraceLine("Clear rects %u flags %X color %08X z %.2f (viewport %u %u %u %u)", (unsigned)count, (unsigned)flags, (unsigned)color, z,
                   (unsigned)vp.X, (unsigned)vp.Y, (unsigned)vp.Width, (unsigned)vp.Height);
     }
+    if (g_depthReversed && (flags & D3DCLEAR_ZBUFFER)) z = 1.0f - z;
     return oClear(dev, count, rects, flags, color, z, stencil);
 }
 
@@ -3016,7 +3075,17 @@ HRESULT __stdcall DrawPrimitiveHook(IDirect3DDevice9* dev, D3DPRIMITIVETYPE t, U
 HRESULT __stdcall DrawIndexedPrimitiveHook(IDirect3DDevice9* dev, D3DPRIMITIVETYPE t, INT base, UINT least, UINT count, UINT start, UINT n)
 {
     if ((uintptr_t)_ReturnAddress() == fo2::kSpriteBatchDraw)
-        return DrawHudBatch(dev, _AddressOfReturnAddress(), t, base, least, count, start, n);
+    {
+        if (!g_depthReversed) return DrawHudBatch(dev, _AddressOfReturnAddress(), t, base, least, count, start, n);
+        // The screen sprites' shader puts them at depth 0, whatever their z, and the engine tests them as asked (the sun's
+        // glow and the lens flare less-or-equal: over everything). Reversed, 0 is the far end: they keep the game's test.
+        DWORD test = D3DCMP_ALWAYS;
+        dev->GetRenderState(D3DRS_ZFUNC, &test);
+        oSetRenderState(dev, D3DRS_ZFUNC, ReversedDepthTest(test));
+        HRESULT hr = DrawHudBatch(dev, _AddressOfReturnAddress(), t, base, least, count, start, n);
+        oSetRenderState(dev, D3DRS_ZFUNC, test);
+        return hr;
+    }
     int k = base >= 0 ? HudCardOf(dev, nullptr, 0, base + least, count) : -1;
     if (k < 0) return oDrawIndexedPrimitive(dev, t, base, least, count, start, n);
     return DrawToCard(dev, k, [&] { return oDrawIndexedPrimitive(dev, t, base, least, count, start, n); });
@@ -3212,7 +3281,7 @@ void DrawCockpitCards(IDirect3DDevice9* dev, BYTE* cam, int eye)
         if (z < n) return false;
         float zd = std::max(z - kCardDepthPull, n * 1.001f);
         out = { (x / z - fov.left) / (fov.right - fov.left) * W - 0.5f, (fov.up - y / z) / (fov.up - fov.down) * H - 0.5f,
-                f / (f - n) * (1.0f - n / zd), 1.0f / z, 0xFFFFFFFF, u, v };
+                EyeDepth(n, f, zd), 1.0f / z, 0xFFFFFFFF, u, v };
         return true;
     };
     auto toWorld = [&](const float* q, float* out) {
@@ -5242,7 +5311,7 @@ void DrawMirrors(IDirect3DDevice9* dev, BYTE* cam, int eye)
             float zd = std::max(z - kMirrorDepthPull, n * 1.001f);
             float mu = m.mask ? (m.skinUv[2 * i] - box[0]) / (box[2] - box[0]) : 0.0f, mv = m.mask ? (m.skinUv[2 * i + 1] - box[1]) / (box[3] - box[1]) : 0.0f;
             verts.push_back({ (x / z - fov.left) / (fov.right - fov.left) * W - 0.5f, (fov.up - y / z) / (fov.up - fov.down) * H - 0.5f,
-                              f / (f - n) * (1.0f - n / zd), 1.0f / z, colour, m.uv[k][2 * i], m.uv[k][2 * i + 1], mu, mv });
+                              EyeDepth(n, f, zd), 1.0f / z, colour, m.uv[k][2 * i], m.uv[k][2 * i + 1], mu, mv });
         }
         if (verts.size() != m.vertices.size()) continue;
         if (!saved)
@@ -5504,6 +5573,7 @@ bool RenderVrEyes(IDirect3DDevice9* dev, BYTE* ctx, BYTE** cams, float* fovScale
     bool blurCenterSaved = false;
     memcpy(savedBlurSpeed, blurSpeed, sizeof(savedBlurSpeed));
     if (!g_cfg.vrSpeedBlur || flying) memset(blurSpeed, 0, sizeof(savedBlurSpeed));
+    ReverseEyeDepth(dev, true);  // ([VR] FloatDepth) the eyes' and the mirrors'
     // The side mirrors' pictures for this frame, laid on their glass in each eye as it renders (MirrorsIntoEye).
     if (cockpit) RenderMirrors(dev, ctx, cams, fovScale, cam, anchor, pose, fov, pastAnchor);
     for (int eye = 0; eye < 2; eye++)
@@ -5557,6 +5627,7 @@ bool RenderVrEyes(IDirect3DDevice9* dev, BYTE* ctx, BYTE** cams, float* fovScale
         }
     }
     share::EndEyes();
+    ReverseEyeDepth(dev, false);
     if (flying) FlightDriverBack();
     RestoreFilterTextures();
     memcpy(blurSpeed, savedBlurSpeed, sizeof(savedBlurSpeed));

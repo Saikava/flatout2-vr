@@ -47,6 +47,19 @@ void HookDirect3D(IDirect3D9* d3d)
     VirtualProtect(&vtbl[kCreateDevice], sizeof(void*), old, &old);
 }
 
+// [VR] FloatDepth: DXVK keeps the 24-bit depth formats the game and the mod ask for as 32-bit floats, which the eyes
+// fill reversed (see g_depthReversed in render.cpp). DXVK reads its options from DXVK_CONFIG (besides dxvk.conf) as
+// Direct3DCreate9 starts it; the game's own depth comes out the same in floats.
+void UseFloatDepth()
+{
+    wchar_t old[1024] = L"";
+    DWORD n = GetEnvironmentVariableW(L"DXVK_CONFIG", old, 1024);
+    std::wstring config = n > 0 && n < 1024 ? std::wstring(old) + L"; " : L"";
+    config += L"d3d9.useD32forD24 = True";
+    SetEnvironmentVariableW(L"DXVK_CONFIG", config.c_str());
+    Log("DXVK_CONFIG=%ls", config.c_str());
+}
+
 // FlatOut2.exe calls Direct3DCreate9 through its import thunk 0x5FFA80 (jmp [IAT]) from two places.
 IDirect3D9* WINAPI Direct3DCreate9Hook(UINT sdk)
 {
@@ -54,6 +67,7 @@ IDirect3D9* WINAPI Direct3DCreate9Hook(UINT sdk)
     {
         g_xrTried = true;
         if (!xr::InitInstance()) Log("VR not available - the game runs on the monitor only");
+        if (g_cfg.vrFloatDepth) UseFloatDepth();
     }
     HMODULE d3d9 = GetModuleHandleW(L"d3d9.dll");
     if (!d3d9) d3d9 = LoadLibraryW(L"d3d9.dll");

@@ -46,7 +46,9 @@ constexpr uintptr_t kPostProcess = 0x5AA390;
 
 // Screen sprites: queued and drawn in batches as vertices in the back buffer's pixel space (x from 0
 // to its width, y to its height), whatever the render target. __thiscall(const void*), ret 4:
-// 0x5AB510 takes a rectangle {x0, y0, x1, y1, u0, v0, u1, v1, colour}, 0x5AB4C0 four ready vertices.
+// 0x5AB510 takes a rectangle {x0, y0, x1, y1, u0, v0, u1, v1, colour}, 0x5AB4C0 four ready vertices
+// {x, y, z, colour, u, v} (the rectangle's: (x0, y0), (x1, y0), (x1, y1), (x0, y1), z 1). Their shader puts them at
+// depth 0 whatever z: tested less-or-equal (the sun's glow, the lens flare) they come over everything.
 constexpr uintptr_t kSlotSpriteRect = kDeviceD3dVtbl + 0xD8;
 constexpr uintptr_t kSpriteRect = 0x5AB510;
 constexpr uintptr_t kSlotSpriteQuad = kDeviceD3dVtbl + 0xD4;
@@ -226,6 +228,9 @@ constexpr uintptr_t kCreateD3DCall2 = 0x5A5A08;
 constexpr uintptr_t kCamMatrixCopy = 0x8E5EC0;
 constexpr uintptr_t kViewMatrix = 0x8E5F00;
 constexpr uintptr_t kProjMatrix = 0x8E5F40;
+// The shaders get the world, view and projection matrices multiplied (c0: world, kViewMatrix, kProjMatrix), made
+// anew by the next draw (0x5A6D20) once this is set (SetCamera and SetFrustum set it).
+constexpr uintptr_t kViewProjChanged = 0x8E5DF4;  // int
 
 // ---- render camera (cams[i] in RenderViews) -----------------------------------------------
 constexpr int kCamMatrix = 0x80;   // float[16], rows: right, up, forward, position (y up, LH)

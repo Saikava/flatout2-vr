@@ -58,6 +58,7 @@ struct Config
     float vrLodDistance = 0.0f;    // level-of-detail and draw distances times this (0 = no limit)
     float vrGrassDistance = 5.0f;  // how far grass is drawn, times this
     float vrViewDistance = 3.0f;   // the far clipping distance times this
+    bool vrFloatDepth = true;      // the eyes' depth in floats, reversed (what lies close together far away keeps apart)
     bool vrSpeedBlur = true;       // races: the game's speed blur in the eyes
     float vrSpeedZoom = 1.0f;      // races: the game's widening of the field of view at speed, times this
     float vrCameraOffset[3] = {};  // races: metres the eyes are moved against the car (x right, y up, z forward)
