@@ -484,8 +484,10 @@ struct Probe
 void ProbeFrame(BYTE* gf)
 {
     Probe& p = g_probe;
-    const BYTE* car = PlayerCar();
-    if (!car || !InRace(gf))
+    // Out of the race first: leaving it, the game frees its players but leaves kLocalPlayer pointing at the
+    // first one's memory (reading the car through it crashed while the menu loaded).
+    const BYTE* car = InRace(gf) ? PlayerCar() : nullptr;
+    if (!car)
     {
         p.have = false;
         return;
