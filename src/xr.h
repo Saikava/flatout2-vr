@@ -32,6 +32,8 @@ bool Running();
 
 // Eye render size (recommended size times RenderScale).
 void EyeSize(unsigned* w, unsigned* h);
+// Eye textures larger than that ([VR] Mirror=2 renders them wider): where the headset's picture begins in each, in pixels.
+void SetEyeOffsets(unsigned leftX, unsigned leftY, unsigned rightX, unsigned rightY);
 
 // Per frame: WaitFrame waits for the headset's next frame and opens it (nothing to do when one is
 // open). The game loop calls it before the game advances, so the game follows the headset's

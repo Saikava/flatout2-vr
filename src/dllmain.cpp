@@ -50,8 +50,9 @@ static void Init()
         return;
     }
     Log("render hooks installed");
-    Log("config: Mirror %d, PhysicsAtHeadsetRate %d, Hud %d (%.2f m wide at %.2f m, height %.2f), PaceHz %.1f (jitter %d), StepProbe %d",
-        g_cfg.vrMirror, g_cfg.vrPhysicsAtHeadsetRate, g_cfg.vrHud, g_cfg.vrHudWidth, g_cfg.vrHudDistance, g_cfg.vrHudHeight,
+    Log("config: Mirror %d (monitor %.0f deg, %.0f down, smoothing %.2f s), PhysicsAtHeadsetRate %d, Hud %d (%.2f m wide at %.2f m, "
+        "height %.2f), PaceHz %.1f (jitter %d), StepProbe %d",
+        g_cfg.vrMirror, g_cfg.vrMonitorFov, g_cfg.vrMonitorPitch, g_cfg.vrMonitorSmoothing, g_cfg.vrPhysicsAtHeadsetRate, g_cfg.vrHud, g_cfg.vrHudWidth, g_cfg.vrHudDistance, g_cfg.vrHudHeight,
         g_cfg.testPaceHz, g_cfg.testPaceJitter, g_cfg.stepProbe);
     const float* co = g_cfg.vrCameraOffset;
     Log("config: CameraOffset %.3f %.3f %.3f (right, up, forward)", co[0], co[1], co[2]);

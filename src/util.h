@@ -46,7 +46,10 @@ struct Config
     float vrScreenDistance = 2.0f;
     float vrScreenWidth = 2.4f;
     float vrWorldScale = 1.0f;
-    bool vrMirror = true;  // in races the monitor shows the left eye instead of its own render
+    int vrMirror = 1;  // in races the monitor shows the left eye instead of its own render (2: a steady view of it, for videos)
+    float vrMonitorFov = 85.0f;       // Mirror=2: the view's width, degrees
+    float vrMonitorPitch = 10.0f;     // Mirror=2: the view aimed down by this, degrees
+    float vrMonitorSmoothing = 0.3f;  // Mirror=2: how long the view takes to follow the head, seconds
     bool vrPhysicsAtHeadsetRate = true;  // races: one physics step per headset frame
     int vrHud = 1;                 // races: the game's HUD on a panel in the headset (2: not while racing)
     float vrHudDistance = 1.2f;    // metres in front of the recenter origin

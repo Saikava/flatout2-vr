@@ -151,6 +151,8 @@ struct VrTargets
     IDirect3DSurface9* ds[2] = {};
     IDirect3DTexture9* tex[2] = {};
     UINT w = 0, h = 0;
+    UINT eyeW = 0, eyeH = 0;  // the headset's picture in them (w, h, unless they have room beside it: SteadyRoom)
+    UINT room[4] = {};        // the left eye's extra pixels left, right, above and below it (the right eye's left for right)
     bool failed = false;
     IDirect3DTexture9* screen = nullptr;
     IDirect3DSurface9* screenResolve = nullptr;  // back buffer format, single sample
@@ -1162,12 +1164,52 @@ void ReleaseVrTargets()
     g_gpu.Release();
 }
 
+// [VR] Mirror=2: the eyes are rendered wider than the headset's picture (which is all it gets, see xr::SetEyeOffsets), so
+// that the monitor's steady view (SteadyMonitorView), aimed down by MonitorPitch, fits in the left eye's picture with
+// kSteadyRoom degrees to turn each way: the left eye sees some 40 degrees right of straight ahead (54 left, 44 up, 55 down),
+// and a view turned down spreads at its bottom corners. The extra pixels beside the left eye's picture (f, w x h): left,
+// right, above and below (the right eye has the same, left for right, so both are of one size).
+constexpr float kSteadyRoom = 5.0f;
+
+void SteadyRoom(const xr::EyeFov& f, UINT w, UINT h, UINT room[4])
+{
+    room[0] = room[1] = room[2] = room[3] = 0;
+    if (g_cfg.vrMirror != 2) return;
+    float tx = tanf(0.5f * std::clamp(g_cfg.vrMonitorFov, 20.0f, 150.0f) * 0.017453293f);
+    float ty = tx * (g_screenW ? (float)g_screenH / (float)g_screenW : 0.5625f);
+    float lo[2] = { f.left, f.down }, hi[2] = { f.right, f.up };
+    for (int i = 0; i < 9; i++)
+    {
+        // The view turned down by b, then aside by a.
+        float a = (float)(i % 3 - 1) * kSteadyRoom * 0.017453293f, b = (g_cfg.vrMonitorPitch + (float)(i / 3 - 1) * kSteadyRoom) * 0.017453293f;
+        for (int c = 0; c < 4; c++)
+        {
+            float x = c & 1 ? tx : -tx, y = c & 2 ? ty : -ty;
+            float y1 = y * cosf(b) - sinf(b), z1 = y * sinf(b) + cosf(b);
+            float x2 = x * cosf(a) + z1 * sinf(a), z2 = std::max(-x * sinf(a) + z1 * cosf(a), 0.2f);
+            lo[0] = std::min(lo[0], x2 / z2), hi[0] = std::max(hi[0], x2 / z2);
+            lo[1] = std::min(lo[1], y1 / z2), hi[1] = std::max(hi[1], y1 / z2);
+        }
+    }
+    float px = (float)w / (f.right - f.left), py = (float)h / (f.up - f.down);
+    room[0] = std::min((UINT)ceilf((f.left - lo[0]) * px), w / 2);
+    room[1] = std::min((UINT)ceilf((hi[0] - f.right) * px), w / 2);
+    room[2] = std::min((UINT)ceilf((hi[1] - f.up) * py), h / 2);
+    room[3] = std::min((UINT)ceilf((f.down - lo[1]) * py), h / 2);
+}
+
 bool EnsureVrEyeTargets(IDirect3DDevice9* dev)
 {
     if (g_vrt.tex[0]) return true;
     if (g_vrt.failed) return false;
-    unsigned w, h;
-    xr::EyeSize(&w, &h);
+    unsigned eyeW, eyeH;
+    xr::EyeSize(&eyeW, &eyeH);
+    UINT room[4];
+    SteadyRoom(xr::Fov(0), eyeW, eyeH, room);
+    unsigned w = eyeW + room[0] + room[1], h = eyeH + room[2] + room[3];
+    if (w != eyeW || h != eyeH)
+        Log("VR eyes: the headset's %ux%u with room for the monitor's steady view: %u %u %u %u pixels left, right, up, down", eyeW, eyeH,
+            room[0], room[1], room[2], room[3]);
     int samples = g_cfg.vrMsaa;
     for (int attempt = 0; attempt < 2; attempt++)
     {
@@ -1184,6 +1226,10 @@ bool EnsureVrEyeTargets(IDirect3DDevice9* dev)
         {
             g_vrt.w = w;
             g_vrt.h = h;
+            g_vrt.eyeW = eyeW;
+            g_vrt.eyeH = eyeH;
+            memcpy(g_vrt.room, room, sizeof(room));
+            xr::SetEyeOffsets(room[0], room[2], room[1], room[2]);
             // Screenshots: both eyes and the monitor.
             PrepareScreenshots(dev, w, h, D3DFMT_A8R8G8B8, 2);
             IDirect3DSurface9* bb = nullptr;
@@ -3321,24 +3367,37 @@ void DrawCockpitCards(IDirect3DDevice9* dev, BYTE* cam, int eye)
 // target of its final passes.
 int* EngineScreenSize() { return (int*)(*(BYTE**)fo2::kDeviceD3d + fo2::kDevWidth); }
 
-// Draws a texture (or the part u0..u1, v0..v1 of it) over the whole bound render target, opaque
-// or as premultiplied alpha over what is there. Every device state is put back, so the engine's
-// state cache stays valid.
-void DrawScreenQuad(IDirect3DDevice9* dev, IDirect3DTexture9* tex, float u0, float v0, float u1, float v1, bool premultiplied)
+// The bound render target's size.
+bool BoundTargetSize(IDirect3DDevice9* dev, UINT* w, UINT* h)
 {
     IDirect3DSurface9* rt = nullptr;
-    if (FAILED(dev->GetRenderTarget(0, &rt))) return;
+    if (FAILED(dev->GetRenderTarget(0, &rt))) return false;
     D3DSURFACE_DESC d;
     rt->GetDesc(&d);
     rt->Release();
+    *w = d.Width;
+    *h = d.Height;
+    return true;
+}
+
+// A vertex in the render target's pixels; rhw 1 over its depth, for a picture laid on it in perspective.
+struct ScreenVertex
+{
+    float x, y, z, rhw, u, v;
+};
+
+// Draws a list of triangles with a texture into the bound render target, opaque or as premultiplied
+// alpha over what is there; outside the texture black (border) or its edge (clamp). Every device
+// state is put back, so the engine's state cache stays valid.
+void DrawScreenTriangles(IDirect3DDevice9* dev, IDirect3DTexture9* tex, const ScreenVertex* verts, UINT triangles, bool premultiplied,
+                         bool border = false)
+{
+    UINT w, h;
+    if (triangles == 0 || !BoundTargetSize(dev, &w, &h)) return;
     IDirect3DStateBlock9* saved = nullptr;
     if (FAILED(dev->CreateStateBlock(D3DSBT_ALL, &saved))) return;
 
-    struct V { float x, y, z, rhw, u, v; };
-    float W = (float)d.Width - 0.5f, H = (float)d.Height - 0.5f;
-    const V quad[4] = { { -0.5f, -0.5f, 0, 1, u0, v0 }, { W, -0.5f, 0, 1, u1, v0 }, { -0.5f, H, 0, 1, u0, v1 }, { W, H, 0, 1, u1, v1 } };
-
-    D3DVIEWPORT9 vp = { 0, 0, d.Width, d.Height, 0.0f, 1.0f };
+    D3DVIEWPORT9 vp = { 0, 0, w, h, 0.0f, 1.0f };
     dev->SetViewport(&vp);
     dev->SetVertexShader(nullptr);
     dev->SetPixelShader(nullptr);
@@ -3355,8 +3414,9 @@ void DrawScreenQuad(IDirect3DDevice9* dev, IDirect3DTexture9* tex, float u0, flo
     dev->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
     dev->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
     dev->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
-    dev->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
-    dev->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+    dev->SetSamplerState(0, D3DSAMP_ADDRESSU, border ? D3DTADDRESS_BORDER : D3DTADDRESS_CLAMP);
+    dev->SetSamplerState(0, D3DSAMP_ADDRESSV, border ? D3DTADDRESS_BORDER : D3DTADDRESS_CLAMP);
+    dev->SetSamplerState(0, D3DSAMP_BORDERCOLOR, 0xFF000000);
     dev->SetSamplerState(0, D3DSAMP_SRGBTEXTURE, FALSE);
     dev->SetRenderState(D3DRS_ZENABLE, D3DZB_FALSE);
     dev->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
@@ -3374,9 +3434,21 @@ void DrawScreenQuad(IDirect3DDevice9* dev, IDirect3DTexture9* tex, float u0, flo
     dev->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
     dev->SetRenderState(D3DRS_COLORWRITEENABLE, 0xF);
     dev->SetRenderState(D3DRS_SRGBWRITEENABLE, FALSE);
-    dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, sizeof(V));
+    dev->DrawPrimitiveUP(D3DPT_TRIANGLELIST, triangles, verts, sizeof(ScreenVertex));
     saved->Apply();
     saved->Release();
+}
+
+// Draws a texture (or the part u0..u1, v0..v1 of it) over the whole bound render target, opaque
+// or as premultiplied alpha over what is there.
+void DrawScreenQuad(IDirect3DDevice9* dev, IDirect3DTexture9* tex, float u0, float v0, float u1, float v1, bool premultiplied)
+{
+    UINT w, h;
+    if (!BoundTargetSize(dev, &w, &h)) return;
+    float W = (float)w - 0.5f, H = (float)h - 0.5f;
+    const ScreenVertex quad[6] = { { -0.5f, -0.5f, 0, 1, u0, v0 }, { W, -0.5f, 0, 1, u1, v0 }, { -0.5f, H, 0, 1, u0, v1 },
+                                   { W, -0.5f, 0, 1, u1, v0 }, { W, H, 0, 1, u1, v1 },       { -0.5f, H, 0, 1, u0, v1 } };
+    DrawScreenTriangles(dev, tex, quad, 2, premultiplied);
 }
 
 // Lays the screen fade's colour (alpha in the top byte) over a render target (the bound one when null).
@@ -3458,6 +3530,273 @@ void MirrorLeftEye(IDirect3DDevice9* dev, const xr::EyeFov& fov)
     DrawScreenQuad(dev, g_vrt.tex[0], u0, v0, u0 + w, v0 + h, false);
 }
 
+// ---- the monitor's steady view ([VR] Mirror=2) -------------------------------------------------------------------------
+// What the headset shows, for a video: the left eye's picture seen from the eye by a camera that follows the head's turning
+// smoothly (in two exponential steps of [VR] MonitorSmoothing/2 each: the head's small shakes are gone, its turns come
+// out eased), its horizon level with the car's, aimed [VR] MonitorPitch degrees down, [VR] MonitorFov degrees across at
+// the monitor's shape. It costs no render of its own: the eye's picture is wider and is cut from, turned (a grid over the
+// monitor, each point's direction looked up in the eye); the eyes are rendered wider than the headset's picture for it
+// (SteadyRoom: the left eye sees only some 40 degrees right of straight ahead). Near the edge of the eye's picture the
+// camera is held back from it, so it eases into following the head as close as it must. The HUD's panel is drawn where it
+// hangs in the headset (EndHudCapture); the cockpit's instruments are in the eye's picture already.
+float Dot3(const float* a, const float* b);
+
+// An orientation: the unit quaternion (x, y, z, w) of the turn taking the game's axes (x right, y up, z forward) to a
+// pose's, relative to the recenter origin.
+struct Quat
+{
+    float x, y, z, w;
+};
+
+Quat AxesToQuat(const float* r, const float* u, const float* f)
+{
+    // m[i][j]: row i of the matrix whose columns are r, u and f.
+    float m00 = r[0], m01 = u[0], m02 = f[0], m10 = r[1], m11 = u[1], m12 = f[1], m20 = r[2], m21 = u[2], m22 = f[2];
+    float t = m00 + m11 + m22;
+    if (t > 0.0f)
+    {
+        float s = 2.0f * sqrtf(1.0f + t);
+        return { (m21 - m12) / s, (m02 - m20) / s, (m10 - m01) / s, 0.25f * s };
+    }
+    if (m00 > m11 && m00 > m22)
+    {
+        float s = 2.0f * sqrtf(1.0f + m00 - m11 - m22);
+        return { 0.25f * s, (m01 + m10) / s, (m02 + m20) / s, (m21 - m12) / s };
+    }
+    if (m11 > m22)
+    {
+        float s = 2.0f * sqrtf(1.0f + m11 - m00 - m22);
+        return { (m01 + m10) / s, 0.25f * s, (m12 + m21) / s, (m02 - m20) / s };
+    }
+    float s = 2.0f * sqrtf(1.0f + m22 - m00 - m11);
+    return { (m02 + m20) / s, (m12 + m21) / s, 0.25f * s, (m10 - m01) / s };
+}
+
+void QuatToAxes(const Quat& q, float* r, float* u, float* f)
+{
+    float x = q.x, y = q.y, z = q.z, w = q.w;
+    r[0] = 1.0f - 2.0f * (y * y + z * z), r[1] = 2.0f * (x * y + z * w), r[2] = 2.0f * (x * z - y * w);
+    u[0] = 2.0f * (x * y - z * w), u[1] = 1.0f - 2.0f * (x * x + z * z), u[2] = 2.0f * (y * z + x * w);
+    f[0] = 2.0f * (x * z + y * w), f[1] = 2.0f * (y * z - x * w), f[2] = 1.0f - 2.0f * (x * x + y * y);
+}
+
+// a after b.
+Quat QuatMul(const Quat& a, const Quat& b)
+{
+    return { a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y, a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+             a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w, a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z };
+}
+
+// The turn from a to b: its axis (unit) and angle (0 to pi).
+float TurnBetween(const Quat& a, const Quat& b, float axis[3])
+{
+    Quat d = QuatMul(b, { -a.x, -a.y, -a.z, a.w });
+    if (d.w < 0.0f) d = { -d.x, -d.y, -d.z, -d.w };
+    float s = sqrtf(d.x * d.x + d.y * d.y + d.z * d.z);
+    if (s < 1e-7f)
+    {
+        axis[0] = 1.0f, axis[1] = axis[2] = 0.0f;
+        return 0.0f;
+    }
+    axis[0] = d.x / s, axis[1] = d.y / s, axis[2] = d.z / s;
+    return 2.0f * atan2f(s, d.w);
+}
+
+// a turned about the axis by the angle.
+Quat Turned(const Quat& a, const float axis[3], float angle)
+{
+    float s = sinf(0.5f * angle);
+    Quat q = QuatMul({ axis[0] * s, axis[1] * s, axis[2] * s, cosf(0.5f * angle) }, a);
+    float n = sqrtf(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w);
+    return { q.x / n, q.y / n, q.z / n, q.w / n };
+}
+
+// The share t of the way from a to b.
+Quat Slerp(const Quat& a, const Quat& b, float t)
+{
+    float axis[3], angle = TurnBetween(a, b, axis);
+    return Turned(a, axis, t * angle);
+}
+
+// Looking along f (unit) with the horizon level: right across the car's floor. False looking straight up or down.
+bool LevelAxes(const float* f, float* r, float* u)
+{
+    float n = sqrtf(f[0] * f[0] + f[2] * f[2]);
+    if (n < 0.05f) return false;
+    r[0] = f[2] / n, r[1] = 0.0f, r[2] = -f[0] / n;
+    u[0] = f[1] * r[2] - f[2] * r[1], u[1] = f[2] * r[0] - f[0] * r[2], u[2] = f[0] * r[1] - f[1] * r[0];
+    return true;
+}
+
+struct SteadyView
+{
+    xr::EyePose eye = {};  // the left eye's pose and field of view, as its picture was rendered (RenderVrEyes)
+    xr::EyeFov eyeFov = {};
+    bool valid = false;    // the camera's orientations follow the head (in a race)
+    double time = 0;       // when they were last moved
+    Quat q[2] = {};        // the two smoothing steps' orientations; the camera's is the second
+    float tanX = 0, tanY = 0;  // half the view's width and height, as tangents
+    float right[3] = {}, up[3] = {}, forward[3] = {};  // this frame's camera
+    bool shown = false;    // the monitor shows it this frame (the HUD's panel goes on it at Present)
+} g_steady;
+
+// Whether the camera turned so sees inside the eye's picture only (its corners do: the picture's edges are straight lines in
+// the eye's too).
+bool SteadyFits(const Quat& q)
+{
+    const xr::EyePose& e = g_steady.eye;
+    const xr::EyeFov& v = g_steady.eyeFov;
+    float r[3], u[3], f[3];
+    QuatToAxes(q, r, u, f);
+    for (int c = 0; c < 4; c++)
+    {
+        float x = c & 1 ? g_steady.tanX : -g_steady.tanX, y = c & 2 ? g_steady.tanY : -g_steady.tanY;
+        float d[3] = { x * r[0] + y * u[0] + f[0], x * r[1] + y * u[1] + f[1], x * r[2] + y * u[2] + f[2] };
+        float ex = Dot3(d, e.right), ey = Dot3(d, e.up), ez = Dot3(d, e.forward);
+        if (ez < 0.01f || ex < v.left * ez || ex > v.right * ez || ey < v.down * ez || ey > v.up * ez) return false;
+    }
+    return true;
+}
+
+// q held back from the eye's picture's edge: turned from `home` (which fits) by at most half of what fits that way as it
+// is, and beyond that by less and less, never reaching the edge.
+Quat SteadyContain(const Quat& home, const Quat& q)
+{
+    float axis[3], angle = TurnBetween(home, q, axis);
+    if (angle < 1e-5f) return q;
+    float lo = 0.0f, hi = 1.5f;  // radians
+    for (int i = 0; i < 16; i++)
+    {
+        float mid = 0.5f * (lo + hi);
+        if (SteadyFits(Turned(home, axis, mid)))
+            lo = mid;
+        else
+            hi = mid;
+    }
+    float most = lo, ease = 0.5f * most;
+    if (most <= 0.0f) return home;
+    if (angle <= ease) return q;
+    return Turned(home, axis, ease + (most - ease) * tanhf((angle - ease) / (most - ease)));
+}
+
+// The monitor's picture in a race (in RenderViews, after the eyes): the camera follows the head a frame further and the
+// view is cut from the eye's picture.
+void SteadyMonitorView(IDirect3DDevice9* dev)
+{
+    SteadyView& s = g_steady;
+    UINT w, h;
+    if (!BoundTargetSize(dev, &w, &h)) return;
+    s.tanX = tanf(0.5f * std::clamp(g_cfg.vrMonitorFov, 20.0f, 150.0f) * 0.017453293f);
+    s.tanY = s.tanX * (float)h / (float)w;
+
+    // Where it would look: where the eye does, level, and down by [VR] MonitorPitch (the dashboard and the hands on the wheel
+    // in view); if the eye's picture has no room for that (a view too wide, the head tilted far), as near it towards the
+    // picture's middle as there is.
+    const xr::EyePose& e = s.eye;
+    const xr::EyeFov& v = s.eyeFov;
+    float r[3], u[3], f[3], down = g_cfg.vrMonitorPitch * 0.017453293f;
+    if (!LevelAxes(e.forward, r, u))
+    {
+        memcpy(r, e.right, sizeof(r));
+        memcpy(u, e.up, sizeof(u));
+    }
+    for (int k = 0; k < 3; k++)
+    {
+        f[k] = e.forward[k] * cosf(down) - u[k] * sinf(down);
+        u[k] = u[k] * cosf(down) + e.forward[k] * sinf(down);
+    }
+    Quat home = AxesToQuat(r, u, f);
+    if (!SteadyFits(home))
+    {
+        float cx = 0.5f * (v.left + v.right), cy = 0.5f * (v.up + v.down);
+        for (int i = 0; i < 3; i++) f[i] = cx * e.right[i] + cy * e.up[i] + e.forward[i];
+        float n = sqrtf(Dot3(f, f));
+        for (float& c : f) c /= n;
+        Quat middle = LevelAxes(f, r, u) ? AxesToQuat(r, u, f) : home;
+        float lo = 0.0f, hi = 1.0f;
+        for (int i = 0; i < 12; i++)
+        {
+            float mid = 0.5f * (lo + hi);
+            if (SteadyFits(Slerp(home, middle, mid)))
+                hi = mid;
+            else
+                lo = mid;
+        }
+        home = Slerp(home, middle, hi);
+    }
+
+    double now = NowSeconds(), dt = std::clamp(now - s.time, 0.0, 0.1);  // (a hitch of the game's: as a slow frame)
+    s.time = now;
+    if (!s.valid || g_cfg.vrMonitorSmoothing <= 0.0f)
+        s.q[0] = s.q[1] = home;
+    else
+    {
+        float a = 1.0f - expf(-(float)dt / (0.5f * g_cfg.vrMonitorSmoothing));
+        s.q[0] = Slerp(s.q[0], home, a);
+        s.q[1] = Slerp(s.q[1], s.q[0], a);
+    }
+    s.valid = true;
+    s.q[0] = SteadyContain(home, s.q[0]);
+    s.q[1] = SteadyContain(home, s.q[1]);
+    QuatToAxes(s.q[1], s.right, s.up, s.forward);
+
+    // A grid over the monitor; rhw is the depth along the eye's axis, so the picture is laid on it in the eye's perspective.
+    constexpr int kGridX = 32, kGridY = 18;
+    static ScreenVertex grid[kGridY + 1][kGridX + 1];
+    static ScreenVertex tris[kGridX * kGridY * 6];
+    for (int j = 0; j <= kGridY; j++)
+        for (int i = 0; i <= kGridX; i++)
+        {
+            float x = (2.0f * i / kGridX - 1.0f) * s.tanX, y = (1.0f - 2.0f * j / kGridY) * s.tanY, d[3];
+            for (int k = 0; k < 3; k++) d[k] = x * s.right[k] + y * s.up[k] + s.forward[k];
+            float ex = Dot3(d, e.right), ey = Dot3(d, e.up), ez = std::max(Dot3(d, e.forward), 1e-3f);
+            grid[j][i] = { (float)i * w / kGridX - 0.5f, (float)j * h / kGridY - 0.5f, 0.0f, ez,
+                           (ex / ez - v.left) / (v.right - v.left), (v.up - ey / ez) / (v.up - v.down) };
+        }
+    int n = 0;
+    for (int j = 0; j < kGridY; j++)
+        for (int i = 0; i < kGridX; i++)
+            for (int c : { 0, 1, 2, 1, 3, 2 }) tris[n++] = grid[j + (c >> 1)][i + (c & 1)];
+    DrawScreenTriangles(dev, g_vrt.tex[0], tris, (UINT)n / 3, false, true);
+    s.shown = true;
+}
+
+// The HUD's panel on the steady view, where it hangs in the headset: a grid over the panel, each point where the camera
+// sees it (parts behind the camera left out).
+void DrawSteadyPanel(IDirect3DDevice9* dev)
+{
+    const SteadyView& s = g_steady;
+    UINT w, h;
+    if (!BoundTargetSize(dev, &w, &h) || g_hud.w == 0) return;
+    // The panel in front of the recenter origin (xr::PanelPose), seen from the eye where the head is: not moved by [VR]
+    // CameraOffset or [Test] HeadOffset as the eyes are (the headset puts it against the head itself).
+    float eye[3];
+    for (int k = 0; k < 3; k++) eye[k] = s.eye.position[k] - g_cfg.vrCameraOffset[k] - g_cfg.testHeadOffset[k];
+    float pw = g_cfg.vrHudWidth, ph = pw * (float)g_hud.h / (float)g_hud.w;
+    constexpr int kGridX = 16, kGridY = 9;
+    static ScreenVertex grid[kGridY + 1][kGridX + 1];
+    static bool front[kGridY + 1][kGridX + 1];
+    static ScreenVertex tris[kGridX * kGridY * 6];
+    for (int j = 0; j <= kGridY; j++)
+        for (int i = 0; i <= kGridX; i++)
+        {
+            float u = (float)i / kGridX, v = (float)j / kGridY;
+            float p[3] = { (u - 0.5f) * pw - eye[0], g_cfg.vrHudHeight + (0.5f - v) * ph - eye[1], g_cfg.vrHudDistance - eye[2] };
+            float x = Dot3(p, s.right), y = Dot3(p, s.up), z = Dot3(p, s.forward);
+            front[j][i] = z > 0.05f;
+            z = std::max(z, 0.05f);
+            grid[j][i] = { (0.5f + 0.5f * x / z / s.tanX) * w - 0.5f, (0.5f - 0.5f * y / z / s.tanY) * h - 0.5f, 0.0f, 1.0f / z, u, v };
+        }
+    int n = 0;
+    for (int j = 0; j < kGridY; j++)
+        for (int i = 0; i < kGridX; i++)
+        {
+            if (!front[j][i] || !front[j][i + 1] || !front[j + 1][i] || !front[j + 1][i + 1]) continue;
+            for (int c : { 0, 1, 2, 1, 3, 2 }) tris[n++] = grid[j + (c >> 1)][i + (c & 1)];
+        }
+    DrawScreenTriangles(dev, g_hud.tex, tris, (UINT)n / 3, true);
+}
+
 // Present: the game's drawing goes back to its own targets; the HUD is laid over the monitor's
 // picture and copied to the headset's panel texture.
 void EndHudCapture(IDirect3DDevice9* dev)
@@ -3473,10 +3812,19 @@ void EndHudCapture(IDirect3DDevice9* dev)
     DWORD world = FadeOver(g_fade[0], g_fade[1]);
     if (world >> 24) FadeTarget(dev, nullptr, world, false);
     if (g_fade[0] >> 24) FadeTarget(dev, g_hud.rt, g_fade[0], true);
-    DrawScreenQuad(dev, g_hud.tex, 0.0f, 0.0f, 1.0f, 1.0f, true);
-    // The monitor shows the cockpit's instruments too (in the headset they are in the car, not on the panel).
-    if (HudCardsRouted())
-        for (IDirect3DTexture9* card : g_hud.cards) DrawScreenQuad(dev, card, 0.0f, 0.0f, 1.0f, 1.0f, true);
+    if (g_steady.shown)
+    {
+        // The steady view (Mirror=2): the panel where the headset shows it (if it does: Hud=2 leaves it out while racing).
+        g_steady.shown = false;
+        if (!g_hudLeftOut) DrawSteadyPanel(dev);
+    }
+    else
+    {
+        DrawScreenQuad(dev, g_hud.tex, 0.0f, 0.0f, 1.0f, 1.0f, true);
+        // The monitor shows the cockpit's instruments too (in the headset they are in the car, not on the panel).
+        if (HudCardsRouted())
+            for (IDirect3DTexture9* card : g_hud.cards) DrawScreenQuad(dev, card, 0.0f, 0.0f, 1.0f, 1.0f, true);
+    }
     IDirect3DSurface9* panel = nullptr;
     if (SUCCEEDED(g_hud.panel->GetSurfaceLevel(0, &panel)))
     {
@@ -5053,6 +5401,19 @@ bool RenderVrEyes(IDirect3DDevice9* dev, BYTE* ctx, BYTE** cams, float* fovScale
     ApplyHeadOffsets(pose[1]);
     SameDirection(pose);
     if (!rec::ReplayView(pose, fov)) rec::RecordView(pose, fov);
+    // Mirror=2: the eyes take in the room beside the headset's picture (SteadyRoom), the right eye's left for right.
+    if (g_vrt.w != g_vrt.eyeW || g_vrt.h != g_vrt.eyeH)
+        for (int eye = 0; eye < 2; eye++)
+        {
+            xr::EyeFov& f = fov[eye];
+            float px = (f.right - f.left) / (float)g_vrt.eyeW, py = (f.up - f.down) / (float)g_vrt.eyeH;
+            f.left -= px * (float)g_vrt.room[eye ? 1 : 0];
+            f.right += px * (float)g_vrt.room[eye ? 0 : 1];
+            f.up += py * (float)g_vrt.room[2];
+            f.down -= py * (float)g_vrt.room[3];
+        }
+    g_steady.eye = pose[0];
+    g_steady.eyeFov = fov[0];  // (as the headset shows it: the speed zoom only shrinks what the picture shows)
     if (cockpit) MoveCockpitCards(anchor);
     // The speed zoom ([VR] SpeedZoom): at speed the game widens its horizontal field of view (by fovScale,
     // up to some 1.3 times the angle) and stretches its picture sideways by half as much, and the world
@@ -5250,7 +5611,11 @@ void __stdcall RenderViewsHook(BYTE* ctx, BYTE** cams, float* fovScale)
     BYTE* cam = views == 1 && cams ? cams[0] : nullptr;
     // The cockpit's eyes and instruments are worked out once a car, and the next race may have its car
     // where the last one's was.
-    if (!race) g_eyeCar = g_dash.car = g_cabin.car = g_mirrors.car = nullptr;
+    if (!race)
+    {
+        g_eyeCar = g_dash.car = g_cabin.car = g_mirrors.car = nullptr;
+        g_steady.valid = false;  // (the monitor's steady view starts anew)
+    }
 
     if (dev && g_screenW == 0)
     {
@@ -5287,7 +5652,10 @@ void __stdcall RenderViewsHook(BYTE* ctx, BYTE** cams, float* fovScale)
     {
         bool eyes = RenderVrEyes(dev, ctx, cams, fovScale, cam);
         g_vrFrameDone = true;
-        if (eyes && g_cfg.vrMirror)
+        g_steady.shown = false;
+        if (eyes && g_cfg.vrMirror == 2)
+            SteadyMonitorView(dev);
+        else if (eyes && g_cfg.vrMirror)
             MirrorLeftEye(dev, xr::Fov(0));
         else
             oRenderViews(ctx, cams, fovScale);  // the monitor's own view

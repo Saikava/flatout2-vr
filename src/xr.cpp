@@ -70,6 +70,7 @@ struct Swapchain
 Swapchain g_eyeSc[2], g_screenSc, g_hudSc;
 int64_t g_format;
 uint32_t g_eyeW, g_eyeH;
+uint32_t g_eyeOffset[2][2];  // where the headset's picture begins in each eye's texture (SetEyeOffsets)
 
 XrFrameState g_frameState;
 bool g_frameOpen;
@@ -268,8 +269,9 @@ bool SameChannelOrder(VkFormat a, int64_t b)
     return (bgra(a) && bgra(b)) || (rgba(a) && rgba(b));
 }
 
-// Copies D3D9 textures into newly acquired images of the given swapchains on DXVK's queue.
-bool CopyToSwapchains(IDirect3DTexture9* const* textures, Swapchain* const* chains, int count)
+// Copies D3D9 textures (from the given offsets in them, if any) into newly acquired images of the given swapchains on
+// DXVK's queue.
+bool CopyToSwapchains(IDirect3DTexture9* const* textures, Swapchain* const* chains, int count, const uint32_t (*offsets)[2] = nullptr)
 {
     struct Src
     {
@@ -340,12 +342,15 @@ bool CopyToSwapchains(IDirect3DTexture9* const* textures, Swapchain* const* chai
                      VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, color);
         ImageBarrier(s.cmd, dst, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
                      VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, color);
-        uint32_t w = std::min(src[i].info.extent.width, chains[i]->w);
-        uint32_t h = std::min(src[i].info.extent.height, chains[i]->h);
+        uint32_t x = offsets ? std::min(offsets[i][0], src[i].info.extent.width) : 0;
+        uint32_t y = offsets ? std::min(offsets[i][1], src[i].info.extent.height) : 0;
+        uint32_t w = std::min(src[i].info.extent.width - x, chains[i]->w);
+        uint32_t h = std::min(src[i].info.extent.height - y, chains[i]->h);
         if (SameChannelOrder(src[i].info.format, g_format))
         {
             VkImageCopy region = {};
             region.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+            region.srcOffset = { (int32_t)x, (int32_t)y, 0 };
             region.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
             region.extent = { w, h, 1 };
             vk.CmdCopyImage(s.cmd, src[i].image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
@@ -355,7 +360,8 @@ bool CopyToSwapchains(IDirect3DTexture9* const* textures, Swapchain* const* chai
             VkImageBlit region = {};
             region.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
             region.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-            region.srcOffsets[1] = { (int32_t)w, (int32_t)h, 1 };
+            region.srcOffsets[0] = { (int32_t)x, (int32_t)y, 0 };
+            region.srcOffsets[1] = { (int32_t)(x + w), (int32_t)(y + h), 1 };
             region.dstOffsets[1] = { (int32_t)w, (int32_t)h, 1 };
             vk.CmdBlitImage(s.cmd, src[i].image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region,
                             VK_FILTER_NEAREST);
@@ -843,6 +849,12 @@ void EyeSize(unsigned* w, unsigned* h)
     *h = g_eyeH;
 }
 
+void SetEyeOffsets(unsigned leftX, unsigned leftY, unsigned rightX, unsigned rightY)
+{
+    g_eyeOffset[0][0] = leftX, g_eyeOffset[0][1] = leftY;
+    g_eyeOffset[1][0] = rightX, g_eyeOffset[1][1] = rightY;
+}
+
 bool WaitFrame()
 {
     if (!g_running) return false;
@@ -924,7 +936,8 @@ void SubmitEyes(IDirect3DTexture9* left, IDirect3DTexture9* right, IDirect3DText
     if (hud && !g_hudSc.handle && !CreateSwapchain(g_hudSc, hudW, hudH, "HUD")) hud = nullptr;
     IDirect3DTexture9* tex[3] = { left, right, hud };
     Swapchain* chains[3] = { &g_eyeSc[0], &g_eyeSc[1], &g_hudSc };
-    if (!g_eyeSc[0].handle || !CopyToSwapchains(tex, chains, hud ? 3 : 2))
+    const uint32_t offsets[3][2] = { { g_eyeOffset[0][0], g_eyeOffset[0][1] }, { g_eyeOffset[1][0], g_eyeOffset[1][1] }, { 0, 0 } };
+    if (!g_eyeSc[0].handle || !CopyToSwapchains(tex, chains, hud ? 3 : 2, offsets))
     {
         EndFrame(nullptr);
         return;

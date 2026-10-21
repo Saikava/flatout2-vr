@@ -146,7 +146,11 @@ void LoadConfig()
     g_cfg.vrScreenDistance = IniFloat(p, L"VR", L"ScreenDistance", d.vrScreenDistance);
     g_cfg.vrScreenWidth = IniFloat(p, L"VR", L"ScreenWidth", d.vrScreenWidth);
     g_cfg.vrWorldScale = IniFloat(p, L"VR", L"WorldScale", d.vrWorldScale);
-    g_cfg.vrMirror = GetPrivateProfileIntW(L"VR", L"Mirror", d.vrMirror, p) != 0;
+    int mirror = GetPrivateProfileIntW(L"VR", L"Mirror", d.vrMirror, p);
+    g_cfg.vrMirror = mirror >= 0 && mirror <= 2 ? mirror : d.vrMirror;
+    g_cfg.vrMonitorFov = IniFloat(p, L"VR", L"MonitorFov", d.vrMonitorFov);
+    g_cfg.vrMonitorPitch = std::clamp(IniFloat(p, L"VR", L"MonitorPitch", d.vrMonitorPitch), -45.0f, 45.0f);
+    g_cfg.vrMonitorSmoothing = IniFloat(p, L"VR", L"MonitorSmoothing", d.vrMonitorSmoothing);
     g_cfg.vrPhysicsAtHeadsetRate = GetPrivateProfileIntW(L"VR", L"PhysicsAtHeadsetRate", d.vrPhysicsAtHeadsetRate, p) != 0;
     int hud = GetPrivateProfileIntW(L"VR", L"Hud", d.vrHud, p);
     g_cfg.vrHud = hud >= 0 && hud <= 2 ? hud : d.vrHud;
