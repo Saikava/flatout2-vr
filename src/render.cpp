@@ -2037,9 +2037,17 @@ static void __stdcall DynamicBatchDraw(BYTE* batch)
     DWORD cull = D3DCULL_CCW;
     dev->GetRenderState(D3DRS_CULLMODE, &cull);
     dev->SetRenderState(D3DRS_CULLMODE, cull == D3DCULL_CW ? D3DCULL_CCW : D3DCULL_CW);
+    // Broken glass (shards round the frame, cracks) is blended over what is behind it but writes its depth all over the
+    // window, the clear part too: the particles drawn after the cars (the smoke and fire from the bonnet, the nitro's
+    // flames, the dust) and the rivals' markers were left out wherever they were seen through it. It writes no depth,
+    // as the whole glass.
     if (glass == Glass::Broken)
     {
+        DWORD depthWrite = TRUE;
+        dev->GetRenderState(D3DRS_ZWRITEENABLE, &depthWrite);
+        dev->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
         CallBatchDraw(batch);
+        dev->SetRenderState(D3DRS_ZWRITEENABLE, depthWrite);
         dev->SetRenderState(D3DRS_CULLMODE, cull);
         return;
     }
@@ -3281,6 +3289,38 @@ void MoveCockpitCards(const float* anchor)
     }
 }
 
+// How full the particle lists are (see game.h kParticleViews): the most a list held in a log interval of frames and in
+// how many frames it was full, for the first view (the race's camera; the eyes share it), for the log.
+struct ParticleLists
+{
+    int most[3] = {}, full[3] = {}, frames = 0;
+    double lastLog = 0;
+} g_particleLists;
+
+void NoteParticleLists()
+{
+    ParticleLists& p = g_particleLists;
+    if (*(const unsigned*)fo2::kParticleViewCount == 0) return;
+    const int offsets[3] = { 0x10, 0x28, 0x1C };  // count, capacity: the main list, the two smaller ones
+    for (int i = 0; i < 3; i++)
+    {
+        const int* list = (const int*)(fo2::kParticleViews + offsets[i]);
+        p.most[i] = std::max(p.most[i], list[0]);
+        p.full[i] += list[0] >= list[1];
+    }
+    p.frames++;
+    double now = NowSeconds();
+    if (now - p.lastLog < g_cfg.logIntervalSeconds) return;
+    if (p.lastLog > 0)
+    {
+        const int* l = (const int*)fo2::kParticleViews;
+        Log("particles: the lists held at most %d of %d, %d of %d, %d of %d; full in %d, %d, %d of %d frames", p.most[0], l[0x14 / 4], p.most[1],
+            l[0x2C / 4], p.most[2], l[0x20 / 4], p.full[0], p.full[1], p.full[2], p.frames);
+    }
+    p = ParticleLists();
+    p.lastLog = now;
+}
+
 // The markers over the rivals ([VR]; see game.h kMarkers): the game draws them on its HUD where the cars are on the
 // monitor's picture, so in the headset they stood on the HUD panel, and some in the cockpit's cards. They are drawn
 // over the cars in the eyes instead. The game picks the rivals and their colours as it draws its HUD: those within its
@@ -3413,13 +3453,14 @@ static __declspec(naked) void MarkerDrawHook()
     }
 }
 
-// In an eye: the last frame's markers over their cars, with the eye's depth (the cockpit and the walls cover them).
+// In an eye: the last frame's markers over their cars, over everything as the game draws them on the monitor (with the
+// eye's depth, the cockpit's pillars, doors and roof hid most of them).
 void DrawMarkers(IDirect3DDevice9* dev, BYTE* cam)
 {
     MarkerState& m = g_markers;
     if (m.shown.empty() || NowSeconds() - m.shownAt > 0.1 || g_hudLeftOut) return;  // (Hud=2 leaves them out with the HUD)
     const float* e = (const float*)(cam + fo2::kCamMatrix);  // the eye's
-    float n = *(const float*)(cam + fo2::kCamNear), f = *(const float*)(cam + fo2::kCamFar);
+    float n = *(const float*)(cam + fo2::kCamNear);
     float reach = std::max(*(const float*)fo2::kMarkerReach, 1.0f);
     const xr::EyeFov& fov = g_vrEye.fov;
     float W = (float)g_vrt.w, H = (float)g_vrt.h;
@@ -3436,7 +3477,7 @@ void DrawMarkers(IDirect3DDevice9* dev, BYTE* cam)
         // In the eye's picture: its middle, half its width and height (pixels), pointing down.
         float px = (x / z - fov.left) / (fov.right - fov.left) * W - 0.5f, py = (fov.up - y / z) / (fov.up - fov.down) * H - 0.5f;
         float hw = 0.5f * wide / (fov.right - fov.left) * W, hh = 0.5f * wide * kMarkerTall / (fov.up - fov.down) * H;
-        float depth = EyeDepth(n, f, z), rhw = 1.0f / z;
+        float depth = 0.0f, rhw = 1.0f / z;
         // A dark rim (the triangle a little larger behind), then the triangle in its colour.
         DWORD rim = (r.colour & 0xFF000000) | ((r.colour >> 2) & 0x3F3F3F);
         float grow = std::max(1.5f, 0.12f * hw);
@@ -3460,9 +3501,8 @@ void DrawMarkers(IDirect3DDevice9* dev, BYTE* cam)
     dev->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE);
     dev->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
     dev->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
-    dev->SetRenderState(D3DRS_ZENABLE, D3DZB_TRUE);
+    dev->SetRenderState(D3DRS_ZENABLE, D3DZB_FALSE);
     dev->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
-    dev->SetRenderState(D3DRS_ZFUNC, D3DCMP_LESSEQUAL);
     dev->SetRenderState(D3DRS_STENCILENABLE, FALSE);
     dev->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
     dev->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
@@ -5839,6 +5879,7 @@ bool RenderVrEyes(IDirect3DDevice9* dev, BYTE* ctx, BYTE** cams, float* fovScale
     bool blurCenterSaved = false;
     memcpy(savedBlurSpeed, blurSpeed, sizeof(savedBlurSpeed));
     if (!g_cfg.vrSpeedBlur || flying) memset(blurSpeed, 0, sizeof(savedBlurSpeed));
+    NoteParticleLists();
     ReverseEyeDepth(dev, true);  // ([VR] FloatDepth) the eyes' and the mirrors'
     // The side mirrors' pictures for this frame, laid on their glass in each eye as it renders (MirrorsIntoEye).
     if (cockpit) RenderMirrors(dev, ctx, cams, fovScale, cam, anchor, pose, fov, pastAnchor);
