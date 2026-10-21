@@ -3281,6 +3281,207 @@ void MoveCockpitCards(const float* anchor)
     }
 }
 
+// The markers over the rivals ([VR]; see game.h kMarkers): the game draws them on its HUD where the cars are on the
+// monitor's picture, so in the headset they stood on the HUD panel, and some in the cockpit's cards. They are drawn
+// over the cars in the eyes instead. The game picks the rivals and their colours as it draws its HUD: those within its
+// camera's field of view (95 degrees) of where the camera looks. It marks them twice, the camera turned as the left
+// eye looks and then turned round (MarkersBegin, MarkersTurn), which takes in every rival within reach whichever way
+// the head turns; the triangles are noted, not drawn (MarkerDrawn), and the eyes draw the last frame's over the cars
+// where they are now, as large as the game draws them on the monitor (some 4 degrees across near by, shrinking to
+// nothing at kMarkerReach).
+float Dot3(const float* a, const float* b);
+
+struct RivalMarker
+{
+    BYTE* car;
+    DWORD colour;
+};
+struct MarkerState
+{
+    std::vector<RivalMarker> next, shown;  // being noted by this frame's HUD, and the last frame's
+    double shownAt = 0;                    // when they were noted
+    float eye[16] = {};                    // the left eye's matrix in the world (rows right, up, forward, place)
+    bool eyeValid = false;
+    float saved[2][16] = {};               // the camera's placement while the HUD marks the cars (kCamMatrixCopy2, kCamMatrix)
+    BYTE* cam = nullptr;
+} g_markers;
+constexpr float kMarkerAbove = 1.4f;  // metres over the car's middle
+constexpr float kMarkerWide = 4.0f;   // degrees across, near by
+constexpr float kMarkerTall = 0.4f;   // its height, of its width
+
+static uintptr_t g_markersFn = fo2::kMarkers, g_markerDrawFn = fo2::kMarkerDraw;
+static BYTE* g_markersCam;  // (the camera, for the second pass's esi)
+
+static void __stdcall MarkersBegin(BYTE* cam)
+{
+    MarkerState& m = g_markers;
+    m.next.clear();
+    m.cam = nullptr;
+    if (!g_hud.active || !m.eyeValid || !cam) return;
+    m.cam = g_markersCam = cam;
+    float* placement[2] = { (float*)(cam + fo2::kCamMatrixCopy2), (float*)(cam + fo2::kCamMatrix) };
+    for (int i = 0; i < 2; i++)
+    {
+        memcpy(m.saved[i], placement[i], sizeof(m.saved[i]));
+        memcpy(placement[i], m.eye, sizeof(m.eye));
+    }
+}
+
+// The camera turned round (about its up), to mark the rivals behind the eyes too: 1 when it was.
+static int __stdcall MarkersTurn()
+{
+    MarkerState& m = g_markers;
+    if (!m.cam) return 0;
+    float turned[16];
+    memcpy(turned, m.eye, sizeof(turned));
+    for (int i = 0; i < 3; i++) turned[i] = -m.eye[i], turned[8 + i] = -m.eye[8 + i];
+    memcpy(m.cam + fo2::kCamMatrixCopy2, turned, sizeof(turned));
+    memcpy(m.cam + fo2::kCamMatrix, turned, sizeof(turned));
+    return 1;
+}
+
+static void __stdcall MarkersEnd()
+{
+    MarkerState& m = g_markers;
+    if (!m.cam) return;
+    memcpy(m.cam + fo2::kCamMatrixCopy2, m.saved[0], sizeof(m.saved[0]));
+    memcpy(m.cam + fo2::kCamMatrix, m.saved[1], sizeof(m.saved[1]));
+    m.cam = nullptr;
+    m.shown.swap(m.next);
+    m.shownAt = NowSeconds();
+}
+
+// At kMarkersCall, instead of kMarkers: the same three arguments, the camera in esi, every register as the game left it;
+// in the headset called again with the camera turned round.
+static __declspec(naked) void MarkersHook()
+{
+    __asm {
+        pushad
+        push esi
+        call MarkersBegin
+        popad
+        push dword ptr [esp + 12]
+        push dword ptr [esp + 12]
+        push dword ptr [esp + 12]
+        call dword ptr [g_markersFn]
+        pushad
+        call MarkersTurn
+        mov [esp + 28], eax
+        popad
+        test eax, eax
+        jz marked
+        push esi
+        mov esi, dword ptr [g_markersCam]
+        push dword ptr [esp + 16]
+        push dword ptr [esp + 16]
+        push dword ptr [esp + 16]
+        call dword ptr [g_markersFn]
+        pop esi
+    marked:
+        pushad
+        call MarkersEnd
+        popad
+        ret 12
+    }
+}
+
+// A rival's triangle (its player in ebx): noted while the camera marks the eyes' cars, and left out of the HUD.
+static int __stdcall MarkerDrawn(BYTE* player, const DWORD* colour)
+{
+    if (!g_markers.cam || !player || !colour) return 1;
+    BYTE* car = *(BYTE**)(player + fo2::kPlayerCar);
+    bool noted = !car;
+    for (const RivalMarker& r : g_markers.next) noted |= r.car == car;  // (marked by both passes)
+    if (!noted) g_markers.next.push_back({ car, *colour });
+    return 0;
+}
+
+// At kMarkerDrawCall, instead of kMarkerDraw (__thiscall, five arguments, the colour's address the fifth).
+static __declspec(naked) void MarkerDrawHook()
+{
+    __asm {
+        push ecx
+        push dword ptr [esp + 24]
+        push ebx
+        call MarkerDrawn
+        pop ecx
+        test eax, eax
+        jz leftOut
+        jmp dword ptr [g_markerDrawFn]
+    leftOut:
+        ret 20
+    }
+}
+
+// In an eye: the last frame's markers over their cars, with the eye's depth (the cockpit and the walls cover them).
+void DrawMarkers(IDirect3DDevice9* dev, BYTE* cam)
+{
+    MarkerState& m = g_markers;
+    if (m.shown.empty() || NowSeconds() - m.shownAt > 0.1 || g_hudLeftOut) return;  // (Hud=2 leaves them out with the HUD)
+    const float* e = (const float*)(cam + fo2::kCamMatrix);  // the eye's
+    float n = *(const float*)(cam + fo2::kCamNear), f = *(const float*)(cam + fo2::kCamFar);
+    float reach = std::max(*(const float*)fo2::kMarkerReach, 1.0f);
+    const xr::EyeFov& fov = g_vrEye.fov;
+    float W = (float)g_vrt.w, H = (float)g_vrt.h;
+    struct V { float x, y, z, rhw; DWORD colour; };
+    std::vector<V> tris;
+    for (const RivalMarker& r : m.shown)
+    {
+        const float* c = (const float*)(r.car + fo2::kCarMatrix) + 12;
+        float d[3] = { c[0] - e[12], c[1] + kMarkerAbove - e[13], c[2] - e[14] };
+        float x = Dot3(d, e), y = Dot3(d, e + 4), z = Dot3(d, e + 8);
+        if (z < n * 1.01f) continue;
+        float wide = 2.0f * tanf(0.5f * kMarkerWide * 3.14159265f / 180.0f) * (1.0f - sqrtf(Dot3(d, d)) / reach);
+        if (wide <= 0.0f) continue;
+        // In the eye's picture: its middle, half its width and height (pixels), pointing down.
+        float px = (x / z - fov.left) / (fov.right - fov.left) * W - 0.5f, py = (fov.up - y / z) / (fov.up - fov.down) * H - 0.5f;
+        float hw = 0.5f * wide / (fov.right - fov.left) * W, hh = 0.5f * wide * kMarkerTall / (fov.up - fov.down) * H;
+        float depth = EyeDepth(n, f, z), rhw = 1.0f / z;
+        // A dark rim (the triangle a little larger behind), then the triangle in its colour.
+        DWORD rim = (r.colour & 0xFF000000) | ((r.colour >> 2) & 0x3F3F3F);
+        float grow = std::max(1.5f, 0.12f * hw);
+        tris.push_back({ px - hw - grow, py - hh - 0.5f * grow, depth, rhw, rim });
+        tris.push_back({ px + hw + grow, py - hh - 0.5f * grow, depth, rhw, rim });
+        tris.push_back({ px, py + hh + grow, depth, rhw, rim });
+        tris.push_back({ px - hw, py - hh, depth, rhw, r.colour });
+        tris.push_back({ px + hw, py - hh, depth, rhw, r.colour });
+        tris.push_back({ px, py + hh, depth, rhw, r.colour });
+    }
+    if (tris.empty()) return;
+    IDirect3DStateBlock9* saved = nullptr;
+    if (FAILED(dev->CreateStateBlock(D3DSBT_ALL, &saved))) return;
+    dev->SetVertexShader(nullptr);
+    dev->SetPixelShader(nullptr);
+    dev->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
+    dev->SetTexture(0, nullptr);
+    dev->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG2);
+    dev->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
+    dev->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG2);
+    dev->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE);
+    dev->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
+    dev->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
+    dev->SetRenderState(D3DRS_ZENABLE, D3DZB_TRUE);
+    dev->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+    dev->SetRenderState(D3DRS_ZFUNC, D3DCMP_LESSEQUAL);
+    dev->SetRenderState(D3DRS_STENCILENABLE, FALSE);
+    dev->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+    dev->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+    dev->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+    dev->SetRenderState(D3DRS_BLENDOP, D3DBLENDOP_ADD);
+    dev->SetRenderState(D3DRS_SEPARATEALPHABLENDENABLE, FALSE);
+    dev->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+    dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    dev->SetRenderState(D3DRS_FILLMODE, D3DFILL_SOLID);
+    dev->SetRenderState(D3DRS_LIGHTING, FALSE);
+    dev->SetRenderState(D3DRS_FOGENABLE, FALSE);
+    dev->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
+    dev->SetRenderState(D3DRS_COLORWRITEENABLE, 0xF);
+    dev->SetRenderState(D3DRS_SRGBWRITEENABLE, FALSE);
+    dev->DrawPrimitiveUP(D3DPT_TRIANGLELIST, (UINT)(tris.size() / 3), tris.data(), sizeof(V));
+    saved->Apply();
+    saved->Release();
+}
+
 void DrawCockpitCards(IDirect3DDevice9* dev, BYTE* cam, int eye)
 {
     BYTE* player = *(BYTE**)fo2::kLocalPlayer;
@@ -3638,7 +3839,6 @@ void MirrorLeftEye(IDirect3DDevice9* dev, const xr::EyeFov& fov)
 // (SteadyRoom: the left eye sees only some 40 degrees right of straight ahead). Near the edge of the eye's picture the
 // camera is held back from it, so it eases into following the head as close as it must. The HUD's panel is drawn where it
 // hangs in the headset (EndHudCapture); the cockpit's instruments are in the eye's picture already.
-float Dot3(const float* a, const float* b);
 
 // An orientation: the unit quaternion (x, y, z, w) of the turn taking the game's axes (x right, y up, z forward) to a
 // pose's, relative to the recenter origin.
@@ -5646,6 +5846,11 @@ bool RenderVrEyes(IDirect3DDevice9* dev, BYTE* ctx, BYTE** cams, float* fovScale
     {
         float e[16];
         BuildEyeMatrix(anchor, pose[eye], e);
+        if (eye == 0)
+        {
+            memcpy(g_markers.eye, e, sizeof(e));  // (the HUD's markers chosen as this eye looks)
+            g_markers.eyeValid = true;
+        }
         float ev[16];
         InvertCamera(e, ev);
         memcpy(camM, e, sizeof(e));
@@ -5684,6 +5889,7 @@ bool RenderVrEyes(IDirect3DDevice9* dev, BYTE* ctx, BYTE** cams, float* fovScale
         g_mirrorEye.cam = nullptr;
         prof::TraceDraws(false);  // a frame trace lists the left eye's draws only
         if (cockpit) DrawCockpitCards(dev, cam, eye);
+        DrawMarkers(dev, cam);
         g_vrEye.active = false;
         IDirect3DSurface9* s = nullptr;
         if (SUCCEEDED(g_vrt.tex[eye]->GetSurfaceLevel(0, &s)))
@@ -5870,6 +6076,9 @@ bool InstallRenderHooks()
                                                   : "the eyes go into the driver's head when he is thrown out (EjectView=2)");
     if (g_cfg.vrEnabled && !PatchCall(fo2::kSampleAnimCall, fo2::kSampleAnim, (const void*)&SampleAnimHook))
         Log("drivers: the animation call differs - the hands move in the animation's steps");
+    if (g_cfg.vrEnabled && (!PatchCall(fo2::kMarkersCall, fo2::kMarkers, (const void*)&MarkersHook) ||
+                            !PatchCall(fo2::kMarkerDrawCall, fo2::kMarkerDraw, (const void*)&MarkerDrawHook)))
+        Log("markers: the HUD's calls differ - the rivals' markers stay on the HUD");
     ok &= PatchPointer(fo2::kSlotSetViewport, fo2::kSetViewport, (const void*)&SetViewportHook);
     ok &= PatchPointer(fo2::kSlotSetCamera, fo2::kSetCamera, (const void*)&SetCameraHook);
     ok &= PatchPointer(fo2::kSlotSetFrustum, fo2::kSetFrustum, (const void*)&SetFrustumHook);

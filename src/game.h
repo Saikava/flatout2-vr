@@ -90,6 +90,18 @@ constexpr uintptr_t kLensFlare = 0x596980;
 // that has the track and its objects but not the cars.
 constexpr int kFlareSun = 0x15C;
 
+// The markers over the rivals (in a derby): the HUD (0x4B88D0) calls 0x4C0200 at kMarkersCall, __stdcall(hud,
+// the local player, the largest angle off the camera's direction), ret 0xC, the camera in esi. For each rival not
+// wrecked, its car within kMarkerReach metres (float) of the camera and in front of it (kCamMatrixCopy2),
+// it projects a point over the car with the camera's matrix and frustum (kCamMatrix, kCamFrustum) and draws a
+// triangle there, tinted by the car's damage (green to yellow to red at 1/3 and 2/3), smaller the further the car,
+// by 0x4B4BF0 at kMarkerDrawCall: __thiscall(x, y, ?, size, const DWORD* colour), ret 0x14, the rival in ebx.
+constexpr uintptr_t kMarkersCall = 0x4BA943;
+constexpr uintptr_t kMarkers = 0x4C0200;
+constexpr uintptr_t kMarkerDrawCall = 0x4C0AE8;
+constexpr uintptr_t kMarkerDraw = 0x4B4BF0;
+constexpr uintptr_t kMarkerReach = 0x8DC6AC;
+
 // The sun's glow: the sky pass (0x592470) calls 0x596540 with the camera in esi and the track's flare
 // in ebx. It projects the sun with the camera's own frustum (kCamFrustum) and draws the glow there as
 // a flat sprite, sized by the camera's field of view (kCamFov).
