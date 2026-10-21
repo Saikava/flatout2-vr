@@ -2557,6 +2557,23 @@ constexpr CockpitCard kCockpitCards[kCardCount] = {
     // into the map's place and past the damage's bar)
     { -0.20f, 0.785f, 0.50f, 1.10f, 0.000f, 0.740f, 0.620f, 0.970f, 24.59f, 62.18f, 15.50f, 7.53f },
 };
+// A derby's HUD is laid out otherwise (kGfEventType): the speed as a number over two long bars, the nitro's and the
+// car's damage (the nitro's flames at its left end); the cars remaining and the contact timer where the position and
+// the lap are, the timer's words longer than the lap's, reaching to where the rival's portrait is on the band; the
+// arena's map a mesh of its own on a larger canvas, the arena where the track puts it on it. Its cards: the gauges a
+// strip in the wheel's opening, the rival's card further right, the map's the canvas as large as it fits below that.
+constexpr CockpitCard kDerbyCards[kCardCount] = {
+    // gauges: the speed and the bars
+    { 0.60f, 0.70f, 1.20f, 1.10f, 0.640f, 0.800f, 1.000f, 0.975f, -9.75f, 8.25f, 11.50f, 6.58f },
+    // the cars remaining
+    { -0.10f, -0.10f, 0.30f, 0.16f, 0.000f, 0.000f, 0.240f, 0.150f, -31.54f, -16.81f, 12.88f, 7.68f },
+    // the contact timer
+    { 0.70f, -0.10f, 1.10f, 0.16f, 0.760f, 0.000f, 1.000f, 0.150f, 16.62f, 31.35f, 12.88f, 7.68f },
+    // the arena's map
+    { -0.10f, 0.38f, 0.40f, 0.93f, -0.060f, 0.385f, 0.345f, 0.925f, 25.16f, 39.16f, 7.29f, -3.21f },
+    // the rival's name and damage (and the crash bonus)
+    { -0.20f, 0.785f, 0.50f, 1.10f, 0.000f, 0.740f, 0.620f, 0.970f, 31.59f, 69.18f, 15.50f, 7.53f },
+};
 constexpr float kCardsBand = 0.732f;      // the band's radius (metres), where the dashboard lets it be
 constexpr float kCardDepthPull = 0.015f;  // metres nearer in depth than they are, not to sink into the dashboard
 
@@ -2643,6 +2660,7 @@ void ReadMesh(BYTE* car, BYTE* node, std::vector<float>& tris, std::vector<int>&
 struct CockpitLayout
 {
     BYTE* car = nullptr;
+    bool derby = false;           // laid out for a derby's HUD (kDerbyCards)
     bool on[kCardCount] = {};     // the card is in the car
     float corner[kCardCount][4][3];  // top left, top right, bottom left, bottom right, in the car's axes
     float centre[3];              // the band's middle, in the car's axes
@@ -2650,6 +2668,15 @@ struct CockpitLayout
     float view[kCardCount][4];    // each card on it: its left and right (azimuth), top and bottom (elevation), radians
 };
 CockpitLayout g_dash;
+
+bool DerbyEvent()
+{
+    const BYTE* gf = *(const BYTE* const*)fo2::kGameFlow;
+    return gf && *(const int*)(gf + fo2::kGfEventType) == 3;
+}
+
+// The cards as the layout has them (a race's or a derby's).
+const CockpitCard* Cards() { return g_dash.derby ? kDerbyCards : kCockpitCards; }
 
 // Cards placed by hand with the Touch controllers ([Test] MoveCards, MoveCockpitCards): each one's middle
 // in the car's axes and its height (metres), kept for the car's model in scripts\FO2VR_cards.ini (a section
@@ -2753,7 +2780,7 @@ void BendCard(int k, const float* mid, float height)
     float az, el, d;
     BandAngles(mid, az, el, d);
     d = std::max(d, 0.05f);
-    float ah = 2.0f * atanf(0.5f * height / d), aw = 2.0f * atanf(0.5f * height * kCockpitCards[k].Aspect() / d);
+    float ah = 2.0f * atanf(0.5f * height / d), aw = 2.0f * atanf(0.5f * height * Cards()[k].Aspect() / d);
     float* v = g_dash.view[k];
     v[0] = az - 0.5f * aw, v[1] = az + 0.5f * aw, v[2] = el + 0.5f * ah, v[3] = el - 0.5f * ah;
     BandCorners(k);
@@ -2820,6 +2847,7 @@ void LayCockpitCards(BYTE* car, BYTE* wheel)
     double t0 = NowSeconds();
     g_dash = CockpitLayout();
     g_dash.car = car;
+    g_dash.derby = DerbyEvent();
     const float* c = (const float*)(car + fo2::kCarMatrix);
     if (g_cabin.car != car)
     {
@@ -2842,7 +2870,7 @@ void LayCockpitCards(BYTE* car, BYTE* wheel)
     int nearest = -1;
     for (int k = 0; k < kCardCount; k++)
     {
-        const CockpitCard& card = kCockpitCards[k];
+        const CockpitCard& card = Cards()[k];
         float* v = g_dash.view[k];
         v[0] = hubAz + card.left * kDeg, v[1] = hubAz + card.right * kDeg, v[2] = hubEl + card.top * kDeg, v[3] = hubEl + card.bottom * kDeg;
         g_dash.on[k] = true;
@@ -2867,8 +2895,9 @@ void LayCockpitCards(BYTE* car, BYTE* wheel)
         BandCorners(k);
         if (g_places[k].set) PlaceCard(k), placed++;
     }
-    Log("cockpit: %ls (%.32s): the cards turned to the wheel's hub (%+.1f %+.1f deg from the driver's eyes at %.3f %.3f %.3f) on a band "
-        "%.3f m round them%s%s (%d placed by hand, %.1f ms)", CarModel(car).c_str(), (const char*)(car + fo2::kCarName), hubAz / kDeg, hubEl / kDeg,
+    Log("cockpit: %ls (%.32s): the %s cards turned to the wheel's hub (%+.1f %+.1f deg from the driver's eyes at %.3f %.3f %.3f) on a band "
+        "%.3f m round them%s%s (%d placed by hand, %.1f ms)", CarModel(car).c_str(), (const char*)(car + fo2::kCarName),
+        g_dash.derby ? "derby's" : "race's", hubAz / kDeg, hubEl / kDeg,
         g_dash.centre[0], g_dash.centre[1], g_dash.centre[2], radius, nearest >= 0 ? ", as near as the body at the " : "",
         nearest >= 0 ? kCardNames[nearest] : "", placed, 1000.0 * (NowSeconds() - t0));
 }
@@ -2904,7 +2933,7 @@ int CardOfBox(const ScreenBox& b)
     float x0 = b.x0 / g_hud.w, x1 = b.x1 / g_hud.w, y0 = b.y0 / g_hud.h, y1 = b.y1 / g_hud.h;
     for (int k : { kCardRival, kCardGauges, kCardPosition, kCardLap, kCardMap })
     {
-        const CockpitCard& c = kCockpitCards[k];
+        const CockpitCard& c = Cards()[k];
         if (x0 >= c.du0 && x1 <= c.du1 && y0 >= c.dv0 && y1 <= c.dv1) return k;
     }
     return -1;
@@ -2921,7 +2950,7 @@ void LogStrayHudDraw(const void* stack, const ScreenBox& b, int sprites)
     float u = 0.5f * (b.x0 + b.x1) / g_hud.w, v = 0.5f * (b.y0 + b.y1) / g_hud.h;
     for (int k : { kCardRival, kCardGauges, kCardPosition, kCardLap, kCardMap })
     {
-        const CockpitCard& c = kCockpitCards[k];
+        const CockpitCard& c = Cards()[k];
         if (!g_hudRoute[k] || u < c.du0 || u > c.du1 || v < c.dv0 || v > c.dv1) continue;
         unsigned ret[3];
         prof::GameCallers(stack, ret);
@@ -3260,8 +3289,8 @@ void DrawCockpitCards(IDirect3DDevice9* dev, BYTE* cam, int eye)
     if (!wheel || !CockpitCardsOn() || g_hudLeftOut) return;  // (Hud=2 leaves them out with the panel)
     const float* c = (const float*)(car + fo2::kCarMatrix);  // the car's axes
     const float* e = (const float*)(cam + fo2::kCamMatrix);  // the eye's
-    // Laid out once the car has its driver's eyes (from the driver's posed head).
-    if (g_dash.car != car && car == g_eyeCar)
+    // Laid out once the car has its driver's eyes (from the driver's posed head), and for the event's HUD.
+    if ((g_dash.car != car || g_dash.derby != DerbyEvent()) && car == g_eyeCar)
     {
         LoadCardPlaces(car);
         LayCockpitCards(car, wheel);
@@ -3305,7 +3334,7 @@ void DrawCockpitCards(IDirect3DDevice9* dev, BYTE* cam, int eye)
     };
     for (int k = 0; k < kCardCount; k++)
     {
-        const CockpitCard& card = kCockpitCards[k];
+        const CockpitCard& card = Cards()[k];
         if (!g_dash.on[k] || !g_hudRoute[k]) continue;
         float p[2 * (kMaxColumns + 1)][3];  // top and bottom of each column
         int cols;

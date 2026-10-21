@@ -501,6 +501,7 @@ constexpr int kCameraInside = 4;
 // ---- game state -----------------------------------------------------------------------------
 constexpr uintptr_t kGameFlow = 0x8E8410;  // GameFlow*
 constexpr int kGameState = 0x458;          // 1 = menu, 2 = race
+constexpr int kGfEventType = 0x4AC;        // 3: a derby (0: a race, a single event); the HUD lays itself out by it
 constexpr int kRaceState = 0x91C;          // 8 = racing
 
 }  // namespace fo2
