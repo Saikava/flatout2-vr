@@ -19,8 +19,11 @@ set(VULKAN_DIR "${CMAKE_SOURCE_DIR}/third_party/vulkan")
 add_library(FO2VR SHARED
   src/background.cpp
   src/d3dcreate.cpp
+  src/dialog.cpp
   src/dllmain.cpp
   src/eyeshare.cpp
+  src/fo2vr.manifest
+  src/largeaddress.cpp
   src/pacing.cpp
   src/profile.cpp
   src/record.cpp

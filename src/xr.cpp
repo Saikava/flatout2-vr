@@ -1,5 +1,7 @@
 #include "xr.h"
 
+#include "background.h"
+#include "dialog.h"
 #include "dxvk_interop.h"
 #include "util.h"
 
@@ -14,6 +16,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <cwctype>
 #include <string>
 #include <vector>
 
@@ -105,11 +108,33 @@ void DefaultViews()
     }
 }
 
+// The results a runtime's start may end with, by name (xrResultToString needs an instance).
+const char* ResultName(XrResult r)
+{
+    switch (r)
+    {
+    case XR_ERROR_RUNTIME_FAILURE: return "XR_ERROR_RUNTIME_FAILURE";
+    case XR_ERROR_RUNTIME_UNAVAILABLE: return "XR_ERROR_RUNTIME_UNAVAILABLE";
+    case XR_ERROR_FORM_FACTOR_UNAVAILABLE: return "XR_ERROR_FORM_FACTOR_UNAVAILABLE";
+    case XR_ERROR_FORM_FACTOR_UNSUPPORTED: return "XR_ERROR_FORM_FACTOR_UNSUPPORTED";
+    case XR_ERROR_INSTANCE_LOST: return "XR_ERROR_INSTANCE_LOST";
+    case XR_ERROR_INITIALIZATION_FAILED: return "XR_ERROR_INITIALIZATION_FAILED";
+    case XR_ERROR_EXTENSION_NOT_PRESENT: return "XR_ERROR_EXTENSION_NOT_PRESENT";
+    case XR_ERROR_API_VERSION_UNSUPPORTED: return "XR_ERROR_API_VERSION_UNSUPPORTED";
+    case XR_ERROR_LIMIT_REACHED: return "XR_ERROR_LIMIT_REACHED";
+    case XR_ERROR_OUT_OF_MEMORY: return "XR_ERROR_OUT_OF_MEMORY";
+    default: return "";
+    }
+}
+
 bool Check(XrResult r, const char* what)
 {
     if (XR_SUCCEEDED(r)) return true;
     char name[XR_MAX_RESULT_STRING_SIZE] = "";
-    if (g_instance) xrResultToString(g_instance, r, name);
+    if (g_instance)
+        xrResultToString(g_instance, r, name);
+    else
+        strcpy(name, ResultName(r));
     Log("xr: %s failed: %d %s", what, (int)r, name);
     return false;
 }
@@ -642,6 +667,255 @@ void EndFrame(const XrCompositionLayerBaseHeader* layer, const XrCompositionLaye
     g_frameOpen = false;
 }
 
+// ---- The runtime's start -----------------------------------------------------------------------------------------
+// xrCreateInstance and xrGetSystem run on a thread of their own. A runtime that cannot start may take half a minute to
+// say so, or never return, and the game stood still with nothing on the screen: SteamVR 2.18 does not come up when
+// its vrserver.exe runs elevated (started by an elevated Virtual Desktop Streamer, or left by an earlier start), its
+// bootstrapper cannot open it and gives up after 30 s, and xrCreateInstance fails (XR_ERROR_RUNTIME_FAILURE) or
+// waits on. After a few seconds a window says what the game waits for and goes away by itself when the runtime is
+// ready; when the start fails, it says why and what to do, with Try again, Play without VR and Quit.
+std::wstring g_runtimePath;  // the runtime's .json (empty: the system's default runtime)
+
+struct RuntimeStart
+{
+    LONG refs = 2;                         // the thread's and the game's
+    HANDLE done = CreateEventW(nullptr, TRUE, FALSE, nullptr);  // set when the thread has its results
+    double began = NowSeconds();
+    XrInstance instance = XR_NULL_HANDLE;  // the results, read once done is set
+    XrSystemId system = XR_NULL_SYSTEM_ID;
+    std::wstring problem;                  // why it failed, for the player (empty: ready)
+
+    bool Done() const { return WaitForSingleObject(done, 0) == WAIT_OBJECT_0; }
+    // The last one out closes an instance nobody took (the game went on without VR while the runtime started).
+    void Release()
+    {
+        if (InterlockedDecrement(&refs) > 0) return;
+        if (instance)
+        {
+            Log("xr: the runtime got ready after the game went on without VR - closed");
+            xrDestroyInstance(instance);
+        }
+        CloseHandle(done);
+        delete this;
+    }
+};
+
+std::wstring RuntimeName()
+{
+    std::wstring r = g_cfg.vrRuntime;
+    for (wchar_t& c : r) c = towlower(c);
+    if (r == L"steamvr" || r.find(L"steamxr") != std::wstring::npos) return L"SteamVR";
+    if (r.find(L"virtualdesktop") != std::wstring::npos) return L"Virtual Desktop";
+    if (r.find(L"oculus") != std::wstring::npos) return L"the Oculus runtime";
+    return L"the VR runtime";
+}
+
+std::wstring Sentence(std::wstring s)
+{
+    if (!s.empty()) s[0] = towupper(s[0]);
+    return s;
+}
+
+// What to do while the game waits for the runtime, or when it failed.
+std::wstring RuntimeHint()
+{
+    std::wstring name = RuntimeName();
+    if (name == L"SteamVR")
+        return L"Start SteamVR if it does not run, and wait until it shows the headset. If SteamVR hangs while it starts, "
+               L"close it (end vrserver.exe in the Task Manager if it stays) and start it again from Steam.";
+    if (name == L"Virtual Desktop") return L"Connect the headset in Virtual Desktop (its Streamer runs on this PC).";
+    return L"Start the VR runtime and connect the headset.";
+}
+
+std::wstring ResultText(XrResult r)
+{
+    wchar_t buf[64];
+    const char* name = ResultName(r);
+    if (*name)
+        swprintf(buf, 64, L"%hs", name);
+    else
+        swprintf(buf, 64, L"error %d", (int)r);
+    return buf;
+}
+
+DWORD WINAPI RuntimeThread(void* param)
+{
+    RuntimeStart* s = (RuntimeStart*)param;
+    const char* exts[] = { XR_KHR_VULKAN_ENABLE_EXTENSION_NAME };
+    XrInstanceCreateInfo ci = { XR_TYPE_INSTANCE_CREATE_INFO };
+    strcpy(ci.applicationInfo.applicationName, "FlatOut 2 VR");
+    ci.applicationInfo.applicationVersion = 1;
+    strcpy(ci.applicationInfo.engineName, "FO2VR");
+    ci.applicationInfo.apiVersion = XR_API_VERSION_1_0;
+    ci.enabledExtensionCount = 1;
+    ci.enabledExtensionNames = exts;
+    XrInstance instance = XR_NULL_HANDLE;
+    XrSystemId system = XR_NULL_SYSTEM_ID;
+    std::wstring problem;
+    XrResult r = xrCreateInstance(&ci, &instance);
+    if (!Check(r, "xrCreateInstance"))
+    {
+        instance = XR_NULL_HANDLE;
+        // The loader says unavailable also when it finds the runtime but cannot load it.
+        if (r == XR_ERROR_RUNTIME_UNAVAILABLE && !g_runtimePath.empty() && GetFileAttributesW(g_runtimePath.c_str()) == INVALID_FILE_ATTRIBUTES)
+            problem = Sentence(RuntimeName()) + L" was not found (" + g_runtimePath + L"). The runtime is chosen by Runtime= in scripts\\FO2VR.ini.";
+        else if (r == XR_ERROR_RUNTIME_UNAVAILABLE)
+            problem = Sentence(RuntimeName()) + L" could not be loaded" + (g_runtimePath.empty() ? L"" : L" (" + g_runtimePath + L")") +
+                      L". Is it installed? The runtime is chosen by Runtime= in scripts\\FO2VR.ini.";
+        else
+            problem = Sentence(RuntimeName()) + L" did not start (" + ResultText(r) + L").\n\n" + RuntimeHint();
+    }
+    else
+    {
+        XrInstanceProperties ip = { XR_TYPE_INSTANCE_PROPERTIES };
+        xrGetInstanceProperties(instance, &ip);
+        Log("xr: runtime %s %u.%u.%u", ip.runtimeName, XR_VERSION_MAJOR(ip.runtimeVersion), XR_VERSION_MINOR(ip.runtimeVersion),
+            XR_VERSION_PATCH(ip.runtimeVersion));
+        XrSystemGetInfo si = { XR_TYPE_SYSTEM_GET_INFO };
+        si.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
+        // SteamVR reports the headset a few seconds after it starts.
+        r = XR_ERROR_FORM_FACTOR_UNAVAILABLE;
+        for (int i = 0; i < 40 && r == XR_ERROR_FORM_FACTOR_UNAVAILABLE; i++)
+        {
+            r = xrGetSystem(instance, &si, &system);
+            if (r == XR_ERROR_FORM_FACTOR_UNAVAILABLE) Sleep(250);
+        }
+        if (!Check(r, "xrGetSystem (is the headset connected?)"))
+        {
+            problem = r == XR_ERROR_FORM_FACTOR_UNAVAILABLE ? Sentence(RuntimeName()) + L" runs but has no headset.\n\n" + RuntimeHint()
+                                                            : Sentence(RuntimeName()) + L" gave no headset (" + ResultText(r) + L").\n\n" + RuntimeHint();
+            xrDestroyInstance(instance);
+            instance = XR_NULL_HANDLE;
+        }
+    }
+    s->instance = instance;
+    s->system = system;
+    s->problem = problem;
+    SetEvent(s->done);
+    s->Release();
+    return 0;
+}
+
+RuntimeStart* BeginRuntimeStart()
+{
+    RuntimeStart* s = new RuntimeStart;
+    HANDLE thread = CreateThread(nullptr, 0, RuntimeThread, s, 0, nullptr);
+    if (thread)
+        CloseHandle(thread);
+    else
+        RuntimeThread(s);
+    return s;
+}
+
+enum { kTryAgain = 100, kWithoutVr, kQuit };
+enum class StartChoice { NoWindow, Ready, WithoutVr, Quit };
+
+struct StartDialog
+{
+    RuntimeStart* start = nullptr;
+    int seconds = -1;  // shown on the waiting page
+    bool failedPage = false, ready = false;
+    std::wstring waitInstruction, waitContent, failContent;
+    TASKDIALOG_BUTTON waitButtons[2] = { { kWithoutVr, L"Play without VR" }, { kQuit, L"Quit the game" } };
+    TASKDIALOG_BUTTON failButtons[3] = { { kTryAgain, L"Try again" }, { kWithoutVr, L"Play without VR" }, { kQuit, L"Quit the game" } };
+    TASKDIALOGCONFIG waiting = { sizeof(TASKDIALOGCONFIG) }, failed = { sizeof(TASKDIALOGCONFIG) };
+};
+
+void ShowWaiting(StartDialog& d, HWND hwnd)
+{
+    d.failedPage = false;
+    d.seconds = (int)(NowSeconds() - d.start->began);
+    d.waitContent = L"The game goes on in VR as soon as " + RuntimeName() + L" is ready (" + std::to_wstring(d.seconds) + L" s).\n\n" +
+                    RuntimeHint();
+    d.waiting.pszContent = d.waitContent.c_str();
+    if (hwnd) SendMessageW(hwnd, TDM_NAVIGATE_PAGE, 0, (LPARAM)&d.waiting);
+}
+
+void ShowFailed(StartDialog& d, HWND hwnd)
+{
+    d.failedPage = true;
+    d.failContent = d.start->problem + L"\n\nDetails: scripts\\FO2VR.log";
+    d.failed.pszContent = d.failContent.c_str();
+    if (hwnd) SendMessageW(hwnd, TDM_NAVIGATE_PAGE, 0, (LPARAM)&d.failed);
+}
+
+HRESULT CALLBACK StartDialogProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM, LONG_PTR data)
+{
+    StartDialog& d = *(StartDialog*)data;
+    switch (msg)
+    {
+    case TDN_CREATED:
+        // Over the game's window, which may cover the screen.
+        SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+        SetForegroundWindow(hwnd);
+        break;
+    case TDN_TIMER:
+        if (d.failedPage) break;
+        if (d.start->Done())
+        {
+            if (!d.start->problem.empty())
+                ShowFailed(d, hwnd);
+            else
+            {
+                d.ready = true;
+                SendMessageW(hwnd, TDM_CLICK_BUTTON, IDCANCEL, 0);
+            }
+        }
+        else if ((int)(NowSeconds() - d.start->began) != d.seconds)
+        {
+            ShowWaiting(d, nullptr);
+            SendMessageW(hwnd, TDM_SET_ELEMENT_TEXT, TDE_CONTENT, (LPARAM)d.waitContent.c_str());
+        }
+        break;
+    case TDN_BUTTON_CLICKED:
+        if (wp == kTryAgain)
+        {
+            Log("xr: the runtime's start tried again");
+            d.start->Release();
+            d.start = BeginRuntimeStart();
+            ShowWaiting(d, hwnd);
+            return S_FALSE;  // the window stays
+        }
+        break;
+    }
+    return S_OK;
+}
+
+// The window while the game waits for the runtime, or after it failed. start may be replaced by a new one (Try again).
+StartChoice AskAboutRuntime(RuntimeStart*& start)
+{
+    StartDialog d;
+    d.start = start;
+    d.waitInstruction = L"Waiting for " + RuntimeName() + L"...";
+    for (TASKDIALOGCONFIG* c : { &d.waiting, &d.failed })
+    {
+        c->dwFlags = TDF_ALLOW_DIALOG_CANCELLATION | TDF_CALLBACK_TIMER;
+        c->pszWindowTitle = L"FlatOut 2 VR";
+        c->pfCallback = StartDialogProc;
+        c->lpCallbackData = (LONG_PTR)&d;
+    }
+    d.waiting.pszMainIcon = TD_INFORMATION_ICON;
+    d.waiting.pszMainInstruction = d.waitInstruction.c_str();
+    d.waiting.cButtons = 2;
+    d.waiting.pButtons = d.waitButtons;
+    d.waiting.nDefaultButton = kWithoutVr;
+    d.failed.pszMainIcon = TD_WARNING_ICON;
+    d.failed.pszMainInstruction = L"VR did not start";
+    d.failed.cButtons = 3;
+    d.failed.pButtons = d.failButtons;
+    d.failed.nDefaultButton = kTryAgain;
+    if (start->Done())
+        ShowFailed(d, nullptr);
+    else
+        ShowWaiting(d, nullptr);
+    int button = 0;
+    HRESULT hr = ShowTaskDialog(d.failedPage ? d.failed : d.waiting, &button);
+    start = d.start;
+    if (FAILED(hr)) return StartChoice::NoWindow;
+    if (d.ready) return StartChoice::Ready;
+    return button == kQuit ? StartChoice::Quit : StartChoice::WithoutVr;  // (or the window closed)
+}
+
 }  // namespace
 
 // [Test] FakeHeadset: no runtime at all. The session counts as running, never has a frame, and its
@@ -675,6 +949,7 @@ bool InitInstance()
     if (_wcsicmp(runtime.c_str(), L"default") != 0 && !runtime.empty())
     {
         SetEnvironmentVariableW(L"XR_RUNTIME_JSON", runtime.c_str());
+        g_runtimePath = runtime;
         Log("xr: runtime %ls", runtime.c_str());
     }
     std::wstring loader = ModuleDir() + L"openxr_loader.dll";
@@ -683,35 +958,35 @@ bool InitInstance()
         Log("xr: cannot load %ls (error %u)", loader.c_str(), (unsigned)GetLastError());
         return false;
     }
-    const char* exts[] = { XR_KHR_VULKAN_ENABLE_EXTENSION_NAME };
-    XrInstanceCreateInfo ci = { XR_TYPE_INSTANCE_CREATE_INFO };
-    strcpy(ci.applicationInfo.applicationName, "FlatOut 2 VR");
-    ci.applicationInfo.applicationVersion = 1;
-    strcpy(ci.applicationInfo.engineName, "FO2VR");
-    ci.applicationInfo.apiVersion = XR_API_VERSION_1_0;
-    ci.enabledExtensionCount = 1;
-    ci.enabledExtensionNames = exts;
-    if (!Check(xrCreateInstance(&ci, &g_instance), "xrCreateInstance")) return false;
-    XrInstanceProperties ip = { XR_TYPE_INSTANCE_PROPERTIES };
-    xrGetInstanceProperties(g_instance, &ip);
-    Log("xr: runtime %s %u.%u.%u", ip.runtimeName, XR_VERSION_MAJOR(ip.runtimeVersion), XR_VERSION_MINOR(ip.runtimeVersion),
-        XR_VERSION_PATCH(ip.runtimeVersion));
-
-    XrSystemGetInfo si = { XR_TYPE_SYSTEM_GET_INFO };
-    si.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
-    // SteamVR reports the headset a few seconds after it starts.
-    XrResult sr = XR_ERROR_FORM_FACTOR_UNAVAILABLE;
-    for (int i = 0; i < 40 && sr == XR_ERROR_FORM_FACTOR_UNAVAILABLE; i++)
+    // Most starts take a second or two; a runtime that keeps the game waiting longer, or fails, gets the window
+    // (not in background mode: tests wait as before).
+    RuntimeStart* start = BeginRuntimeStart();
+    WaitForSingleObject(start->done, 3000);
+    if (!start->Done() || !start->problem.empty())
     {
-        sr = xrGetSystem(g_instance, &si, &g_system);
-        if (sr == XR_ERROR_FORM_FACTOR_UNAVAILABLE) Sleep(250);
+        StartChoice choice = BackgroundMode() ? StartChoice::NoWindow : AskAboutRuntime(start);
+        if (choice == StartChoice::NoWindow) WaitForSingleObject(start->done, INFINITE);
+        if (choice == StartChoice::Quit)
+        {
+            Log("xr: quit at the runtime's start, by the player's choice");
+            TerminateProcess(GetCurrentProcess(), 0);
+        }
+        if (choice == StartChoice::WithoutVr)
+        {
+            Log("xr: the game goes on without VR, by the player's choice");
+            start->Release();
+            return false;
+        }
     }
-    if (!Check(sr, "xrGetSystem (is the headset connected?)"))
+    if (!start->problem.empty())
     {
-        xrDestroyInstance(g_instance);
-        g_instance = XR_NULL_HANDLE;
+        start->Release();
         return false;
     }
+    g_instance = start->instance;
+    g_system = start->system;
+    start->instance = XR_NULL_HANDLE;
+    start->Release();
     XrSystemProperties sp = { XR_TYPE_SYSTEM_PROPERTIES };
     xrGetSystemProperties(g_instance, g_system, &sp);
     XrViewConfigurationView views[2] = { { XR_TYPE_VIEW_CONFIGURATION_VIEW }, { XR_TYPE_VIEW_CONFIGURATION_VIEW } };

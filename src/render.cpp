@@ -8,6 +8,7 @@
 #include "dxvk_interop.h"
 #include "eyeshare.h"
 #include "game.h"
+#include "largeaddress.h"
 #include "mirrorglass.h"
 #include "pacing.h"
 #include "profile.h"
@@ -2280,6 +2281,7 @@ int __fastcall EnginePresentHook(void* self, void*)
 
     if (now - g_lastLog >= g_cfg.logIntervalSeconds && g_stats.frames > 0)
     {
+        NoteAddressSpace();
         double span = now - g_lastLog;
         if (g_lastLog > 0 && InRace())
         {

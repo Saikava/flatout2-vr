@@ -1,5 +1,6 @@
 #include "background.h"
 #include "d3dcreate.h"
+#include "largeaddress.h"
 #include "pacing.h"
 #include "record.h"
 #include "render.h"
@@ -31,6 +32,7 @@ static bool SettingsDialog()
 static void Init()
 {
     if (SettingsDialog()) return;
+    WaitForOldGame();
     LogInit(ModuleDir() + L"FO2VR.log");
     LoadConfig();
 

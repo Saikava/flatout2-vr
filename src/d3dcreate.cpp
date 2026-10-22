@@ -3,6 +3,7 @@
 #include "background.h"
 #include "dxvk_interop.h"
 #include "game.h"
+#include "largeaddress.h"
 #include "render.h"
 #include "util.h"
 #include "xr.h"
@@ -66,6 +67,7 @@ IDirect3D9* WINAPI Direct3DCreate9Hook(UINT sdk)
     if (g_cfg.vrEnabled && !g_xrTried)
     {
         g_xrTried = true;
+        EnsureLargeAddressAware();
         if (!xr::InitInstance()) Log("VR not available - the game runs on the monitor only");
         if (g_cfg.vrFloatDepth) UseFloatDepth();
     }

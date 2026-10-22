@@ -179,6 +179,7 @@ void LoadConfig()
     g_cfg.vrMirrors = std::clamp((int)GetPrivateProfileIntW(L"VR", L"Mirrors", d.vrMirrors, p), 0, 2);
     g_cfg.vrMirrorRadius = IniFloat(p, L"VR", L"MirrorRadius", d.vrMirrorRadius);
     g_cfg.vrMirrorRadius = g_cfg.vrMirrorRadius > 0.0f ? std::max(g_cfg.vrMirrorRadius, 0.3f) : 0.0f;
+    g_cfg.vrLargeAddressAware = GetPrivateProfileIntW(L"VR", L"LargeAddressAware", d.vrLargeAddressAware, p) != 0;
     g_cfg.keyRecenter = GetPrivateProfileIntW(L"Keys", L"Recenter", d.keyRecenter, p);
     g_cfg.logIntervalSeconds = IniFloat(p, L"Log", L"IntervalSeconds", d.logIntervalSeconds);
     g_cfg.keyScreenshot = GetPrivateProfileIntW(L"Keys", L"Screenshot", d.keyScreenshot, p);

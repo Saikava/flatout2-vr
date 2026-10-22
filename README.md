@@ -110,13 +110,29 @@ The game's controls are unchanged.
 | `FloatDepth` | 1 | The eyes keep depth as 32-bit floats, reversed (near 1, far 0), set in DXVK by the mod: what lies close together far away, such as a turn sign's arrow on its board, stays apart instead of showing through in crawling bands (0: 24-bit depth as the game keeps it) |
 | `SpeedBlur` | 1 | The game's speed blur (0 = off) |
 | `SpeedZoom` | 1.0 | The game's widening of the view at speed: 1 = as on a monitor, 0 = off |
+| `LargeAddressAware` | 1 | FlatOut2.exe may use 4 GB of memory, not 2 (see [Memory](#troubleshooting)): when the game starts, the mod sets the flag in the file (the original kept as `FlatOut2.exe.2GB.bak`) and starts the game anew with it (0: leave FlatOut2.exe as it is) |
 
 ## Troubleshooting
 
 The log, `scripts\FO2VR.log`, usually says what went wrong.
 
-- **The game starts on the monitor only.** The mod found no headset: start SteamVR (or connect the
-  headset in Virtual Desktop) before the game, and check `Runtime=` in `scripts\FO2VR.ini`.
+- **A window says "Waiting for SteamVR..." or "VR did not start".** The game waits for the VR runtime and
+  goes on in VR by itself once it is ready; the window says what went wrong when it fails, with Try again,
+  Play without VR and Quit. Start SteamVR (or connect the headset in Virtual Desktop) before the game, and
+  check `Runtime=` in `scripts\FO2VR.ini`. If SteamVR hangs while it starts (its window never shows the
+  headset), close it, end `vrserver.exe` in the Task Manager if it stays, and start SteamVR from Steam: when
+  Virtual Desktop's Streamer runs as administrator, the SteamVR it starts may not come up.
+- **Memory: a track does not load** (the game stands still at the loading screen; `FlatOut2_d3d9.log` ends with
+  "Memory allocation failed"). FlatOut2.exe is a 32-bit program and, as released, may use only 2 GB of memory,
+  which it shares with the VR runtime and the graphics driver; larger tracks can run out of it in VR. The mod
+  lets it use 4 GB by setting a flag in FlatOut2.exe (`LargeAddressAware=1`) and says so when it cannot, e.g. when
+  the game's folder is not writable. To set the flag yourself, close the game and run this in PowerShell (with
+  the path of your FlatOut2.exe; it keeps a copy as `FlatOut2.exe.bak`):
+  ```
+  $f = "C:\Program Files (x86)\Steam\steamapps\common\FlatOut 2\FlatOut2.exe"
+  $b = [IO.File]::ReadAllBytes($f); $o = [BitConverter]::ToInt32($b, 0x3C) + 22
+  if ($b[$o] -band 0x20) { "already 4 GB" } else { Copy-Item $f "$f.bak"; $b[$o] = $b[$o] -bor 0x20; [IO.File]::WriteAllBytes($f, $b); "done" }
+  ```
 - **The log says "the game does not run on DXVK".** `d3d9.dll` from the archive is missing from the game
   folder, or another mod replaced it.
 - **The log says "unsupported FlatOut2.exe".** The mod needs version 1.2 of the game (the GOG or the
