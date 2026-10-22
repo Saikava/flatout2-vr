@@ -3455,6 +3455,36 @@ static __declspec(naked) void MarkerDrawHook()
     }
 }
 
+// The Steam release's fo2_zoom.dll hooks the triangle's call (kMarkerDrawCall) for its widescreen HUD: a jump into code
+// of its own that calls kMarkerDraw as the game would, every register as it was. The triangle is then taken at
+// kMarkerDraw's start (it draws others of the HUD's too, which MarkerDrawn lets through): its first two instructions
+// (sub esp, 8; movzx eax, byte [ecx+1Ch]) run in MarkerDrawRest before the rest of it.
+static uintptr_t g_markerDrawResume = fo2::kMarkerDraw + 7;
+
+static __declspec(naked) void MarkerDrawRest()
+{
+    __asm {
+        sub esp, 8
+        movzx eax, byte ptr [ecx + 0x1C]
+        jmp dword ptr [g_markerDrawResume]
+    }
+}
+
+static bool HookMarkerDraw()
+{
+    const BYTE* site = (const BYTE*)fo2::kMarkerDrawCall;
+    if (site[0] == 0xE8 && fo2::kMarkerDrawCall + 5 + *(const int32_t*)(site + 1) == fo2::kMarkerDraw)
+        return PatchCall(fo2::kMarkerDrawCall, fo2::kMarkerDraw, (const void*)&MarkerDrawHook);
+    static const BYTE start[7] = { 0x83, 0xEC, 0x08, 0x0F, 0xB6, 0x41, 0x1C };
+    BYTE jump[7] = { 0xE9, 0, 0, 0, 0, 0x90, 0x90 };
+    int32_t rel = (int32_t)((uintptr_t)&MarkerDrawHook - (fo2::kMarkerDraw + 5));
+    memcpy(jump + 1, &rel, 4);
+    if (!PatchCode(fo2::kMarkerDraw, start, jump, sizeof(jump))) return false;
+    g_markerDrawFn = (uintptr_t)&MarkerDrawRest;
+    Log("markers: the triangle's call is another's (fo2_zoom.dll's) - the triangles are taken where they are drawn");
+    return true;
+}
+
 // In an eye: the last frame's markers over their cars, over everything as the game draws them on the monitor (with the
 // eye's depth, the cockpit's pillars, doors and roof hid most of them).
 void DrawMarkers(IDirect3DDevice9* dev, BYTE* cam)
@@ -3708,6 +3738,54 @@ void DrawCockpitCards(IDirect3DDevice9* dev, BYTE* cam, int eye)
 // The engine's back buffer size (DeviceD3d fields), which its post-processing uses for the
 // target of its final passes.
 int* EngineScreenSize() { return (int*)(*(BYTE**)fo2::kDeviceD3d + fo2::kDevWidth); }
+
+// The eyes, the mirrors and the lens flare give the game's screen shape (kScreenShape) their own aspect ratio while they
+// render: the engine culls with a frustum built from it. The Steam release's fo2_zoom.dll points its getter
+// (kScreenShapeGet) at the monitor's resolution: the eyes were culled as 16:9, cutting off what lies above and below
+// a 16:9 picture in the headset's taller one. While they render, the getter reads the screen shape again
+// (OwnScreenShape), and what fo2_zoom.dll set afterwards. The getter is looked at as the eyes first render, when
+// fo2_zoom.dll has long done its changes.
+struct ScreenShapeGetter
+{
+    bool checked = false;
+    uint32_t* operand[2] = {};  // the getter's two addresses, when another's (null: the game's own)
+    uint32_t theirs[2] = {};
+} g_shapeGetter;
+
+void CheckScreenShapeGetter()
+{
+    BYTE* get = (BYTE*)fo2::kScreenShapeGet;
+    if (get[0] != 0xD9 || get[1] != 0x05 || get[0x10] != 0xD9 || get[0x11] != 0x05)
+    {
+        Log("screen shape: its getter differs - the eyes are culled by the monitor's aspect ratio");
+        return;
+    }
+    uint32_t* operand[2] = { (uint32_t*)(get + 2), (uint32_t*)(get + 0x12) };
+    if (*operand[0] == fo2::kScreenShape && *operand[1] == fo2::kScreenShape + 4) return;
+    DWORD old;
+    if (!VirtualProtect(get, 0x16, PAGE_EXECUTE_READWRITE, &old)) return;
+    for (int i = 0; i < 2; i++)
+    {
+        g_shapeGetter.operand[i] = operand[i];
+        g_shapeGetter.theirs[i] = *operand[i];
+    }
+    Log("screen shape: the getter reads %08X (fo2_zoom.dll's) - the eyes and mirrors set it back while they render",
+        (unsigned)g_shapeGetter.theirs[0]);
+}
+
+void OwnScreenShape(bool own)
+{
+    ScreenShapeGetter& g = g_shapeGetter;
+    if (!g.checked)
+    {
+        g.checked = true;
+        CheckScreenShapeGetter();
+    }
+    if (!g.operand[0]) return;
+    *g.operand[0] = own ? fo2::kScreenShape : g.theirs[0];
+    *g.operand[1] = own ? fo2::kScreenShape + 4 : g.theirs[1];
+    FlushInstructionCache(GetCurrentProcess(), (const void*)fo2::kScreenShapeGet, 0x16);
+}
 
 // The bound render target's size.
 bool BoundTargetSize(IDirect3DDevice9* dev, UINT* w, UINT* h)
@@ -5832,6 +5910,7 @@ bool RenderVrEyes(IDirect3DDevice9* dev, BYTE* ctx, BYTE** cams, float* fovScale
     screenSize[1] = (int)g_vrt.h;
     screenShape[0] = (float)g_vrt.w;
     screenShape[1] = (float)g_vrt.h;
+    OwnScreenShape(true);
     // The far clipping plane: the track's visibility (MaxVisibility, 300-700 m) or the camera's
     // 1000 m. Beyond it the haze is not yet thick enough to hide what pops in there: [VR]
     // ViewDistance moves it out.
@@ -5952,6 +6031,7 @@ bool RenderVrEyes(IDirect3DDevice9* dev, BYTE* ctx, BYTE** cams, float* fovScale
     screenSize[1] = savedScreen[1];
     screenShape[0] = savedShape[0];
     screenShape[1] = savedShape[1];
+    OwnScreenShape(false);
     grass[0] = savedGrass[0];
     grass[1] = savedGrass[1];
     *camFar = savedFar;
@@ -6119,8 +6199,8 @@ bool InstallRenderHooks()
                                                   : "the eyes go into the driver's head when he is thrown out (EjectView=2)");
     if (g_cfg.vrEnabled && !PatchCall(fo2::kSampleAnimCall, fo2::kSampleAnim, (const void*)&SampleAnimHook))
         Log("drivers: the animation call differs - the hands move in the animation's steps");
-    if (g_cfg.vrEnabled && (!PatchCall(fo2::kMarkersCall, fo2::kMarkers, (const void*)&MarkersHook) ||
-                            !PatchCall(fo2::kMarkerDrawCall, fo2::kMarkerDraw, (const void*)&MarkerDrawHook)))
+    // (the camera is turned for the markers only when their triangles are taken: on the HUD they would stand wrong)
+    if (g_cfg.vrEnabled && (!HookMarkerDraw() || !PatchCall(fo2::kMarkersCall, fo2::kMarkers, (const void*)&MarkersHook)))
         Log("markers: the HUD's calls differ - the rivals' markers stay on the HUD");
     ok &= PatchPointer(fo2::kSlotSetViewport, fo2::kSetViewport, (const void*)&SetViewportHook);
     ok &= PatchPointer(fo2::kSlotSetCamera, fo2::kSetCamera, (const void*)&SetCameraHook);

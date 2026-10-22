@@ -21,6 +21,8 @@ struct HWND__;
 // undoes a mute left from an earlier background run. False if the exe differs.
 bool InstallBackground();
 bool BackgroundMode();
+// As Direct3D starts: DirectInput's own interface hooked when the game's call to it is another's (see background.cpp).
+void HookInputInterfaces();
 
 // Around IDirect3D9::CreateDevice: windowed instead of full screen, then the window goes to
 // another monitor and the keyboard focus back to where it was.

@@ -64,6 +64,7 @@ void UseFloatDepth()
 // FlatOut2.exe calls Direct3DCreate9 through its import thunk 0x5FFA80 (jmp [IAT]) from two places.
 IDirect3D9* WINAPI Direct3DCreate9Hook(UINT sdk)
 {
+    HookInputInterfaces();
     if (g_cfg.vrEnabled && !g_xrTried)
     {
         g_xrTried = true;

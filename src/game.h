@@ -193,8 +193,11 @@ constexpr int kGrassChunkBytes = 0x30000;
 constexpr uintptr_t kTrailFill = 0x59F848;
 
 // The screen's shape (float width, height: 4 and 3, or 16 and 9), from which RenderViews takes the
-// cameras' aspect ratio (DeviceD3d's getter 0x5AAD10, slot 9).
+// cameras' aspect ratio (DeviceD3d's getter kScreenShapeGet, slot 9: fld [kScreenShape] at +0, fld
+// [kScreenShape + 4] at +0x10). The Steam release's fo2_zoom.dll points the getter at the screen's
+// resolution instead (0x6D68E8, two ints it reads as floats: their ratio is the monitor's).
 constexpr uintptr_t kScreenShape = 0x69BE18;
+constexpr uintptr_t kScreenShapeGet = 0x5AAD10;
 
 // The renderer's screen textures (up to 4 render targets of 512x512, each a wrapper with its
 // IDirect3DTexture9 at kTexD3D). Its post-processing (DeviceD3d slot 0x150, 0x5AA390, called by

@@ -534,6 +534,12 @@ HRESULT WINAPI DirectInput8CreateHook(HINSTANCE inst, DWORD version, REFIID iid,
     return hr;
 }
 
+// The Steam release's fo2_zoom.dll makes the game's DirectInput8Create call into its own (it brings in game controllers
+// through SDL). Then dinput8's own interface is hooked instead, through an object made for that as Direct3D starts
+// (HookInputInterfaces): the game makes its DirectInput after its Direct3D device, and its devices come from
+// dinput8's IDirectInput8A::CreateDevice either way.
+bool g_hookInterfaces;
+
 // The game's DirectInput8Create call goes through DirectInput8CreateHook (background mode, input
 // recording and replay).
 bool InstallInputHooks()
@@ -543,8 +549,9 @@ bool InstallInputHooks()
     const uint8_t expected[6] = { 0xFF, 0x15, 0x48, 0xA7, 0x8D, 0x00 };
     if (memcmp((const void*)kDirectInputCreateCall, expected, 6) != 0)
     {
-        Log("input: DirectInput call differs - not hooked");
-        return false;
+        Log("input: the game's DirectInput call is another's (fo2_zoom.dll's) - DirectInput hooked as Direct3D starts");
+        g_hookInterfaces = done = true;
+        return true;
     }
     uint8_t call[6] = { 0xE8, 0, 0, 0, 0, 0x90 };
     int32_t rel = (int32_t)((uintptr_t)&DirectInput8CreateHook - (kDirectInputCreateCall + 5));
@@ -592,6 +599,24 @@ bool InstallBackground()
 }
 
 bool BackgroundMode() { return g_on; }
+
+void HookInputInterfaces()
+{
+    if (!g_hookInterfaces) return;
+    g_hookInterfaces = false;
+    static const GUID kDirectInput8A = { 0xBF798030, 0x483A, 0x4DA2, { 0xAA, 0x99, 0x5D, 0x64, 0xED, 0x36, 0x97, 0x00 } };
+    HMODULE dinput = LoadLibraryW(L"dinput8.dll");
+    auto create = dinput ? (CreateFn)GetProcAddress(dinput, "DirectInput8Create") : nullptr;
+    void* di = nullptr;
+    if (!create || FAILED(create(GetModuleHandleW(nullptr), 0x0800, kDirectInput8A, &di, nullptr)) || !di)
+    {
+        Log("input: no DirectInput of its own - not hooked");
+        return;
+    }
+    HookSlot(*(void***)di, slot::CreateDevice, (void*)&CreateDeviceHook, oCreateDevice);
+    ((IUnknown*)di)->Release();
+    Log("DirectInput hooked (its interface)");
+}
 
 void BackgroundBeforeDevice(D3DPRESENT_PARAMETERS* pp)
 {
