@@ -161,21 +161,20 @@ void NoteAddressSpace()
     double now = NowSeconds();
     if (now - lastCheck < g_cfg.logIntervalSeconds) return;
     lastCheck = now;
+    MEMORYSTATUSEX ms = { sizeof(ms) };
+    if (!GlobalMemoryStatusEx(&ms)) return;
+    SIZE_T used = (SIZE_T)(ms.ullTotalVirtual - ms.ullAvailVirtual);
+    if (used < logged + (128u << 20)) return;
+    logged = used;
+    // The largest free block only when it is logged: the walk through the address space's thousands of regions takes
+    // milliseconds (done every log interval, it cost a headset frame every time).
     SYSTEM_INFO si;
     GetSystemInfo(&si);
-    SIZE_T used = 0, largest = 0;
+    SIZE_T largest = 0;
     MEMORY_BASIC_INFORMATION m;
     for (const BYTE* p = (const BYTE*)si.lpMinimumApplicationAddress; p < si.lpMaximumApplicationAddress && VirtualQuery(p, &m, sizeof(m));
          p = (const BYTE*)m.BaseAddress + m.RegionSize)
-    {
-        if (m.State == MEM_FREE)
-            largest = std::max(largest, m.RegionSize);
-        else
-            used += m.RegionSize;
-    }
-    if (used < logged + (128u << 20)) return;
-    logged = used;
-    SIZE_T total = (SIZE_T)si.lpMaximumApplicationAddress - (SIZE_T)si.lpMinimumApplicationAddress;
-    Log("memory: the game's address space %u MB used of %u, the largest free block %u MB", (unsigned)(used >> 20), (unsigned)(total >> 20),
-        (unsigned)(largest >> 20));
+        if (m.State == MEM_FREE) largest = std::max(largest, m.RegionSize);
+    Log("memory: the game's address space %u MB used of %u, the largest free block %u MB", (unsigned)(used >> 20),
+        (unsigned)(ms.ullTotalVirtual >> 20), (unsigned)(largest >> 20));
 }
