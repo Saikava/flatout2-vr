@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="docs/img/hero.jpg" alt="The start of a race in FlatOut 2, seen in the headset" width="100%">
-</p>
-
 # FlatOut 2 VR
 
 **Play FlatOut 2 in VR.** A free mod for the PC game: the races in true stereo 3D with head tracking,
@@ -20,19 +16,10 @@ release.
 Sit in the car as you want to sit and press **F8** to recenter the view. Playing through Virtual Desktop
 without SteamVR? Change one line in the settings: see [Runtimes](#runtimes).
 
-<p align="center">
-  <img src="docs/img/forest.jpg" alt="Racing through a forest" width="32%">
-  <img src="docs/img/stunt.jpg" alt="A stunt car in mid-air in the stunt arena" width="32%">
-  <img src="docs/img/stunt-players.jpg" alt="A stunt event with giant football players" width="32%">
-</p>
-
 ## Features
 
 - **Stereo 3D and head tracking** in every race camera: lean out of the window, look back at the wrecks
-  behind you. Each eye gets its own render of the scene, not a shifted copy:
-
-  <img src="docs/img/stereo.jpg" alt="The left and the right eye's views of the same moment" width="100%">
-
+  behind you. Each eye gets its own render of the scene, not a shifted copy.
 - **A cockpit**: the game's camera inside the car puts you in the driver's seat, with the driver's hands on
   the steering wheel, the dashboard, the roof, the pillars and the glass around you (the game itself shows
   none of it there). The side mirrors, convex as real ones are, show what is behind. The gauges, position,
