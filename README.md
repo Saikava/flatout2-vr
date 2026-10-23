@@ -105,6 +105,11 @@ To drive with them, choose **VR controllers** in the game's Options > Controller
 In the menus (whichever controller is chosen) the thumbsticks move, A selects, B and the menu button go
 back. Index and Windows Mixed Reality controllers work with what they have of these.
 
+The menu button is on the left controller, under the thumb that steers. To pause with the right hand, set
+`PauseButton=RightStick` (the right thumbstick pressed) or `RightGrip` in `scripts\FO2VR.ini`: that button
+then pauses and continues the race, and does nothing else (with `RightStick`, move Look back to the left
+thumbstick pressed in the game's Configure controls). The game's Configure controls has no Pause of its own.
+
 Experimental, off by default (`GrabWheel=1`): steer by holding the cockpit's steering wheel. Reach for it
 as you sit (recentered), squeeze a grip at its rim and turn it with your hands; 90 degrees is full lock, as
 the cockpit's wheel turns (`WheelTurn`).
@@ -148,6 +153,7 @@ monitor does not have the focus (started from the headset, it may never have had
 | `SpeedZoom` | 1.0 | The game's widening of the view at speed: 1 = as on a monitor, 0 = off |
 | `LargeAddressAware` | 1 | FlatOut2.exe may use 4 GB of memory, not 2 (see [Memory](#troubleshooting)): when the game starts, the mod sets the flag in the file (the original kept as `FlatOut2.exe.2GB.bak`) and starts the game anew with it (0: leave FlatOut2.exe as it is) |
 | `MotionControllers` | 1 | The VR controllers as a game controller, "VR controllers" (see [VR controllers](#vr-controllers); 0: none) |
+| `PauseButton` | (none) | A button of the VR controllers that pauses and continues a race besides the menu button: `RightStick`, `RightGrip`, `LeftStick`, `LeftGrip`, `X` or `Y` (the game then no longer sees it) |
 | `Rumble` | 1.0 | How strongly the game's force feedback vibrates the VR controllers and Xbox controllers (up to 2; 0: not at all) |
 | `EngineRumble` | 0 | The engine as a light, steady vibration while driving (VR controllers, an Xbox controller's light motor), stronger with the revs and the throttle, at most this strong (0.2-0.5: a hum under the crashes'; 0: none) |
 | `GrabWheel` | 0 | Experimental: the VR controllers' grips take hold of the cockpit's steering wheel, which your hands then turn (instead of shifting gears) |

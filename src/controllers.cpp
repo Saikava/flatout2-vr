@@ -881,6 +881,20 @@ int DefaultObject(DWORD semantic)
     return -1;
 }
 
+// [VR] PauseButton: a button that pauses a race besides the menu button, which is on the left controller (the right
+// one has none for games) under the thumb that steers. The game's Configure controls has no Pause on the PC (its
+// controls list, patch1.bfs, leaves it out), so it is chosen in the ini, among the buttons that do nothing in the
+// menus (A and B do). The game no longer sees it: what its controls had on it (the right thumbstick pressed: look
+// back) does nothing then. Not a grip with GrabWheel (the grips hold the wheel).
+struct PauseButtonName
+{
+    const wchar_t* name;
+    int button;
+};
+const PauseButtonName kPauseButtons[] = { { L"X", 2 },         { L"Y", 3 },         { L"LeftGrip", 4 },
+                                          { L"RightGrip", 5 }, { L"LeftStick", 8 }, { L"RightStick", 9 } };
+int g_pauseButton = -1;
+
 // ---- the steering wheel in the hands --------------------------------------------------------------------------------
 // [VR] GrabWheel (experimental, off by default: holding the hands up tires them within minutes): a grip squeezed with
 // the hand at the car's steering wheel (as the cockpit has it: SteeringWheel; within 20 cm of its plane, 6 to 40 cm
@@ -1338,8 +1352,9 @@ private:
         auto grip = [](bool& held, float g) { return held = held ? g > 0.4f : g > 0.6f; };
         // (With GrabWheel the grips hold the wheel, not shift.)
         bool grips = !g_cfg.vrGrabWheel;
-        const bool buttons[kButtons] = { r.lower, r.button, l.lower, l.button, grips && grip(m_grip[0], l.grip), grips && grip(m_grip[1], r.grip), false,
-                                         l.menu, l.thumb, r.thumb };
+        bool buttons[kButtons] = { r.lower, r.button, l.lower, l.button, grips && grip(m_grip[0], l.grip), grips && grip(m_grip[1], r.grip), false,
+                                   l.menu, l.thumb, r.thumb };
+        if (g_pauseButton >= 0) buttons[g_pauseButton] = false;  // (it pauses: ControllersMenuKeys)
         if (m_wheel.Took() >= 0) m_tick[m_wheel.Took()] = NowSeconds() + 0.04;
         if (g_cfg.testControllersLog && (wheel || m_wasWheel))
         {
@@ -1522,6 +1537,15 @@ bool InstallControllers()
         Log("controllers: the game's controller list is called differently - no VR controllers, no vibration for Xbox controllers");
         return false;
     }
+    const std::wstring& name = g_cfg.vrPauseButton;
+    for (const PauseButtonName& p : kPauseButtons)
+        if (_wcsicmp(name.c_str(), p.name) == 0) g_pauseButton = p.button;
+    if (g_pauseButton >= 0 && g_cfg.vrGrabWheel && (g_pauseButton == 4 || g_pauseButton == 5)) g_pauseButton = -1;
+    if (g_pauseButton >= 0)
+        Log("controllers: the VR controllers' %ls pauses a race (as the menu button)", name.c_str());
+    else if (!name.empty() && _wcsicmp(name.c_str(), L"none") != 0)
+        Log("controllers: PauseButton=%ls is none of X, Y, LeftGrip, RightGrip (not with GrabWheel), LeftStick, RightStick - only the menu button pauses",
+            name.c_str());
     return true;
 }
 
@@ -1556,9 +1580,9 @@ bool ControllersRecenter()
 // consoles' menus are the same scripts, fed by their pads), nor pause a race. So the VR controllers and Xbox controllers
 // (XInput, whether or not one is the game's chosen controller) press its keys, as its keyboard hook would: in the menus
 // the thumbsticks and the D-pad the arrows (repeating while held), A Enter, B Esc, the VR controllers' menu button Esc,
-// Start Enter ("press START") and Back Esc; while driving the menu button and Start Esc (the pause). What a button
-// presses is chosen as it goes down and held until it comes up. Not while a control waits for its new key or button
-// (Configure controls), nor in a replay.
+// Start Enter ("press START") and Back Esc; while driving the menu button and Start Esc (the pause), and [VR]
+// PauseButton too, which also continues the race from its pause. What a button presses is chosen as it goes down and
+// held until it comes up. Not while a control waits for its new key or button (Configure controls), nor in a replay.
 namespace {
 
 enum Press
@@ -1572,6 +1596,7 @@ enum Press
     kEsc,    // in the menus
     kStart,  // Start: Enter in the menus, Esc while driving
     kMenu,   // the VR controllers' menu button: Esc
+    kPause,  // [VR] PauseButton: Esc while driving and in the race's pause
 };
 
 struct Source
@@ -1600,6 +1625,8 @@ void GameKey(int vk, bool down)
     }
 }
 
+bool g_paused;  // the race's pause (Driving)
+
 // The player drives: a race running (its countdown too; not its pause, its "start race" or its end).
 bool Driving()
 {
@@ -1607,9 +1634,11 @@ bool Driving()
     int steps = PhysicsSteps();
     framesWithoutStep = steps != lastSteps ? 0 : framesWithoutStep + 1;
     lastSteps = steps;
+    g_paused = false;
     BYTE* gf = *(BYTE**)fo2::kGameFlow;
     if (!gf || *(int*)(gf + fo2::kGameState) != 2) return false;
     int race = *(int*)(gf + fo2::kRaceState);
+    g_paused = race == 8 && framesWithoutStep >= 2;
     return race == 7 || (race == 8 && framesWithoutStep < 2);
 }
 
@@ -1642,6 +1671,7 @@ void Feed(Source& src, bool down, Press press, bool driving, bool off, double no
             case kEsc: vk = driving ? 0 : VK_ESCAPE; break;
             case kStart: vk = driving ? VK_ESCAPE : VK_RETURN; break;
             case kMenu: vk = VK_ESCAPE; break;
+            case kPause: vk = driving || g_paused ? VK_ESCAPE : 0; break;
             default: break;
             }
         src.vk = vk;
@@ -1674,7 +1704,30 @@ void StickWays(const float s[2], bool ways[4])
         ways[y > 0 ? 0 : 1] = true;
 }
 
-Source g_vrWays[4], g_vrA, g_vrB, g_vrMenu;
+// [VR] PauseButton held (a grip past most of the way, let go past less than half, as VrPad has them). A thumbstick's
+// press counts once held a tenth of a second without the other one's (both pressed recenter the view).
+bool PauseButtonDown(const xr::Controller& l, const xr::Controller& r, double now)
+{
+    static bool grip, spoilt;
+    static double since;
+    bool down = false;
+    switch (g_pauseButton)
+    {
+    case 2: down = l.lower; break;
+    case 3: down = l.button; break;
+    case 4: down = grip = grip ? l.grip > 0.4f : l.grip > 0.6f; break;
+    case 5: down = grip = grip ? r.grip > 0.4f : r.grip > 0.6f; break;
+    case 8: down = l.thumb; break;
+    case 9: down = r.thumb; break;
+    }
+    if (!down) since = 0, spoilt = false;
+    else if (since == 0) since = now;
+    if (g_pauseButton < 8) return down;
+    if (l.thumb && r.thumb) spoilt = true;
+    return down && !spoilt && now - since >= 0.1;
+}
+
+Source g_vrWays[4], g_vrA, g_vrB, g_vrMenu, g_vrPause;
 Source g_padWays[4][4], g_padA[4], g_padB[4], g_padStart[4], g_padBack[4];
 
 }  // namespace
@@ -1704,6 +1757,7 @@ void ControllersMenuKeys()
         Feed(g_vrA, r.lower, kEnter, driving, off, now);
         Feed(g_vrB, r.button, kEsc, driving, off, now);
         Feed(g_vrMenu, l.menu, kMenu, driving, off, now);
+        if (g_pauseButton >= 0) Feed(g_vrPause, PauseButtonDown(l, r, now), kPause, driving, off, now);
     }
     if (LoadXInput())
     {
