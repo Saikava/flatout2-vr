@@ -291,8 +291,9 @@ void RunCommand(std::string line)
     }
     if (cmd == "hand")
     {
-        // hand <0 left | 1 right> x y z yaw pitch [trigger [stick-x stick-y [button]]]: a pretend controller
-        // pointing from (x, y z) from the recenter origin; "hand 1 off" puts it away.
+        // hand <0 left | 1 right> x y z yaw pitch [trigger [stick-x stick-y [buttons [grip]]]]: a pretend controller
+        // pointing from (x, y z) from the recenter origin, its buttons held: 1 B or Y, 2 A or X, 4 menu, 8 the
+        // thumbstick pressed; "hand 1 off" puts it away.
         int h = 0, button = 0;
         float p[3] = {}, yaw = 0, pitch = 0;
         xr::Controller c;
@@ -304,16 +305,20 @@ void RunCommand(std::string line)
             Log("input file: hand %d off", h & 1);
             return;
         }
-        sscanf(arg.c_str(), "%d %f %f %f %f %f %f %f %f %d", &h, &p[0], &p[1], &p[2], &yaw, &pitch, &c.trigger, &c.stick[0], &c.stick[1], &button);
+        sscanf(arg.c_str(), "%d %f %f %f %f %f %f %f %f %d %f", &h, &p[0], &p[1], &p[2], &yaw, &pitch, &c.trigger, &c.stick[0], &c.stick[1], &button,
+               &c.grip);
         float y = yaw * 0.017453293f, x = pitch * 0.017453293f;
         float f[3] = { sinf(y) * cosf(x), sinf(x), cosf(y) * cosf(x) }, r[3] = { cosf(y), 0.0f, -sinf(y) };
         c.tracked = true;
-        c.button = button != 0;
+        c.button = (button & 1) != 0;
+        c.lower = (button & 2) != 0;
+        c.menu = (button & 4) != 0;
+        c.thumb = (button & 8) != 0;
         for (int i = 0; i < 3; i++) c.aim.position[i] = p[i], c.aim.forward[i] = f[i], c.aim.right[i] = r[i];
         c.aim.up[0] = f[1] * r[2] - f[2] * r[1], c.aim.up[1] = f[2] * r[0] - f[0] * r[2], c.aim.up[2] = f[0] * r[1] - f[1] * r[0];
         xr::SetTestHand(h & 1, c);
-        Log("input file: hand %d at %.2f %.2f %.2f, yaw %.1f, pitch %.1f, trigger %.2f, stick %.2f %.2f, button %d", h & 1, p[0], p[1], p[2], yaw, pitch,
-            c.trigger, c.stick[0], c.stick[1], button);
+        Log("input file: hand %d at %.2f %.2f %.2f, yaw %.1f, pitch %.1f, trigger %.2f, stick %.2f %.2f, buttons %d, grip %.2f", h & 1, p[0], p[1],
+            p[2], yaw, pitch, c.trigger, c.stick[0], c.stick[1], button, c.grip);
         return;
     }
     if (cmd == "camera")

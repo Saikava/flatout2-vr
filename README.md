@@ -2,7 +2,7 @@
 
 **Play FlatOut 2 in VR.** A free mod for the PC game: the races in true stereo 3D with head tracking,
 smooth at your headset's refresh rate, with the HUD on a panel in front of you. You drive with the game's
-own controls (gamepad, wheel or keyboard); no motion controllers needed. Works with the GOG and the Steam
+own controls (gamepad, wheel or keyboard) or with your VR controllers. Works with the GOG and the Steam
 release.
 
 [![Download](https://img.shields.io/github/v/release/Saikava/flatout2-vr?label=Download&style=for-the-badge&color=f0a30a)](https://github.com/Saikava/flatout2-vr/releases/latest) [![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=for-the-badge)](LICENSE)
@@ -35,6 +35,10 @@ without SteamVR? Change one line in the settings: see [Runtimes](#runtimes).
   screens. Each matches in both eyes. Fades to black cover the whole view.
 - **Longer view distances** for the headset: full model detail and grass much further out.
   Everything is configurable.
+- **VR controllers and gamepads**: drive with the VR controllers (thumbstick and triggers), and work the
+  menus with them or with an Xbox controller (the game's menus take only the keyboard otherwise). The game's
+  force feedback vibrates the VR controllers and Xbox controllers (it has no vibration for those
+  otherwise). Game controllers work whether or not the game's window on the monitor has the focus.
 
 ## Requirements
 
@@ -81,6 +85,33 @@ The game's controls are unchanged.
 | Numpad 8 2 4 6, + - | Move the view against the car while held: up, down, left, right, forward, back (slowly at first), e.g. to sit a little lower in the cockpit. Numpad 5 puts it back. The view stays where you left it for the next game. Num Lock must be on |
 | F11 | Screenshot of the monitor, both eyes and the HUD (into `scripts\shots\`) |
 
+### VR controllers
+
+To drive with them, choose **VR controllers** in the game's Options > Controller options > Controller
+(and Force feedback On there for their vibration). Until you change them in the game's Configure controls:
+
+| VR controller | In a race |
+| --- | --- |
+| Left thumbstick | Steer |
+| Right trigger / left trigger | Accelerate / brake and reverse |
+| A / B | Nitro / handbrake |
+| X / Y | Change the camera / reset the car |
+| Menu button | Pause |
+| Right / left grip | Gear up / down (manual transmission) |
+| Right thumbstick pressed | Look back |
+| Both thumbsticks pressed | Recenter the view (as F8) |
+
+In the menus (whichever controller is chosen) the thumbsticks move, A selects, B and the menu button go
+back. Index and Windows Mixed Reality controllers work with what they have of these.
+
+### Gamepads
+
+The game's menus take only the keyboard; with the mod an Xbox controller works them too: the left
+thumbstick or the D-pad moves, A or Start selects, B or Back goes back, and Start pauses a race. With Force
+feedback On in the game's options, an Xbox controller vibrates in crashes. In VR the game reads its game
+controllers even when its window on the monitor does not have the focus (started from the headset, it may
+never have had it).
+
 ## Settings
 
 `scripts\FO2VR.ini`, section `[VR]`:
@@ -111,6 +142,8 @@ The game's controls are unchanged.
 | `SpeedBlur` | 1 | The game's speed blur (0 = off) |
 | `SpeedZoom` | 1.0 | The game's widening of the view at speed: 1 = as on a monitor, 0 = off |
 | `LargeAddressAware` | 1 | FlatOut2.exe may use 4 GB of memory, not 2 (see [Memory](#troubleshooting)): when the game starts, the mod sets the flag in the file (the original kept as `FlatOut2.exe.2GB.bak`) and starts the game anew with it (0: leave FlatOut2.exe as it is) |
+| `MotionControllers` | 1 | The VR controllers as a game controller, "VR controllers" (see [VR controllers](#vr-controllers); 0: none) |
+| `Rumble` | 1.0 | How strongly the game's force feedback vibrates the VR controllers and Xbox controllers (up to 2; 0: not at all) |
 
 ## Troubleshooting
 
@@ -138,6 +171,8 @@ The log, `scripts\FO2VR.log`, usually says what went wrong.
 - **The log says "unsupported FlatOut2.exe".** The mod needs version 1.2 of the game (the GOG or the
   Steam release).
 - **The HUD looks stretched.** Choose a 16:9 resolution in the game's settings.
+- **The VR controllers or the gamepad do nothing in a race.** Choose them in the game's Options > Controller
+  options > Controller: the game drives with the one chosen there (the keyboard works besides).
 - **It stutters in the headset.** Each frame has to be ready in the headset's time (8.3 ms at 120 Hz); the log's
   `frame avg/max ms` lines show how long the eyes take. In `scripts\FO2VR.ini`, `[VR]`, these cost the most:
   `Mirrors` (1 halves the mirrors' cost, 0 drops it), `MSAA` (2 or 0), `RenderScale` (0.8 or 0.9),

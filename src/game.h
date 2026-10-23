@@ -513,6 +513,25 @@ constexpr int kPartKnockOff = 11;
 constexpr uintptr_t kSettingCamera = 0x69C2A0;  // int
 constexpr int kCameraInside = 4;
 
+// ---- input ------------------------------------------------------------------------------------
+// The game's input (0x55B240) makes its DirectInput (0x561270, kept at kDirectInput) and lists its game controllers
+// (kControllerEnum, called at kControllerEnumCall with the input in esi): see controllers.cpp.
+constexpr uintptr_t kControllerEnumCall = 0x55B253;
+constexpr uintptr_t kControllerEnum = 0x5612C0;
+constexpr uintptr_t kDirectInput = 0x8DA74C;  // IDirectInput8A*
+// The input's controllers (the keyboard and the chosen game controller): their number and list (kInputControllers
+// at the input, kInputControllerList on). A controller waiting for a key or button to be assigned to one of its
+// controls (Configure controls) has the control's index at kControllerRemap (-1 otherwise).
+constexpr uintptr_t kInput = 0x8E844C;  // the input's object*
+constexpr int kInputControllers = 0x4;
+constexpr int kInputControllerList = 0x1C;
+constexpr int kControllerRemap = 0x784;
+// The game's keyboard: its WH_KEYBOARD hook (0x55AAD0) keeps a state per virtual key (0x80 down, bit 0 toggled on
+// every press), counts presses per key and the keys held. The menus read these.
+constexpr uintptr_t kKeyState = 0x8D7E60;    // BYTE[256]
+constexpr uintptr_t kKeyPresses = 0x8D7D60;  // BYTE[256]
+constexpr uintptr_t kKeysHeld = 0x8DA740;    // int
+
 // ---- game state -----------------------------------------------------------------------------
 constexpr uintptr_t kGameFlow = 0x8E8410;  // GameFlow*
 constexpr int kGameState = 0x458;          // 1 = menu, 2 = race

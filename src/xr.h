@@ -66,11 +66,17 @@ struct Controller
     EyePose aim = {};               // forward: the pointing ray
     float trigger = 0, grip = 0;    // the index trigger, the grip (0 to 1)
     bool button = false;            // B (right) or Y (left)
+    bool lower = false;             // A (right) or X (left)
+    bool menu = false;              // the menu button (left)
+    bool thumb = false;             // the thumbstick pressed
     float stick[2] = {};            // the thumbstick: x right, y up
 };
 Controller Hand(int hand);  // 0 left, 1 right
 // [Test] without a headset: a controller given by hand (the background command "hand").
 void SetTestHand(int hand, const Controller& c);
+// A controller vibrates this strongly (0 to 1; 0 stops it) until told otherwise. Called every frame while it changes.
+void Haptics(int hand, float amplitude);
+float HapticsAmplitude(int hand);  // what Haptics was last told (also without a headset, for the log)
 
 // Where the time of handing images to the runtime goes (seconds, summed since the last call).
 struct SubmitTimes

@@ -35,6 +35,7 @@ struct Config
     bool testRecord = false;      // record the next race's input (record.h)
     bool testReplay = false;      // play the recorded input back in the race
     bool testFrameTimes = false;  // write each race frame's display time and start to scripts\fo2vr_frametimes.csv
+    bool testControllersLog = false;  // log the VR controllers' state as the game reads it, the force-feedback effects and the vibration
     int testReplayStop = 0;
     int testReplayShots[8] = {};
     int testReplayTrace = 0;  // replay: log one frame of render calls at this race frame (background mode)  // replay: screenshots at these race frames (background mode)       // replay: log the benchmark totals and close the game after this many race frames (0 = whole race)
@@ -73,6 +74,9 @@ struct Config
                                    // 2: one for each eye, 0: the game's dark glass)
     float vrMirrorRadius = 1.4f;   // the mirrors' glass is convex, of this radius (metres): it shows more, smaller (0: flat)
     bool vrLargeAddressAware = true;  // FlatOut2.exe marked to use 4 GB of memory, not 2 (see largeaddress.cpp)
+    bool vrMotionControllers = true;  // the VR controllers as a game controller of the game's ("VR controllers")
+    float vrRumble = 1.0f;            // the game's force feedback as vibration (Xbox controllers, the VR controllers),
+                                      // this strong (0 = none)
     // [Log]
     float logIntervalSeconds = 2.0f;
     // [Keys]

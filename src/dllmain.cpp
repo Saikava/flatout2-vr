@@ -1,4 +1,5 @@
 #include "background.h"
+#include "controllers.h"
 #include "d3dcreate.h"
 #include "largeaddress.h"
 #include "pacing.h"
@@ -60,6 +61,7 @@ static void Init()
     Log("config: CameraOffset %.3f %.3f %.3f (right, up, forward)", co[0], co[1], co[2]);
     if (!InstallPacingHooks()) Log("frame gate hook FAILED");
     InstallBackground();
+    InstallControllers();
     rec::Install();
     StartInCockpit();
     if (g_cfg.vrEnabled || BackgroundMode()) Log("Direct3DCreate9 hook %s", InstallCreateHook() ? "installed" : "FAILED");

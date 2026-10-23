@@ -5,6 +5,7 @@
 #include "render.h"
 
 #include "background.h"
+#include "controllers.h"
 #include "dxvk_interop.h"
 #include "eyeshare.h"
 #include "game.h"
@@ -2265,7 +2266,8 @@ int __fastcall EnginePresentHook(void* self, void*)
 
     // VR: whatever the race path did not submit this frame is shown on the flat screen.
     xr::PollEvents();
-    if (KeyPressed(g_cfg.keyRecenter, g_recenterKeyWasDown)) xr::Recenter();
+    if (KeyPressed(g_cfg.keyRecenter, g_recenterKeyWasDown) | ControllersRecenter()) xr::Recenter();  // F8, both thumbsticks pressed
+    ControllersMenuKeys();
     CameraKeys(now);
     if (xr::Running() && !g_vrFrameDone)
     {

@@ -90,10 +90,17 @@ SubmitTimes g_times;
 
 // The controllers' actions (CreateInput) and their state for the open frame (ReadInput).
 XrActionSet g_actionSet = XR_NULL_HANDLE;
-XrAction g_aimAction, g_triggerAction, g_gripAction, g_buttonAction, g_stickAction;
+XrAction g_aimAction, g_triggerAction, g_gripAction, g_buttonAction, g_stickAction, g_lowerAction, g_menuAction, g_thumbAction, g_hapticAction;
 XrPath g_handPath[2];
 XrSpace g_aimSpace[2];
 Controller g_hands[2], g_testHands[2];
+// The controllers' vibration (Haptics): what each hand plays, and when it was last sent to the runtime.
+struct Vibration
+{
+    float amplitude = 0;
+    double sent = -1;
+};
+Vibration g_vibration[2];
 
 // No tracking (headset asleep, or no frame located yet): eyes straight ahead with a Quest 3-like
 // field of view, for test renders.
@@ -536,9 +543,10 @@ void PrepareDxvkExtensions()
     set(instList.c_str(), devList.c_str());
 }
 
-// The controllers: one action set with the aim pose, the trigger, the grip, B/Y and the thumbstick of
-// either hand, bound for the Touch controllers (and the trigger and pose of any controller through the
-// simple profile).
+// The controllers: one action set with the aim pose, the trigger, the grip, B/Y, A/X, the menu button, the thumbstick
+// and its click of either hand, and their vibration, bound for the Touch controllers (Virtual Desktop gives the game
+// other headsets' controllers as these too), the Index and Windows Mixed Reality controllers (what they have of it) and
+// any other through the simple profile (the trigger, the menu button and the pose).
 void CreateInput()
 {
     XrActionSetCreateInfo si = { XR_TYPE_ACTION_SET_CREATE_INFO };
@@ -558,6 +566,10 @@ void CreateInput()
         { &g_gripAction, "grip", "Grip", XR_ACTION_TYPE_FLOAT_INPUT },
         { &g_buttonAction, "reset", "Reset", XR_ACTION_TYPE_BOOLEAN_INPUT },
         { &g_stickAction, "stick", "Thumbstick", XR_ACTION_TYPE_VECTOR2F_INPUT },
+        { &g_lowerAction, "lower", "A or X", XR_ACTION_TYPE_BOOLEAN_INPUT },
+        { &g_menuAction, "menu", "Menu", XR_ACTION_TYPE_BOOLEAN_INPUT },
+        { &g_thumbAction, "thumbclick", "Thumbstick press", XR_ACTION_TYPE_BOOLEAN_INPUT },
+        { &g_hapticAction, "haptic", "Vibration", XR_ACTION_TYPE_VIBRATION_OUTPUT },
     };
     for (auto& a : actions)
     {
@@ -589,10 +601,33 @@ void CreateInput()
               { g_triggerAction, "/user/hand/left/input/trigger/value" }, { g_triggerAction, "/user/hand/right/input/trigger/value" },
               { g_gripAction, "/user/hand/left/input/squeeze/value" }, { g_gripAction, "/user/hand/right/input/squeeze/value" },
               { g_buttonAction, "/user/hand/left/input/y/click" }, { g_buttonAction, "/user/hand/right/input/b/click" },
-              { g_stickAction, "/user/hand/left/input/thumbstick" }, { g_stickAction, "/user/hand/right/input/thumbstick" } });
+              { g_stickAction, "/user/hand/left/input/thumbstick" }, { g_stickAction, "/user/hand/right/input/thumbstick" },
+              { g_lowerAction, "/user/hand/left/input/x/click" }, { g_lowerAction, "/user/hand/right/input/a/click" },
+              { g_menuAction, "/user/hand/left/input/menu/click" },
+              { g_thumbAction, "/user/hand/left/input/thumbstick/click" }, { g_thumbAction, "/user/hand/right/input/thumbstick/click" },
+              { g_hapticAction, "/user/hand/left/output/haptic" }, { g_hapticAction, "/user/hand/right/output/haptic" } });
+    suggest("/interaction_profiles/valve/index_controller",
+            { { g_aimAction, "/user/hand/left/input/aim/pose" }, { g_aimAction, "/user/hand/right/input/aim/pose" },
+              { g_triggerAction, "/user/hand/left/input/trigger/value" }, { g_triggerAction, "/user/hand/right/input/trigger/value" },
+              { g_gripAction, "/user/hand/left/input/squeeze/value" }, { g_gripAction, "/user/hand/right/input/squeeze/value" },
+              { g_buttonAction, "/user/hand/left/input/b/click" }, { g_buttonAction, "/user/hand/right/input/b/click" },
+              { g_stickAction, "/user/hand/left/input/thumbstick" }, { g_stickAction, "/user/hand/right/input/thumbstick" },
+              { g_lowerAction, "/user/hand/left/input/a/click" }, { g_lowerAction, "/user/hand/right/input/a/click" },
+              { g_thumbAction, "/user/hand/left/input/thumbstick/click" }, { g_thumbAction, "/user/hand/right/input/thumbstick/click" },
+              { g_hapticAction, "/user/hand/left/output/haptic" }, { g_hapticAction, "/user/hand/right/output/haptic" } });
+    suggest("/interaction_profiles/microsoft/motion_controller",
+            { { g_aimAction, "/user/hand/left/input/aim/pose" }, { g_aimAction, "/user/hand/right/input/aim/pose" },
+              { g_triggerAction, "/user/hand/left/input/trigger/value" }, { g_triggerAction, "/user/hand/right/input/trigger/value" },
+              { g_gripAction, "/user/hand/left/input/squeeze/click" }, { g_gripAction, "/user/hand/right/input/squeeze/click" },
+              { g_stickAction, "/user/hand/left/input/thumbstick" }, { g_stickAction, "/user/hand/right/input/thumbstick" },
+              { g_menuAction, "/user/hand/left/input/menu/click" },
+              { g_thumbAction, "/user/hand/left/input/thumbstick/click" }, { g_thumbAction, "/user/hand/right/input/thumbstick/click" },
+              { g_hapticAction, "/user/hand/left/output/haptic" }, { g_hapticAction, "/user/hand/right/output/haptic" } });
     suggest("/interaction_profiles/khr/simple_controller",
             { { g_aimAction, "/user/hand/left/input/aim/pose" }, { g_aimAction, "/user/hand/right/input/aim/pose" },
-              { g_triggerAction, "/user/hand/left/input/select/click" }, { g_triggerAction, "/user/hand/right/input/select/click" } });
+              { g_triggerAction, "/user/hand/left/input/select/click" }, { g_triggerAction, "/user/hand/right/input/select/click" },
+              { g_menuAction, "/user/hand/left/input/menu/click" },
+              { g_hapticAction, "/user/hand/left/output/haptic" }, { g_hapticAction, "/user/hand/right/output/haptic" } });
     for (int h = 0; h < 2; h++)
     {
         XrActionSpaceCreateInfo ci = { XR_TYPE_ACTION_SPACE_CREATE_INFO };
@@ -637,9 +672,15 @@ void ReadInput()
             f = { XR_TYPE_ACTION_STATE_FLOAT };
             gi.action = g_gripAction;
             if (XR_SUCCEEDED(xrGetActionStateFloat(g_session, &gi, &f)) && f.isActive) c.grip = f.currentState;
-            XrActionStateBoolean b = { XR_TYPE_ACTION_STATE_BOOLEAN };
-            gi.action = g_buttonAction;
-            if (XR_SUCCEEDED(xrGetActionStateBoolean(g_session, &gi, &b)) && b.isActive) c.button = b.currentState != XR_FALSE;
+            auto pressed = [&](XrAction action) {
+                XrActionStateBoolean b = { XR_TYPE_ACTION_STATE_BOOLEAN };
+                gi.action = action;
+                return XR_SUCCEEDED(xrGetActionStateBoolean(g_session, &gi, &b)) && b.isActive && b.currentState != XR_FALSE;
+            };
+            c.button = pressed(g_buttonAction);
+            c.lower = pressed(g_lowerAction);
+            c.menu = pressed(g_menuAction);
+            c.thumb = pressed(g_thumbAction);
             XrActionStateVector2f v = { XR_TYPE_ACTION_STATE_VECTOR2F };
             gi.action = g_stickAction;
             if (XR_SUCCEEDED(xrGetActionStateVector2f(g_session, &gi, &v)) && v.isActive) c.stick[0] = v.currentState.x, c.stick[1] = v.currentState.y;
@@ -1182,6 +1223,35 @@ EyePose Pose(int eye) { return ToGamePose(g_views[eye].pose); }
 Controller Hand(int hand) { return g_fake ? g_testHands[hand] : g_hands[hand]; }
 
 void SetTestHand(int hand, const Controller& c) { g_testHands[hand] = c; }
+
+// Each vibration is sent for a little longer than it is sent again (the game's force feedback changes from frame to
+// frame), so a frame that comes late does not leave a gap and a vibration the game stops ends by itself.
+void Haptics(int hand, float amplitude)
+{
+    Vibration& v = g_vibration[hand];
+    amplitude = amplitude > 1.0f ? 1.0f : roundf(amplitude * 20.0f) / 20.0f;  // steps of 5%: not a call every frame
+    if (amplitude < 0.05f) amplitude = 0;
+    double now = NowSeconds();
+    if (amplitude == v.amplitude && (amplitude == 0 || now - v.sent < 0.05)) return;
+    v.amplitude = amplitude;
+    v.sent = now;
+    if (!g_running || !g_hapticAction) return;
+    XrHapticActionInfo hi = { XR_TYPE_HAPTIC_ACTION_INFO };
+    hi.action = g_hapticAction;
+    hi.subactionPath = g_handPath[hand];
+    if (amplitude == 0)
+    {
+        xrStopHapticFeedback(g_session, &hi);
+        return;
+    }
+    XrHapticVibration vib = { XR_TYPE_HAPTIC_VIBRATION };
+    vib.duration = 100000000;  // 0.1 s
+    vib.frequency = XR_FREQUENCY_UNSPECIFIED;
+    vib.amplitude = amplitude;
+    xrApplyHapticFeedback(g_session, &hi, (const XrHapticBaseHeader*)&vib);
+}
+
+float HapticsAmplitude(int hand) { return g_vibration[hand].amplitude; }
 
 EyeFov Fov(int eye)
 {

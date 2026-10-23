@@ -1,6 +1,7 @@
 #include "d3dcreate.h"
 
 #include "background.h"
+#include "controllers.h"
 #include "dxvk_interop.h"
 #include "game.h"
 #include "largeaddress.h"
@@ -31,6 +32,7 @@ HRESULT __stdcall CreateDeviceHook(IDirect3D9* d3d, UINT adapter, D3DDEVTYPE typ
     if (SUCCEEDED(hr) && out && *out)
     {
         BackgroundAfterDevice(pp && pp->hDeviceWindow ? pp->hDeviceWindow : wnd);
+        FocusGameWindow(pp && pp->hDeviceWindow ? pp->hDeviceWindow : wnd);
         OnDeviceCreated(*out);
     }
     return hr;

@@ -122,6 +122,7 @@ void LoadConfig()
     g_cfg.testRecord = GetPrivateProfileIntW(L"Test", L"Record", d.testRecord, p) != 0;
     g_cfg.testReplay = GetPrivateProfileIntW(L"Test", L"Replay", d.testReplay, p) != 0;
     g_cfg.testFrameTimes = GetPrivateProfileIntW(L"Test", L"FrameTimes", d.testFrameTimes, p) != 0;
+    g_cfg.testControllersLog = GetPrivateProfileIntW(L"Test", L"ControllersLog", d.testControllersLog, p) != 0;
     g_cfg.testReplayStop = GetPrivateProfileIntW(L"Test", L"ReplayStop", d.testReplayStop, p);
     g_cfg.testReplayTrace = GetPrivateProfileIntW(L"Test", L"ReplayTrace", d.testReplayTrace, p);
     {
@@ -180,6 +181,8 @@ void LoadConfig()
     g_cfg.vrMirrorRadius = IniFloat(p, L"VR", L"MirrorRadius", d.vrMirrorRadius);
     g_cfg.vrMirrorRadius = g_cfg.vrMirrorRadius > 0.0f ? std::max(g_cfg.vrMirrorRadius, 0.3f) : 0.0f;
     g_cfg.vrLargeAddressAware = GetPrivateProfileIntW(L"VR", L"LargeAddressAware", d.vrLargeAddressAware, p) != 0;
+    g_cfg.vrMotionControllers = GetPrivateProfileIntW(L"VR", L"MotionControllers", d.vrMotionControllers, p) != 0;
+    g_cfg.vrRumble = std::clamp(IniFloat(p, L"VR", L"Rumble", d.vrRumble), 0.0f, 2.0f);
     g_cfg.keyRecenter = GetPrivateProfileIntW(L"Keys", L"Recenter", d.keyRecenter, p);
     g_cfg.logIntervalSeconds = IniFloat(p, L"Log", L"IntervalSeconds", d.logIntervalSeconds);
     g_cfg.keyScreenshot = GetPrivateProfileIntW(L"Keys", L"Screenshot", d.keyScreenshot, p);
