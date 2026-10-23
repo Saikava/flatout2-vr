@@ -80,6 +80,7 @@ struct Config
     std::wstring vrPauseButton;       // a VR controllers' button that also pauses (controllers.cpp, kPauseButtons; "": none)
     bool vrGrabWheel = false;         // experimental: the VR controllers' grips hold the car's steering wheel, the hands turn it
     float vrWheelTurn = 90.0f;        // GrabWheel: the hands' turn for full lock, degrees
+    float vrWheelRange = 0.0f;        // a steering wheel's turn from lock to lock, degrees: the cockpit's wheel turns as it (0 = as the car's steering)
     float vrEngineRumble = 0.0f;      // the engine's revs and throttle as a steady vibration, this strong (0 = none)
     // [Log]
     float logIntervalSeconds = 2.0f;

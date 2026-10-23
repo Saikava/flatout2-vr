@@ -902,8 +902,8 @@ int g_pauseButton = -1;
 // the thumbstick) takes hold of it, and the turn of the holding hands about the hub, in the wheel's plane, turns it
 // (two hands: their turns averaged, so either may slip), up to [VR] WheelTurn degrees either way, which is full
 // lock. Let go, the wheel goes back to the middle in a fraction of a second. Its turn is the steering, given to
-// the game as the axis whose steering is that (see AxisForSteering): at 90 degrees, the default, the cockpit's wheel
-// turns with the hands (on the move the game turns the car, and its wheel, less: its own steering at speed).
+// the game as the axis whose steering is that (see AxisForSteering); the cockpit's wheel turns with the hands
+// (ControllersWheelTurn), up to its 90 degrees, also on the move, where the game steers the car less.
 class GrabbedWheel
 {
 public:
@@ -1015,6 +1015,22 @@ float AxisForSteering(float s)
     if (!(cubic >= 0 && cubic <= 1)) cubic = 0.5f;
     float v = UnCubic((100 - sensitivity) * 0.01f, UnCubic(cubic, std::min(s, 1.0f)));
     return std::clamp(0.5f + (v - 0.5f) * saturation * 0.01f, 0.0f, 1.0f);
+}
+
+// The held wheel's turn as VrPad last read it (ControllersWheelTurn): -1 to 1 for the cockpit wheel's 90 degrees.
+bool g_wheelHeld;
+float g_wheelHeldTurn;
+
+// (action, controller): a control's value as the game reads it, 0 to 1 (game.h, kActionValue).
+uintptr_t g_actionValueFn = fo2::kActionValue;
+__declspec(naked) float __stdcall ActionValue(const BYTE*, const BYTE*)
+{
+    __asm {
+        mov eax, [esp + 4]
+        mov edx, [esp + 8]
+        call dword ptr [g_actionValueFn]
+        ret 8
+    }
 }
 
 class VrPad : public IDirectInputDevice8A
@@ -1340,6 +1356,7 @@ private:
         float steer = 0;
         const xr::Controller hands[2] = { l, r };
         bool wheel = g_cfg.vrGrabWheel && m_wheel.Steering(hands, steer);
+        g_wheelHeld = wheel, g_wheelHeldTurn = steer * g_cfg.vrWheelTurn / 90.0f;
         if (wheel)
             s.lX = Scale(0, std::copysign(AxisForSteering(std::abs(steer)), steer), false);
         else
@@ -1573,6 +1590,35 @@ bool ControllersRecenter()
     bool pressed = down && !wasDown;
     wasDown = down;
     return pressed;
+}
+
+// [VR] WheelRange: the chosen game controller's steering (its controls' left and right half axes) as the controller
+// has it, not bent by the game's sensitivity and saturation, times half the wheel's range. Not the VR controllers'
+// thumbstick, which is no wheel: their wheel is the cockpit's, held in the hands (GrabWheel).
+bool ControllersWheelTurn(float& turn)
+{
+    BYTE* input = *(BYTE**)fo2::kInput;
+    int count = input ? *(int*)(input + fo2::kInputControllers) : 0;
+    for (int i = 0; i < count && i < 4; i++)
+    {
+        const BYTE* c = ((BYTE**)(input + fo2::kInputControllerList))[i];
+        if (!c) continue;
+        if (*(const GUID*)(c + fo2::kControllerGuid) == kVrPadProduct)
+        {
+            if (!g_wheelHeld) continue;
+            turn = std::clamp(g_wheelHeldTurn, -1.0f, 1.0f);
+            return true;
+        }
+        const BYTE* left = c + fo2::kControllerActions + fo2::kActionSteerLeft * fo2::kActionSize;
+        const BYTE* right = c + fo2::kControllerActions + fo2::kActionSteerRight * fo2::kActionSize;
+        if (g_cfg.vrWheelRange <= 0 || *(const int*)(left + fo2::kActionType) != 1 || *(const int*)(right + fo2::kActionType) != 1)
+            continue;  // (the keyboard's are keys)
+        float s = std::clamp(ActionValue(right, c), 0.0f, 1.0f) - std::clamp(ActionValue(left, c), 0.0f, 1.0f);
+        if (!(std::abs(s) <= 1.0f)) continue;  // (an axis from and to the same value)
+        turn = std::clamp(s * g_cfg.vrWheelRange / 180.0f, -1.0f, 1.0f);
+        return true;
+    }
+    return false;
 }
 
 // ---- the menus' keys ----------------------------------------------------------------------------------------------

@@ -1963,6 +1963,52 @@ static __declspec(naked) void SampleAnimHook()
     }
 }
 
+// [VR] WheelRange (and GrabWheel): the player's car's steering wheel, and the driver's hands on it, turn as the player's
+// own wheel (or the hands holding the cockpit's: ControllersWheelTurn), not as the car's steering. That follows the
+// controller's bent by the game's curves, at a limited rate and less at speed (game.h, kSteeringCubic), and its full
+// lock turns the cockpit's wheel 90 degrees: with a wheel of 900 degrees the cockpit's turned a fifth as far, less on the
+// move. The car's steering is set to the player's own wheel's while its parts and its driver are posed (kPoseCarParts,
+// kPoseDriver), and put back; past 90 degrees the cockpit's wheel stays at its lock (the driving animation's end).
+bool g_ownWheel;  // both calls hooked
+
+bool OwnWheelTurn(const BYTE* car, float& turn)
+{
+    BYTE* player = LocalPlayer();
+    if (!g_ownWheel || !player || car != *(BYTE**)(player + fo2::kPlayerCar) || !InRace()) return false;
+    if (*(const int*)(player + fo2::kPlayerInputOff) || *(const int*)(player + fo2::kPlayerSteerKeys)) return false;
+    if (*(const int*)(car + fo2::kCarRagdoll + fo2::kRagdollOut)) return false;
+    return ControllersWheelTurn(turn);
+}
+
+// At kPoseCarPartsCall, instead of kPoseCarParts.
+static void __stdcall PoseCarPartsHook(BYTE* car, float dt)
+{
+    float* steering = (float*)(car + fo2::kCarSteering);
+    float game = *steering, turn;
+    bool own = OwnWheelTurn(car, turn);
+    if (own) *steering = turn;
+    ((void(__stdcall*)(BYTE*, float))fo2::kPoseCarParts)(car, dt);
+    *steering = game;
+    if (own && g_cfg.testControllersLog)
+    {
+        static double logged;
+        static float last;
+        if (NowSeconds() - logged > 0.1 && std::abs(turn - last) > 0.001f)
+        {
+            logged = NowSeconds(), last = turn;
+            Log("cockpit: the steering wheel at %.1f degrees as the player's own (the car's steering at %.1f)", turn * 90.0f, game * 90.0f);
+        }
+    }
+}
+
+// At kPoseDriverCall, instead of kPoseDriver.
+static void __stdcall PoseDriverHook(BYTE* ragdoll, float* place, float steering)
+{
+    float turn;
+    if (OwnWheelTurn(ragdoll - fo2::kCarRagdoll, turn)) steering = turn;
+    ((void(__stdcall*)(BYTE*, float*, float))fo2::kPoseDriver)(ragdoll, place, steering);
+}
+
 static int __stdcall CarViewMode(int mode, BYTE* car)
 {
     bool flying = g_vrEye.active && car == g_flight.car;  // the eyes in the thrown driver's head: the car whole
@@ -6224,6 +6270,16 @@ bool InstallRenderHooks()
                                                   : "the eyes go into the driver's head when he is thrown out (EjectView=2)");
     if (g_cfg.vrEnabled && !PatchCall(fo2::kSampleAnimCall, fo2::kSampleAnim, (const void*)&SampleAnimHook))
         Log("drivers: the animation call differs - the hands move in the animation's steps");
+    if (g_cfg.vrEnabled && (g_cfg.vrWheelRange > 0 || g_cfg.vrGrabWheel))
+    {
+        // (the driver's first: with only the wheel's hooked, the hands would leave it)
+        g_ownWheel = PatchCall(fo2::kPoseDriverCall, fo2::kPoseDriver, (const void*)&PoseDriverHook) &&
+                     PatchCall(fo2::kPoseCarPartsCall, fo2::kPoseCarParts, (const void*)&PoseCarPartsHook);
+        if (!g_ownWheel)
+            Log("cockpit: the car's posing calls differ - the steering wheel turns as the car's steering");
+        else if (g_cfg.vrWheelRange > 0)
+            Log("cockpit: the steering wheel turns as a game controller's of %.0f degrees lock to lock (WheelRange), up to its 90", g_cfg.vrWheelRange);
+    }
     // (the camera is turned for the markers only when their triangles are taken: on the HUD they would stand wrong)
     if (g_cfg.vrEnabled && (!HookMarkerDraw() || !PatchCall(fo2::kMarkersCall, fo2::kMarkers, (const void*)&MarkersHook)))
         Log("markers: the HUD's calls differ - the rivals' markers stay on the HUD");

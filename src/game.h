@@ -417,6 +417,16 @@ constexpr uintptr_t kThrowDriverOut = 0x424EF0;
 constexpr int kCarCrashArg = 0x2A84;
 constexpr uintptr_t kSampleAnimCall = 0x57CA2F;
 constexpr uintptr_t kSampleAnim = 0x57ADA0;
+// The car's steering, -1 (left) to 1: the player's (see kSteeringCubic) times the speed's factor.
+constexpr int kCarSteering = 0x1E04;  // float
+// Every car step poses its parts with __stdcall(car, float dt) (kPoseCarParts, called at kPoseCarPartsCall), the
+// steering wheel among them (kCarSteeringWheel): turned by the steering (and a shake on rough ground), clamped to -1..1,
+// times 90 degrees. Then it poses the driver from the steering with __stdcall(ragdoll, float* place, float steering)
+// (kPoseDriver at kPoseDriverCall; see kSampleAnim). Each reads the steering once.
+constexpr uintptr_t kPoseCarPartsCall = 0x42948E;
+constexpr uintptr_t kPoseCarParts = 0x4231D0;
+constexpr uintptr_t kPoseDriverCall = 0x4295E4;
+constexpr uintptr_t kPoseDriver = 0x57C970;
 // An animation: its bone count (+0), start and end time (+4, +8), time per frame (+0x14).
 constexpr int kAnimBones = 0x0;
 constexpr int kAnimStart = 0x4;
@@ -539,6 +549,22 @@ constexpr int kControllerRemap = 0x784;
 constexpr int kControllerGuid = 0x8;
 constexpr int kControllerSensitivity = 0x134;
 constexpr int kControllerSaturation = 0x13C;
+// A controller's controls (Configure controls; Savegame\am*.dat keeps them): 20 entries of kActionSize bytes from
+// kControllerActions, each a key (type 0: its virtual key at +4), an axis (type 1: the index of its value in
+// DIJOYSTATE2 at +4, from which value to which in shorts at +0xC and +0xE) or a button (type 2). The steering is the
+// right half axis's value less the left one's (kActionSteerRight, kActionSteerLeft), each read by kActionValue (the
+// entry in eax, the controller in edx; an axis's (value - from) / (to - from), 0..1, on the FPU stack), then stretched
+// by the saturation and bent by the sensitivity (0x55D920).
+constexpr int kControllerActions = 0x644;
+constexpr int kActionSize = 16;
+constexpr int kActionType = 8;
+constexpr int kActionSteerLeft = 12;
+constexpr int kActionSteerRight = 13;
+constexpr uintptr_t kActionValue = 0x55EA50;
+// The player's input (0x46D22F, every frame): none while kPlayerInputOff is set (the steering put back to the middle);
+// else the steering from its controls, an axis's (kPlayerSteerKeys clear) or the keys'.
+constexpr int kPlayerInputOff = 0x378;
+constexpr int kPlayerSteerKeys = 0x668;
 // The player's steering (0x46F6C4) bends the controller's again, (1 - c) y + c y^3 with c here (0.5, from the game's
 // data), moves toward it at a limited rate (centre to full lock in half a second), and the car's steering is that times
 // a factor that falls with the speed (0x46FA50: 1 up to 20, 0.8 at 40, 0.5 at 100, 0.25 at 250). The steering wheel in

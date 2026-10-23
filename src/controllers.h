@@ -13,3 +13,7 @@ void FocusGameWindow(HWND window);
 bool ControllersRecenter();
 // Per frame: in the game's menus (which take only the keyboard) the VR controllers and Xbox controllers press its keys.
 void ControllersMenuKeys();
+// The player's own steering wheel's turn, for the cockpit's (render.cpp): -1 to 1 for the cockpit wheel's 90 degrees
+// either way. The hands' turn while they hold the cockpit's wheel ([VR] GrabWheel), or a game controller's steering axis
+// as its wheel turns ([VR] WheelRange). False when neither (the car's steering turns it, as the game has it).
+bool ControllersWheelTurn(float& turn);

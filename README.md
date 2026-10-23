@@ -122,6 +122,14 @@ feedback On in the game's options, an Xbox controller vibrates in crashes (and w
 engine's revs). In VR the game reads its game controllers, and plays its sound, even when its window on the
 monitor does not have the focus (started from the headset, it may never have had it).
 
+### Steering wheels
+
+The cockpit's steering wheel turns as the game steers the car: 90 degrees at full lock, which your wheel
+reaches only at its own (450 degrees on a 900-degree wheel), and slower and less at speed. Set `WheelRange=`
+in `scripts\FO2VR.ini` to your wheel's range from lock to lock, in degrees, as set in its software (900 for
+most), and the cockpit's wheel turns as yours, as far and as fast, up to its lock at 90 degrees either way,
+where the driver's hands stop (the game has no animation past that).
+
 ## Settings
 
 `scripts\FO2VR.ini`, section `[VR]`:
@@ -158,6 +166,7 @@ monitor does not have the focus (started from the headset, it may never have had
 | `EngineRumble` | 0 | The engine as a light, steady vibration while driving (VR controllers, an Xbox controller's light motor), stronger with the revs and the throttle, at most this strong (0.2-0.5: a hum under the crashes'; 0: none) |
 | `GrabWheel` | 0 | Experimental: the VR controllers' grips take hold of the cockpit's steering wheel, which your hands then turn (instead of shifting gears) |
 | `WheelTurn` | 90 | How far your hands turn the wheel for full lock, degrees (at 90 the cockpit's wheel turns with them; more: slower steering) |
+| `WheelRange` | 0 | A steering wheel as the game controller: its range from lock to lock, degrees (as set in its software; 900 for most). The cockpit's steering wheel then turns as yours, up to its lock at 90 degrees either way (see [Steering wheels](#steering-wheels); 0: as the game steers the car, slower and less at speed) |
 
 ## Troubleshooting
 

@@ -191,6 +191,8 @@ void LoadConfig()
     }
     g_cfg.vrGrabWheel = GetPrivateProfileIntW(L"VR", L"GrabWheel", d.vrGrabWheel, p) != 0;
     g_cfg.vrWheelTurn = std::clamp(IniFloat(p, L"VR", L"WheelTurn", d.vrWheelTurn), 30.0f, 900.0f);
+    float range = IniFloat(p, L"VR", L"WheelRange", d.vrWheelRange);
+    g_cfg.vrWheelRange = range > 0 ? std::clamp(range, 90.0f, 3600.0f) : 0.0f;
     g_cfg.vrEngineRumble = std::clamp(IniFloat(p, L"VR", L"EngineRumble", d.vrEngineRumble), 0.0f, 1.0f);
     g_cfg.keyRecenter = GetPrivateProfileIntW(L"Keys", L"Recenter", d.keyRecenter, p);
     g_cfg.logIntervalSeconds = IniFloat(p, L"Log", L"IntervalSeconds", d.logIntervalSeconds);
