@@ -423,6 +423,12 @@ constexpr int kAnimStart = 0x4;
 constexpr int kAnimEnd = 0x8;
 constexpr int kAnimFrameTime = 0x14;
 constexpr int kCarSteeringWheel = 0x32F0;  // scene node*
+// The engine: its revs (per minute), its idle and its limit (the engine's sound is given the revs and the limit,
+// 0x42431F), and the throttle as the engine has it (0 to 1, the pedal through the automatic gearbox's shifts).
+constexpr int kCarEngineRevs = 0x5D8;      // float
+constexpr int kCarEngineIdle = 0x390;      // float
+constexpr int kCarEngineLimit = 0x3AC;     // float
+constexpr int kCarEngineThrottle = 0x5B8;  // float
 // A scene node's world matrix (float[16], rows right, up, forward, position); its local one is at +0x40.
 constexpr int kNodeWorld = 0x80;
 // Its flags: kNodeHidden leaves it out (SetCarView sets it on the driver for the camera inside the car).
@@ -526,11 +532,27 @@ constexpr uintptr_t kInput = 0x8E844C;  // the input's object*
 constexpr int kInputControllers = 0x4;
 constexpr int kInputControllerList = 0x1C;
 constexpr int kControllerRemap = 0x784;
+// A controller's product GUID and its settings, in percent (Options > Controller options): the sensitivity bends its
+// steering ((1 - k) v + k v^3 with k = (100 - sensitivity) / 100, 0x561780, a table of 1024 read at 0x55D920), the
+// dead zone, and the saturation, which first stretches each half axis's value v about its middle ((v - 0.5) /
+// (saturation / 100) + 0.5, clamped to 0..1).
+constexpr int kControllerGuid = 0x8;
+constexpr int kControllerSensitivity = 0x134;
+constexpr int kControllerSaturation = 0x13C;
+// The player's steering (0x46F6C4) bends the controller's again, (1 - c) y + c y^3 with c here (0.5, from the game's
+// data), moves toward it at a limited rate (centre to full lock in half a second), and the car's steering is that times
+// a factor that falls with the speed (0x46FA50: 1 up to 20, 0.8 at 40, 0.5 at 100, 0.25 at 250). The steering wheel in
+// the cockpit turns 90 degrees at full lock.
+constexpr uintptr_t kSteeringCubic = 0x8DB9E0;  // float
 // The game's keyboard: its WH_KEYBOARD hook (0x55AAD0) keeps a state per virtual key (0x80 down, bit 0 toggled on
 // every press), counts presses per key and the keys held. The menus read these.
 constexpr uintptr_t kKeyState = 0x8D7E60;    // BYTE[256]
 constexpr uintptr_t kKeyPresses = 0x8D7D60;  // BYTE[256]
 constexpr uintptr_t kKeysHeld = 0x8DA740;    // int
+
+// ---- sound -------------------------------------------------------------------------------------
+// The game's import of GetProcAddress, through which its sound (FMOD 3.75, built in) gets DirectSoundCreate8.
+constexpr uintptr_t kIatGetProcAddress = 0x6521C8;
 
 // ---- game state -----------------------------------------------------------------------------
 constexpr uintptr_t kGameFlow = 0x8E8410;  // GameFlow*

@@ -4,6 +4,7 @@
 #include "game.h"
 #include "pacing.h"
 #include "record.h"
+#include "render.h"
 #include "util.h"
 #include "xr.h"
 
@@ -59,6 +60,23 @@ struct Motors
 };
 
 class ForceFeedback;
+
+bool g_driving;  // the player drives (ControllersMenuKeys, once a frame)
+
+// [VR] EngineRumble: the engine as a light, steady vibration (the game's force feedback has nothing of it) while the
+// player drives: from a tenth of EngineRumble at idle with the foot off to all of it at the rev limit with the
+// throttle down.
+float EngineHum()
+{
+    if (g_cfg.vrEngineRumble <= 0 || !g_driving) return 0;
+    BYTE* player = *(BYTE**)fo2::kLocalPlayer;
+    BYTE* car = player ? *(BYTE**)(player + fo2::kPlayerCar) : nullptr;
+    if (!car) return 0;
+    float revs = *(float*)(car + fo2::kCarEngineRevs), idle = *(float*)(car + fo2::kCarEngineIdle), limit = *(float*)(car + fo2::kCarEngineLimit);
+    if (!(idle >= 0 && limit > idle + 100 && revs >= 0)) return 0;
+    float rev = std::clamp((revs - idle) / (limit - idle), 0.0f, 1.0f), throttle = std::clamp(*(float*)(car + fo2::kCarEngineThrottle), 0.0f, 1.0f);
+    return g_cfg.vrEngineRumble * (0.25f + 0.75f * rev) * (0.4f + 0.6f * throttle);
+}
 
 const char* EffectName(REFGUID g)
 {
@@ -240,15 +258,16 @@ public:
     }
 
     DWORD gain = 10000;  // DIPROP_FFGAIN
-    // The motors now: the effects' sum times the controller's gain (nothing with the actuators off or paused).
+    // The motors now: the effects' sum times the controller's gain, the engine's hum on the light motor (nothing with
+    // the actuators off, that is Force feedback off in the game's options, or paused).
     Motors Output(double now)
     {
         Motors m;
         if (!m_actuators || m_paused) return m;
         for (Effect* e : m_effects) e->Add(now, m);
-        float g = (float)gain / 10000.0f * g_cfg.vrRumble;
-        m.low = std::min(m.low * g, 1.0f);
-        m.high = std::min(m.high * g, 1.0f);
+        float g = (float)gain / 10000.0f;
+        m.low = std::min(m.low * g * g_cfg.vrRumble, 1.0f);
+        m.high = std::min(std::max(m.high * g * g_cfg.vrRumble, EngineHum() * g), 1.0f);
         return m;
     }
 
@@ -798,7 +817,8 @@ private:
 // right trigger Rz; buttons 0 A, 1 B, 2 X, 3 Y, 4 and 5 the grips, 6 (none), 7 the menu button, 8 and 9 the thumbsticks
 // pressed. The game's controls for it, until changed in its options (Configure controls): steering on the left
 // thumbstick, accelerate and brake on the right and left triggers, nitro A, handbrake B, the camera X, reset Y, pause
-// the menu button, look back the right thumbstick pressed, gears up and down (manual) the right and left grips.
+// the menu button, look back the right thumbstick pressed, gears up and down (manual) the right and left grips (without
+// GrabWheel: with it the grips hold the steering wheel, see GrabbedWheel).
 const GUID kVrPadInstance = { 0x3C2E1F6A, 0x4D5B, 0x704F, { 0x9C, 0x2A, 0x46, 0x4F, 0x32, 0x56, 0x52, 0x31 } };
 const GUID kVrPadProduct = { 0xC0B3F2F0, 0xA156, 0x524E, { 0x8F, 0x4F, 0x32, 0x56, 0x52, 0x43, 0x54, 0x4C } };
 const char kVrPadName[] = "VR controllers";
@@ -859,6 +879,128 @@ int DefaultObject(DWORD semantic)
     for (const DefaultControl& d : kDefaults)
         if (d.semantic == semantic) return d.object;
     return -1;
+}
+
+// ---- the steering wheel in the hands --------------------------------------------------------------------------------
+// [VR] GrabWheel (experimental, off by default: holding the hands up tires them within minutes): a grip squeezed with
+// the hand at the car's steering wheel (as the cockpit has it: SteeringWheel; within 20 cm of its plane, 6 to 40 cm
+// from its hub; a grip already squeezed does not, so that controllers held tight in the lap do not take the wheel from
+// the thumbstick) takes hold of it, and the turn of the holding hands about the hub, in the wheel's plane, turns it
+// (two hands: their turns averaged, so either may slip), up to [VR] WheelTurn degrees either way, which is full
+// lock. Let go, the wheel goes back to the middle in a fraction of a second. Its turn is the steering, given to
+// the game as the axis whose steering is that (see AxisForSteering): at 90 degrees, the default, the cockpit's wheel
+// turns with the hands (on the move the game turns the car, and its wheel, less: its own steering at speed).
+class GrabbedWheel
+{
+public:
+    // The steering (-1 left to 1 right) while the wheel is held or coming back; false when it is free.
+    bool Steering(const xr::Controller hands[2], float& steer)
+    {
+        double now = NowSeconds();
+        float dt = (float)std::clamp(now - m_last, 0.0, 0.1);
+        m_last = now;
+        m_took = -1;
+        float hub[3], ax[9];
+        if (!SteeringWheel(hub, ax))
+        {
+            // (No car: a wheel where a car's would be.)
+            const float h[3] = { 0.0f, -0.29f, 0.57f }, a[9] = { 1, 0, 0, 0, 0.972f, 0.234f, 0, -0.234f, 0.972f };
+            memcpy(hub, h, sizeof(h));
+            memcpy(ax, a, sizeof(a));
+        }
+        // The wheel's plane: its axis (the node's z, which it turns about), and its right and top as when straight.
+        float n[3] = { ax[6], ax[7], ax[8] };
+        Normalize(n);
+        float r[3] = { 1.0f - n[0] * n[0], -n[0] * n[1], -n[0] * n[2] };
+        Normalize(r);
+        const float u[3] = { n[1] * r[2] - n[2] * r[1], n[2] * r[0] - n[0] * r[2], n[0] * r[1] - n[1] * r[0] };
+        float turn = 0;
+        int holding = 0;
+        for (int h = 0; h < 2; h++)
+        {
+            const xr::Controller& c = hands[h];
+            float d[3], along = 0;
+            for (int i = 0; i < 3; i++) d[i] = c.hold.position[i] - hub[i], along += d[i] * n[i];
+            for (int i = 0; i < 3; i++) d[i] -= along * n[i];
+            float x = d[0] * r[0] + d[1] * r[1] + d[2] * r[2], y = d[0] * u[0] + d[1] * u[1] + d[2] * u[2];
+            float angle = atan2f(x, y);  // 0 at the top, to the right positive
+            float off = std::sqrt(x * x + y * y);
+            bool squeezed = c.grip > (m_squeezed[h] ? 0.4f : 0.6f);
+            bool held = c.tracked && squeezed && (m_held[h] ? off > 0.03f : !m_squeezed[h] && std::abs(along) < 0.2f && off > 0.06f && off < 0.4f);
+            m_squeezed[h] = squeezed;
+            if (held && m_held[h])
+            {
+                float a = angle - m_angle[h];
+                a = a > 3.14159265f ? a - 6.2831853f : a < -3.14159265f ? a + 6.2831853f : a;
+                turn += a;
+                holding++;
+            }
+            else if (held)
+                m_took = h;
+            m_held[h] = held;
+            m_angle[h] = angle;
+        }
+        float lock = g_cfg.vrWheelTurn * 0.017453293f;
+        if (holding)
+            m_turn = std::clamp(m_turn + turn / holding, -lock, lock);
+        else if (!m_held[0] && !m_held[1])
+            m_turn *= expf(-dt / 0.06f);  // let go: back to the middle
+        if (!m_held[0] && !m_held[1] && std::abs(m_turn) < 0.002f)
+        {
+            m_turn = 0;
+            return false;
+        }
+        steer = m_turn / lock;
+        return true;
+    }
+    bool Held(int h) const { return m_held[h]; }
+    int Took() const { return m_took; }  // the hand that took hold this time (-1: none)
+
+private:
+    static void Normalize(float v[3])
+    {
+        float l = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+        if (l > 1e-6f) v[0] /= l, v[1] /= l, v[2] /= l;
+    }
+
+    bool m_held[2] = {}, m_squeezed[2] = {};
+    float m_angle[2] = {};  // each hand's angle about the hub last time
+    float m_turn = 0;       // the wheel's turn, radians (to the right positive)
+    int m_took = -1;
+    double m_last = 0;
+};
+
+// (1 - k) x + k x^3 = s for x in 0..1 (the game's steering curves; s in 0..1).
+float UnCubic(float k, float s)
+{
+    float x = s;
+    for (int i = 0; i < 8; i++) x = std::clamp(x - ((1 - k) * x + k * x * x * x - s) / ((1 - k) + 3 * k * x * x), 0.0f, 1.0f);
+    return x;
+}
+
+// The half axis's value (0..1) the game turns into steering s (0..1): its curves and the controller's saturation
+// undone (game.h, kControllerSensitivity and kSteeringCubic), with the settings the game has for the VR controllers.
+float AxisForSteering(float s)
+{
+    if (s <= 0) return 0;
+    int sensitivity = 90, saturation = 90;
+    if (BYTE* input = *(BYTE**)fo2::kInput)
+    {
+        int count = *(int*)(input + fo2::kInputControllers);
+        for (int i = 0; i < count && i < 4; i++)
+        {
+            BYTE* c = ((BYTE**)(input + fo2::kInputControllerList))[i];
+            if (c && *(GUID*)(c + fo2::kControllerGuid) == kVrPadProduct)
+            {
+                sensitivity = std::clamp(*(int*)(c + fo2::kControllerSensitivity), 0, 100);
+                saturation = std::clamp(*(int*)(c + fo2::kControllerSaturation), 10, 100);
+            }
+        }
+    }
+    float cubic = *(float*)fo2::kSteeringCubic;
+    if (!(cubic >= 0 && cubic <= 1)) cubic = 0.5f;
+    float v = UnCubic((100 - sensitivity) * 0.01f, UnCubic(cubic, std::min(s, 1.0f)));
+    return std::clamp(0.5f + (v - 0.5f) * saturation * 0.01f, 0.0f, 1.0f);
 }
 
 class VrPad : public IDirectInputDevice8A
@@ -1181,24 +1323,45 @@ private:
         float ls[2], rs[2];
         stick(l.stick, ls);
         stick(r.stick, rs);
-        s.lX = Scale(0, ls[0], true);
+        float steer = 0;
+        const xr::Controller hands[2] = { l, r };
+        bool wheel = g_cfg.vrGrabWheel && m_wheel.Steering(hands, steer);
+        if (wheel)
+            s.lX = Scale(0, std::copysign(AxisForSteering(std::abs(steer)), steer), false);
+        else
+            s.lX = Scale(0, ls[0], true);
         s.lY = Scale(1, -ls[1], true);
         s.lZ = Scale(2, trigger(l.trigger), false);
         s.lRx = Scale(3, rs[0], true);
         s.lRy = Scale(4, -rs[1], true);
         s.lRz = Scale(5, trigger(r.trigger), false);
         auto grip = [](bool& held, float g) { return held = held ? g > 0.4f : g > 0.6f; };
-        const bool buttons[kButtons] = { r.lower, r.button, l.lower, l.button, grip(m_grip[0], l.grip), grip(m_grip[1], r.grip), false, l.menu, l.thumb, r.thumb };
+        // (With GrabWheel the grips hold the wheel, not shift.)
+        bool grips = !g_cfg.vrGrabWheel;
+        const bool buttons[kButtons] = { r.lower, r.button, l.lower, l.button, grips && grip(m_grip[0], l.grip), grips && grip(m_grip[1], r.grip), false,
+                                         l.menu, l.thumb, r.thumb };
+        if (m_wheel.Took() >= 0) m_tick[m_wheel.Took()] = NowSeconds() + 0.04;
+        if (g_cfg.testControllersLog && (wheel || m_wasWheel))
+        {
+            static double logged;
+            if (NowSeconds() - logged > 0.1 || wheel != m_wasWheel)
+            {
+                logged = NowSeconds();
+                Log("controllers: wheel %s, held %d %d, steering %.3f, axis %ld", wheel ? "on" : "free", m_wheel.Held(0), m_wheel.Held(1), wheel ? steer : 0.0f,
+                    s.lX);
+            }
+        }
+        m_wasWheel = wheel;
         for (int b = 0; b < kButtons; b++) s.rgbButtons[b] = buttons[b] ? 0x80 : 0;
     }
 
     void Update() { Vibrate(m_ff.Output(NowSeconds())); }
     void Vibrate(Motors m)
     {
-        // One motor in each hand: as strong as the stronger of the two.
+        // One motor in each hand: as strong as the stronger of the two (and a tick for a hand taking the wheel).
         float a = std::min(std::max(m.low, m.high), 1.0f);
-        xr::Haptics(0, a);
-        xr::Haptics(1, a);
+        double now = NowSeconds();
+        for (int h = 0; h < 2; h++) xr::Haptics(h, now < m_tick[h] ? std::max(a, 0.4f) : a);
         if (g_cfg.testControllersLog && xr::HapticsAmplitude(1) != m_logged)
         {
             m_logged = xr::HapticsAmplitude(1);
@@ -1212,6 +1375,9 @@ private:
     DWORD m_deadzone[kAxes] = {}, m_saturation[kAxes] = { 10000, 10000, 10000, 10000, 10000, 10000 };
     DWORD m_autocenter = DIPROPAUTOCENTER_OFF;
     bool m_grip[2] = {};
+    GrabbedWheel m_wheel;
+    bool m_wasWheel = false;
+    double m_tick[2] = {};  // a hand's tick of vibration lasts until then
     float m_logged = 0;
     bool m_read = false;
     DIJOYSTATE2 m_last = {};
@@ -1518,6 +1684,7 @@ void ControllersMenuKeys()
     if (!g_cfg.vrEnabled) return;
     double now = NowSeconds();
     bool driving = Driving(), off = Remapping() || rec::Replaying();
+    g_driving = driving;
     static int was = -1;
     if (g_cfg.testControllersLog && (int)driving != was)
     {

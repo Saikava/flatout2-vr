@@ -316,6 +316,7 @@ void RunCommand(std::string line)
         c.thumb = (button & 8) != 0;
         for (int i = 0; i < 3; i++) c.aim.position[i] = p[i], c.aim.forward[i] = f[i], c.aim.right[i] = r[i];
         c.aim.up[0] = f[1] * r[2] - f[2] * r[1], c.aim.up[1] = f[2] * r[0] - f[0] * r[2], c.aim.up[2] = f[0] * r[1] - f[1] * r[0];
+        c.hold = c.aim;
         xr::SetTestHand(h & 1, c);
         Log("input file: hand %d at %.2f %.2f %.2f, yaw %.1f, pitch %.1f, trigger %.2f, stick %.2f %.2f, buttons %d, grip %.2f", h & 1, p[0], p[1],
             p[2], yaw, pitch, c.trigger, c.stick[0], c.stick[1], button, c.grip);

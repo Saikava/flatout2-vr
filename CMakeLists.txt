@@ -30,6 +30,7 @@ add_library(FO2VR SHARED
   src/record.cpp
   src/render.cpp
   src/screenshot.cpp
+  src/sound.cpp
   src/util.cpp
   src/xr.cpp
 )

@@ -38,7 +38,8 @@ without SteamVR? Change one line in the settings: see [Runtimes](#runtimes).
 - **VR controllers and gamepads**: drive with the VR controllers (thumbstick and triggers), and work the
   menus with them or with an Xbox controller (the game's menus take only the keyboard otherwise). The game's
   force feedback vibrates the VR controllers and Xbox controllers (it has no vibration for those
-  otherwise). Game controllers work whether or not the game's window on the monitor has the focus.
+  otherwise). Game controllers and the game's sound work whether or not the game's window on the monitor has
+  the focus.
 
 ## Requirements
 
@@ -104,13 +105,17 @@ To drive with them, choose **VR controllers** in the game's Options > Controller
 In the menus (whichever controller is chosen) the thumbsticks move, A selects, B and the menu button go
 back. Index and Windows Mixed Reality controllers work with what they have of these.
 
+Experimental, off by default (`GrabWheel=1`): steer by holding the cockpit's steering wheel. Reach for it
+as you sit (recentered), squeeze a grip at its rim and turn it with your hands; 90 degrees is full lock, as
+the cockpit's wheel turns (`WheelTurn`).
+
 ### Gamepads
 
 The game's menus take only the keyboard; with the mod an Xbox controller works them too: the left
 thumbstick or the D-pad moves, A or Start selects, B or Back goes back, and Start pauses a race. With Force
-feedback On in the game's options, an Xbox controller vibrates in crashes. In VR the game reads its game
-controllers even when its window on the monitor does not have the focus (started from the headset, it may
-never have had it).
+feedback On in the game's options, an Xbox controller vibrates in crashes (and with `EngineRumble` with the
+engine's revs). In VR the game reads its game controllers, and plays its sound, even when its window on the
+monitor does not have the focus (started from the headset, it may never have had it).
 
 ## Settings
 
@@ -144,6 +149,9 @@ never have had it).
 | `LargeAddressAware` | 1 | FlatOut2.exe may use 4 GB of memory, not 2 (see [Memory](#troubleshooting)): when the game starts, the mod sets the flag in the file (the original kept as `FlatOut2.exe.2GB.bak`) and starts the game anew with it (0: leave FlatOut2.exe as it is) |
 | `MotionControllers` | 1 | The VR controllers as a game controller, "VR controllers" (see [VR controllers](#vr-controllers); 0: none) |
 | `Rumble` | 1.0 | How strongly the game's force feedback vibrates the VR controllers and Xbox controllers (up to 2; 0: not at all) |
+| `EngineRumble` | 0 | The engine as a light, steady vibration while driving (VR controllers, an Xbox controller's light motor), stronger with the revs and the throttle, at most this strong (0.2-0.5: a hum under the crashes'; 0: none) |
+| `GrabWheel` | 0 | Experimental: the VR controllers' grips take hold of the cockpit's steering wheel, which your hands then turn (instead of shifting gears) |
+| `WheelTurn` | 90 | How far your hands turn the wheel for full lock, degrees (at 90 the cockpit's wheel turns with them; more: slower steering) |
 
 ## Troubleshooting
 

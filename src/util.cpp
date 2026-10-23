@@ -183,6 +183,9 @@ void LoadConfig()
     g_cfg.vrLargeAddressAware = GetPrivateProfileIntW(L"VR", L"LargeAddressAware", d.vrLargeAddressAware, p) != 0;
     g_cfg.vrMotionControllers = GetPrivateProfileIntW(L"VR", L"MotionControllers", d.vrMotionControllers, p) != 0;
     g_cfg.vrRumble = std::clamp(IniFloat(p, L"VR", L"Rumble", d.vrRumble), 0.0f, 2.0f);
+    g_cfg.vrGrabWheel = GetPrivateProfileIntW(L"VR", L"GrabWheel", d.vrGrabWheel, p) != 0;
+    g_cfg.vrWheelTurn = std::clamp(IniFloat(p, L"VR", L"WheelTurn", d.vrWheelTurn), 30.0f, 900.0f);
+    g_cfg.vrEngineRumble = std::clamp(IniFloat(p, L"VR", L"EngineRumble", d.vrEngineRumble), 0.0f, 1.0f);
     g_cfg.keyRecenter = GetPrivateProfileIntW(L"Keys", L"Recenter", d.keyRecenter, p);
     g_cfg.logIntervalSeconds = IniFloat(p, L"Log", L"IntervalSeconds", d.logIntervalSeconds);
     g_cfg.keyScreenshot = GetPrivateProfileIntW(L"Keys", L"Screenshot", d.keyScreenshot, p);

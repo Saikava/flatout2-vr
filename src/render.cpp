@@ -1543,6 +1543,27 @@ void CarEye(BYTE* car, float* eye)
     for (int i = 0; i < 3; i++) eye[i] = m[12 + i] + p[0] * m[i] + p[1] * m[4 + i] + p[2] * m[8 + i];
 }
 
+// (SteeringWheel)
+bool WheelPose(float hub[3], float axes[9])
+{
+    BYTE* player = *(BYTE**)fo2::kLocalPlayer;
+    BYTE* car = player ? *(BYTE**)(player + fo2::kPlayerCar) : nullptr;
+    BYTE* wheel = car ? *(BYTE**)(car + fo2::kCarSteeringWheel) : nullptr;
+    if (!wheel) return false;
+    const float* c = (const float*)(car + fo2::kCarMatrix);
+    const float* w = (const float*)(wheel + fo2::kNodeWorld);
+    const float* seat = (const float*)(car + fo2::kCarDriverLoc);
+    float eye[3];
+    DriverEyeFromSeat(car, eye);
+    for (int i = 0; i < 3; i++)
+    {
+        float d = (w[12] - c[12]) * c[4 * i] + (w[13] - c[13]) * c[4 * i + 1] + (w[14] - c[14]) * c[4 * i + 2];
+        hub[i] = d - seat[i] - eye[i] - g_cfg.vrCameraOffset[i];
+        for (int j = 0; j < 3; j++) axes[3 * i + j] = w[4 * i] * c[4 * j] + w[4 * i + 1] * c[4 * j + 1] + w[4 * i + 2] * c[4 * j + 2];
+    }
+    return true;
+}
+
 // When the eyes look from inside the player's car, the camera's placement moves to the driver's eyes,
 // fixed in the car (the driver's own node flies off with it when it is thrown out: see FlightEye). Which
 // camera the view has comes out while the view renders (CarViewMode): this is the last frame's, so a cut from
@@ -6167,6 +6188,8 @@ void __stdcall RenderViewsHook(BYTE* ctx, BYTE** cams, float* fovScale)
 }
 
 }  // namespace
+
+bool SteeringWheel(float hub[3], float axes[9]) { return WheelPose(hub, axes); }
 
 void OnDeviceCreated(IDirect3DDevice9* dev)
 {

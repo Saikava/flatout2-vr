@@ -64,6 +64,7 @@ struct Controller
 {
     bool tracked = false;
     EyePose aim = {};               // forward: the pointing ray
+    EyePose hold = {};              // where the hand holds it (the grip pose; the aim pose when there is none)
     float trigger = 0, grip = 0;    // the index trigger, the grip (0 to 1)
     bool button = false;            // B (right) or Y (left)
     bool lower = false;             // A (right) or X (left)

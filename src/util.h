@@ -77,6 +77,9 @@ struct Config
     bool vrMotionControllers = true;  // the VR controllers as a game controller of the game's ("VR controllers")
     float vrRumble = 1.0f;            // the game's force feedback as vibration (Xbox controllers, the VR controllers),
                                       // this strong (0 = none)
+    bool vrGrabWheel = false;         // experimental: the VR controllers' grips hold the car's steering wheel, the hands turn it
+    float vrWheelTurn = 90.0f;        // GrabWheel: the hands' turn for full lock, degrees
+    float vrEngineRumble = 0.0f;      // the engine's revs and throttle as a steady vibration, this strong (0 = none)
     // [Log]
     float logIntervalSeconds = 2.0f;
     // [Keys]

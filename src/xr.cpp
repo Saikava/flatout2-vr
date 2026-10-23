@@ -90,9 +90,9 @@ SubmitTimes g_times;
 
 // The controllers' actions (CreateInput) and their state for the open frame (ReadInput).
 XrActionSet g_actionSet = XR_NULL_HANDLE;
-XrAction g_aimAction, g_triggerAction, g_gripAction, g_buttonAction, g_stickAction, g_lowerAction, g_menuAction, g_thumbAction, g_hapticAction;
+XrAction g_aimAction, g_holdAction, g_triggerAction, g_gripAction, g_buttonAction, g_stickAction, g_lowerAction, g_menuAction, g_thumbAction, g_hapticAction;
 XrPath g_handPath[2];
-XrSpace g_aimSpace[2];
+XrSpace g_aimSpace[2], g_holdSpace[2];
 Controller g_hands[2], g_testHands[2];
 // The controllers' vibration (Haptics): what each hand plays, and when it was last sent to the runtime.
 struct Vibration
@@ -562,6 +562,7 @@ void CreateInput()
         XrActionType type;
     } actions[] = {
         { &g_aimAction, "aim", "Aim", XR_ACTION_TYPE_POSE_INPUT },
+        { &g_holdAction, "hold", "Hold", XR_ACTION_TYPE_POSE_INPUT },
         { &g_triggerAction, "trigger", "Trigger", XR_ACTION_TYPE_FLOAT_INPUT },
         { &g_gripAction, "grip", "Grip", XR_ACTION_TYPE_FLOAT_INPUT },
         { &g_buttonAction, "reset", "Reset", XR_ACTION_TYPE_BOOLEAN_INPUT },
@@ -598,6 +599,7 @@ void CreateInput()
     };
     suggest("/interaction_profiles/oculus/touch_controller",
             { { g_aimAction, "/user/hand/left/input/aim/pose" }, { g_aimAction, "/user/hand/right/input/aim/pose" },
+              { g_holdAction, "/user/hand/left/input/grip/pose" }, { g_holdAction, "/user/hand/right/input/grip/pose" },
               { g_triggerAction, "/user/hand/left/input/trigger/value" }, { g_triggerAction, "/user/hand/right/input/trigger/value" },
               { g_gripAction, "/user/hand/left/input/squeeze/value" }, { g_gripAction, "/user/hand/right/input/squeeze/value" },
               { g_buttonAction, "/user/hand/left/input/y/click" }, { g_buttonAction, "/user/hand/right/input/b/click" },
@@ -608,6 +610,7 @@ void CreateInput()
               { g_hapticAction, "/user/hand/left/output/haptic" }, { g_hapticAction, "/user/hand/right/output/haptic" } });
     suggest("/interaction_profiles/valve/index_controller",
             { { g_aimAction, "/user/hand/left/input/aim/pose" }, { g_aimAction, "/user/hand/right/input/aim/pose" },
+              { g_holdAction, "/user/hand/left/input/grip/pose" }, { g_holdAction, "/user/hand/right/input/grip/pose" },
               { g_triggerAction, "/user/hand/left/input/trigger/value" }, { g_triggerAction, "/user/hand/right/input/trigger/value" },
               { g_gripAction, "/user/hand/left/input/squeeze/value" }, { g_gripAction, "/user/hand/right/input/squeeze/value" },
               { g_buttonAction, "/user/hand/left/input/b/click" }, { g_buttonAction, "/user/hand/right/input/b/click" },
@@ -617,6 +620,7 @@ void CreateInput()
               { g_hapticAction, "/user/hand/left/output/haptic" }, { g_hapticAction, "/user/hand/right/output/haptic" } });
     suggest("/interaction_profiles/microsoft/motion_controller",
             { { g_aimAction, "/user/hand/left/input/aim/pose" }, { g_aimAction, "/user/hand/right/input/aim/pose" },
+              { g_holdAction, "/user/hand/left/input/grip/pose" }, { g_holdAction, "/user/hand/right/input/grip/pose" },
               { g_triggerAction, "/user/hand/left/input/trigger/value" }, { g_triggerAction, "/user/hand/right/input/trigger/value" },
               { g_gripAction, "/user/hand/left/input/squeeze/click" }, { g_gripAction, "/user/hand/right/input/squeeze/click" },
               { g_stickAction, "/user/hand/left/input/thumbstick" }, { g_stickAction, "/user/hand/right/input/thumbstick" },
@@ -625,6 +629,7 @@ void CreateInput()
               { g_hapticAction, "/user/hand/left/output/haptic" }, { g_hapticAction, "/user/hand/right/output/haptic" } });
     suggest("/interaction_profiles/khr/simple_controller",
             { { g_aimAction, "/user/hand/left/input/aim/pose" }, { g_aimAction, "/user/hand/right/input/aim/pose" },
+              { g_holdAction, "/user/hand/left/input/grip/pose" }, { g_holdAction, "/user/hand/right/input/grip/pose" },
               { g_triggerAction, "/user/hand/left/input/select/click" }, { g_triggerAction, "/user/hand/right/input/select/click" },
               { g_menuAction, "/user/hand/left/input/menu/click" },
               { g_hapticAction, "/user/hand/left/output/haptic" }, { g_hapticAction, "/user/hand/right/output/haptic" } });
@@ -635,6 +640,8 @@ void CreateInput()
         ci.subactionPath = g_handPath[h];
         ci.poseInActionSpace.orientation.w = 1.0f;
         Check(xrCreateActionSpace(g_session, &ci, &g_aimSpace[h]), "xrCreateActionSpace");
+        ci.action = g_holdAction;
+        Check(xrCreateActionSpace(g_session, &ci, &g_holdSpace[h]), "xrCreateActionSpace");
     }
     XrSessionActionSetsAttachInfo ai = { XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO };
     ai.countActionSets = 1;
@@ -664,6 +671,11 @@ void ReadInput()
                 c.tracked = true;
                 c.aim = ToGamePose(loc.pose);
             }
+            loc = { XR_TYPE_SPACE_LOCATION };
+            c.hold = c.aim;
+            if (g_holdSpace[h] && XR_SUCCEEDED(xrLocateSpace(g_holdSpace[h], g_local, g_frameState.predictedDisplayTime, &loc)) &&
+                (loc.locationFlags & valid) == valid)
+                c.hold = ToGamePose(loc.pose);
             XrActionStateGetInfo gi = { XR_TYPE_ACTION_STATE_GET_INFO };
             gi.subactionPath = g_handPath[h];
             XrActionStateFloat f = { XR_TYPE_ACTION_STATE_FLOAT };

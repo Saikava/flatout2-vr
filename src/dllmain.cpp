@@ -5,6 +5,7 @@
 #include "pacing.h"
 #include "record.h"
 #include "render.h"
+#include "sound.h"
 #include "util.h"
 
 #include <windows.h>
@@ -62,6 +63,7 @@ static void Init()
     if (!InstallPacingHooks()) Log("frame gate hook FAILED");
     InstallBackground();
     InstallControllers();
+    InstallSound();
     rec::Install();
     StartInCockpit();
     if (g_cfg.vrEnabled || BackgroundMode()) Log("Direct3DCreate9 hook %s", InstallCreateHook() ? "installed" : "FAILED");
