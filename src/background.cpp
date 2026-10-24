@@ -1,5 +1,6 @@
 #include "background.h"
 
+#include "controllers.h"
 #include "record.h"
 #include "util.h"
 #include "xr.h"
@@ -35,6 +36,9 @@ constexpr uintptr_t kIatShowWindow = 0x6522A0;
 constexpr uintptr_t kIatSetFocus = 0x6522A8;
 
 bool g_on;
+bool g_keepActive;      // VR: the game is not told when its window loses the focus either (KeepGameActive)
+bool g_wasTopmost;      // VR: the game's window was on top of all when it lost the focus
+WNDPROC g_firstProc;    // VR: the window's procedure as KeepGameActive found it
 HWND g_prevForeground;  // the window that had the focus when the game started
 HWND g_gameWindow;
 WNDPROC g_gameWndProc;
@@ -145,12 +149,27 @@ bool PatchImport(uintptr_t slot, const char* name, void* hook, T& orig)
     return true;
 }
 
-// The game never hears that it lost the focus, so it keeps running.
+// The game never hears that it lost the focus, so it keeps running (and reading its controls). In VR its window in
+// full screen, which it keeps on top of all, goes under the others meanwhile, so that the one the player chose shows.
 LRESULT CALLBACK BackgroundWndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg)
     {
     case WM_ACTIVATEAPP:
+        if (g_keepActive && !g_on)
+        {
+            bool topmost = (GetWindowLongA(wnd, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0;
+            if (!wp && topmost)
+            {
+                g_wasTopmost = true;
+                SetWindowPos(wnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);  // (no longer topmost)
+            }
+            else if (wp && g_wasTopmost)
+            {
+                g_wasTopmost = false;
+                SetWindowPos(wnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            }
+        }
         if (!wp) return 0;
         break;
     case WM_ACTIVATE:
@@ -430,18 +449,21 @@ HRESULT __stdcall SetDataFormatHook(void* self, const DIDATAFORMAT* format)
     return hr;
 }
 
+// The game keeps running without the focus: background mode, and VR (KeepGameActive).
+bool KeepsActive() { return g_on || g_keepActive; }
+
 // Without the focus the keyboard and mouse cannot be acquired; the game then sees them working
 // but idle, apart from the keys of the command file.
 HRESULT __stdcall AcquireHook(void* self)
 {
     HRESULT hr = oAcquire(self);
-    return g_on && FAILED(hr) && KindOf(self) != Kind::Other ? DI_OK : hr;
+    return KeepsActive() && FAILED(hr) && KindOf(self) != Kind::Other ? DI_OK : hr;
 }
 
 HRESULT __stdcall PollHook(void* self)
 {
     HRESULT hr = oPoll(self);
-    return g_on && FAILED(hr) && KindOf(self) != Kind::Other ? DI_OK : hr;
+    return KeepsActive() && FAILED(hr) && KindOf(self) != Kind::Other ? DI_OK : hr;
 }
 
 // A game controller's index among the game controllers (the order the game set them up in).
@@ -466,9 +488,9 @@ HRESULT __stdcall GetDeviceStateHook(void* self, DWORD size, void* data)
             if (rec::ControllerState(ControllerIndex(self), size, data)) return DI_OK;
         return hr;
     }
-    if (!data || !g_on) return hr;
+    if (!data || !KeepsActive()) return hr;
     if (FAILED(hr)) memset(data, 0, size);
-    if (k == Kind::Keyboard && size == 256)
+    if (g_on && k == Kind::Keyboard && size == 256)
         for (int i = 0; i < 256; i++) ((BYTE*)data)[i] |= g_keys[i];
     return DI_OK;
 }
@@ -478,9 +500,9 @@ HRESULT __stdcall GetDeviceDataHook(void* self, DWORD objectSize, DIDEVICEOBJECT
     DWORD room = inOut ? *inOut : 0;
     HRESULT hr = oGetDeviceData(self, objectSize, data, inOut, flags);
     Kind k = KindOf(self);
-    if (k == Kind::Other || !inOut || !g_on) return hr;
+    if (k == Kind::Other || !inOut || !KeepsActive()) return hr;
     if (FAILED(hr)) *inOut = 0;
-    if (k == Kind::Keyboard && data && objectSize >= 16)
+    if (g_on && k == Kind::Keyboard && data && objectSize >= 16)
     {
         DWORD n = *inOut;
         size_t used = 0;
@@ -547,7 +569,7 @@ HRESULT WINAPI DirectInput8CreateHook(HINSTANCE inst, DWORD version, REFIID iid,
 bool g_hookInterfaces;
 
 // The game's DirectInput8Create call goes through DirectInput8CreateHook (background mode, input
-// recording and replay).
+// recording and replay, VR).
 bool InstallInputHooks()
 {
     static bool done;
@@ -576,7 +598,7 @@ bool InstallInputHooks()
 bool InstallBackground()
 {
     g_on = g_cfg.testBackground;
-    if (g_cfg.testRecord || g_cfg.testReplay) InstallInputHooks();
+    if (g_cfg.testRecord || g_cfg.testReplay || g_cfg.vrEnabled) InstallInputHooks();
     if (g_cfg.testRecord) Log("record: the next race's input will be recorded");
     if (!g_on)
     {
@@ -646,8 +668,33 @@ void BackgroundAfterDevice(HWND window)
     Log("background: game window at %ld,%ld %ldx%ld", g_place.left, g_place.top, g_place.right - g_place.left, g_place.bottom - g_place.top);
 }
 
+void KeepGameActive(HWND window)
+{
+    if (g_on || !window || g_gameWindow == window) return;
+    g_keepActive = true;
+    g_gameWindow = window;
+    g_firstProc = g_gameWndProc = (WNDPROC)SetWindowLongA(window, GWL_WNDPROC, (LONG)(LONG_PTR)&BackgroundWndProc);
+    Log("VR: the game is not told when its window loses the focus (its controls keep working; the window goes under the "
+        "one in front)");
+}
+
 int BackgroundPoll()
 {
+    // VR: the window's own procedure put back (by DXVK's, which hooks it in full screen, as a device reset changes
+    // that) is hooked again; one put over the mod's (which goes on to it) is left alone.
+    if (g_keepActive && !g_on && IsWindow(g_gameWindow) && (WNDPROC)GetWindowLongA(g_gameWindow, GWL_WNDPROC) == g_firstProc)
+    {
+        g_gameWndProc = (WNDPROC)SetWindowLongA(g_gameWindow, GWL_WNDPROC, (LONG)(LONG_PTR)&BackgroundWndProc);
+        Log("VR: the game's window had its own procedure back - hooked again");
+    }
+    // VR: each time the game's window gets the focus back, other programs may not take it by themselves again.
+    if (g_keepActive && !g_on)
+    {
+        static bool wasFront;
+        bool front = GetForegroundWindow() == g_gameWindow;
+        if (front && !wasFront) LockGameFocus();
+        wasFront = front;
+    }
     if (!g_on) return 0;
     double now = NowSeconds();
     for (size_t i = 0; i < g_releases.size();)

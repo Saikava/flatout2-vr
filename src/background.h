@@ -28,6 +28,11 @@ void HookInputInterfaces();
 // another monitor and the keyboard focus back to where it was.
 void BackgroundBeforeDevice(_D3DPRESENT_PARAMETERS_* pp);
 void BackgroundAfterDevice(HWND__* window);
+// VR, once its Direct3D device is made: the game is not told when its window loses the focus either (it reads no
+// controls without it: SteamVR's windows took it as the game started SteamVR, and the race went on without the
+// player), its keyboard and mouse seen idle meanwhile. Its window in full screen, kept on top of all, goes under the
+// window in front instead, so that the player may use the PC beside it.
+void KeepGameActive(HWND__* window);
 
 // Once a frame: carries out new commands. Returns kPollShot / kPollTrace / kPollHud (the Hud key) /
 // kPollEject when asked for.

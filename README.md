@@ -62,6 +62,10 @@ The mod talks to the headset through OpenXR. Choose the runtime in `scripts\FO2V
 
 Meta's own OpenXR runtime (Quest Link without SteamVR) does not work with 32-bit games.
 
+`Runtime=` holds also when the game runs as administrator (for example started by a Steam that runs as
+administrator): OpenXR's loader would then ignore it and start the system's active runtime, so the mod loads
+the runtime itself.
+
 ## What's in the archive
 
 - `winmm.dll`: [Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader), which loads the mod;
@@ -119,8 +123,10 @@ the cockpit's wheel turns (`WheelTurn`).
 The game's menus take only the keyboard; with the mod an Xbox controller works them too: the left
 thumbstick or the D-pad moves, A or Start selects, B or Back goes back, and Start pauses a race. With Force
 feedback On in the game's options, an Xbox controller vibrates in crashes (and with `EngineRumble` with the
-engine's revs). In VR the game reads its game controllers, and plays its sound, even when its window on the
-monitor does not have the focus (started from the headset, it may never have had it).
+engine's revs). In VR the game goes on, with its controllers and its sound, when its window on the monitor
+loses the focus: switch to another program and the game's window goes under it. Other programs may not take
+the focus from the game by themselves (SteamVR's windows did as it started); Alt+Tab or a click switch as
+usual.
 
 ### Steering wheels
 
@@ -157,7 +163,7 @@ where the driver's hands stop (the game has no animation past that).
 | `GrassDistance` | 5.0 | How far grass is drawn, times this |
 | `ViewDistance` | 3.0 | How far the world is drawn, times this |
 | `FloatDepth` | 1 | The eyes keep depth as 32-bit floats, reversed (near 1, far 0), set in DXVK by the mod: what lies close together far away, such as a turn sign's arrow on its board, stays apart instead of showing through in crawling bands (0: 24-bit depth as the game keeps it) |
-| `SpeedBlur` | 1 | The game's speed blur (0 = off) |
+| `SpeedBlur` | 1 | The game's speed blur, this many times as strong (0.5 half as strong, 0 off, up to 2) |
 | `SpeedZoom` | 1.0 | The game's widening of the view at speed: 1 = as on a monitor, 0 = off |
 | `LargeAddressAware` | 1 | FlatOut2.exe may use 4 GB of memory, not 2 (see [Memory](#troubleshooting)): when the game starts, the mod sets the flag in the file (the original kept as `FlatOut2.exe.2GB.bak`) and starts the game anew with it (0: leave FlatOut2.exe as it is) |
 | `MotionControllers` | 1 | The VR controllers as a game controller, "VR controllers" (see [VR controllers](#vr-controllers); 0: none) |
@@ -189,6 +195,10 @@ The log, `scripts\FO2VR.log`, usually says what went wrong.
   $b = [IO.File]::ReadAllBytes($f); $o = [BitConverter]::ToInt32($b, 0x3C) + 22
   if ($b[$o] -band 0x20) { "already 4 GB" } else { Copy-Item $f "$f.bak"; $b[$o] = $b[$o] -bor 0x20; [IO.File]::WriteAllBytes($f, $b); "done" }
   ```
+- **The game closes with "The graphics driver was reset".** The graphics card stopped with an error and Windows
+  reset its driver (the system's event log has it, as `nvlddmkm` on an NVIDIA card); the game cannot draw after
+  that, so it closes rather than standing still in the headset. Start it again. If it keeps happening, open an
+  issue with `scripts\FO2VR.log`.
 - **The log says "the game does not run on DXVK".** `d3d9.dll` from the archive is missing from the game
   folder, or another mod replaced it.
 - **The log says "unsupported FlatOut2.exe".** The mod needs version 1.2 of the game (the GOG or the

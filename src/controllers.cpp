@@ -1566,11 +1566,24 @@ bool InstallControllers()
     return true;
 }
 
+// Other programs may not take the focus from the game's window by themselves (the player's Alt or click may): as the
+// game starts SteamVR, SteamVR's windows (its status window, its pages') came up a few seconds after the game's and
+// took it, the keyboard going to them. The lock is the system's own and ends at the player's next Alt or click
+// elsewhere; it is set again as the window gets the focus back (background.cpp, BackgroundPoll).
+void LockGameFocus()
+{
+    if (LockSetForegroundWindow(LSFW_LOCK)) Log("controllers: other programs may not take the focus from the game's window by themselves");
+}
+
 void FocusGameWindow(HWND window)
 {
     if (!window || !InVr() || BackgroundMode()) return;
     HWND front = GetForegroundWindow();
-    if (front == window) return;
+    if (front == window)
+    {
+        LockGameFocus();
+        return;
+    }
     // Windows lets a program take the focus only from the program in front (or one that has just been used): the
     // thread of the window in front is asked to share its input for the moment.
     DWORD frontThread = front ? GetWindowThreadProcessId(front, nullptr) : 0, ours = GetCurrentThreadId();
@@ -1581,6 +1594,7 @@ void FocusGameWindow(HWND window)
     char title[128] = "";
     if (front) GetWindowTextA(front, title, sizeof(title));
     Log("controllers: the game's window was not in front (\"%s\" was): put in front %s", title, ok ? "" : "- FAILED");
+    if (GetForegroundWindow() == window) LockGameFocus();
 }
 
 bool ControllersRecenter()

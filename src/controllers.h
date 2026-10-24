@@ -9,6 +9,9 @@ bool InstallControllers();
 // VR: the game's window, once its Direct3D device is made, is put in front if it is not (the game may have been
 // started from the headset, with another window in front: the keyboard then went elsewhere).
 void FocusGameWindow(HWND window);
+// The window in front (the game's) is kept there: other programs may not take the focus by themselves until the
+// player's next Alt or click elsewhere (LockSetForegroundWindow).
+void LockGameFocus();
 // Per frame: true once when both thumbsticks of the VR controllers are pressed together (recenter the view).
 bool ControllersRecenter();
 // Per frame: in the game's menus (which take only the keyboard) the VR controllers and Xbox controllers press its keys.

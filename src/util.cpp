@@ -162,7 +162,7 @@ void LoadConfig()
     g_cfg.vrGrassDistance = IniFloat(p, L"VR", L"GrassDistance", d.vrGrassDistance);
     g_cfg.vrViewDistance = IniFloat(p, L"VR", L"ViewDistance", d.vrViewDistance);
     g_cfg.vrFloatDepth = GetPrivateProfileIntW(L"VR", L"FloatDepth", d.vrFloatDepth, p) != 0;
-    g_cfg.vrSpeedBlur = GetPrivateProfileIntW(L"VR", L"SpeedBlur", d.vrSpeedBlur, p) != 0;
+    g_cfg.vrSpeedBlur = std::clamp(IniFloat(p, L"VR", L"SpeedBlur", d.vrSpeedBlur), 0.0f, 2.0f);
     g_cfg.vrSpeedZoom = IniFloat(p, L"VR", L"SpeedZoom", d.vrSpeedZoom);
     {
         wchar_t buf[64] = L"";

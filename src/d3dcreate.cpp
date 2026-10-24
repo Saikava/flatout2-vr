@@ -32,6 +32,7 @@ HRESULT __stdcall CreateDeviceHook(IDirect3D9* d3d, UINT adapter, D3DDEVTYPE typ
     if (SUCCEEDED(hr) && out && *out)
     {
         BackgroundAfterDevice(pp && pp->hDeviceWindow ? pp->hDeviceWindow : wnd);
+        if (xr::Available() && !BackgroundMode()) KeepGameActive(pp && pp->hDeviceWindow ? pp->hDeviceWindow : wnd);
         FocusGameWindow(pp && pp->hDeviceWindow ? pp->hDeviceWindow : wnd);
         OnDeviceCreated(*out);
     }

@@ -663,9 +663,9 @@ void LogCamera(BYTE* ctx, BYTE** cams, const float* fovScale)
         if (g_vrEye.cockpit) Log("  cockpit: the sun's share past the car %.2f, near clipping plane %.3f m", g_sunShare, g_cockpitNear);
     }
     const float* center = (const float*)fo2::kRadialBlurCenter;
-    Log("  post: colour filter %d, speed blur %d passes from %.2f %.2f, strength %.2f x speed %.2f", *(const int*)fo2::kColorFilterOn,
-        *(const int*)fo2::kRadialBlurPasses, center[0], center[1], *(const float*)fo2::kRadialBlurStrength,
-        *(const float*)fo2::kRadialBlurSpeed);
+    Log("  post: colour filter %d, speed blur %d passes from %.2f %.2f, strength %.2f x speed %.2f (in the eyes x %.2f, SpeedBlur)",
+        *(const int*)fo2::kColorFilterOn, *(const int*)fo2::kRadialBlurPasses, center[0], center[1], *(const float*)fo2::kRadialBlurStrength,
+        *(const float*)fo2::kRadialBlurSpeed, g_cfg.vrSpeedBlur);
 }
 
 // ---- engine hooks ---------------------------------------------------------------------------
@@ -1018,14 +1018,21 @@ void ReleaseHudTargets()
     g_hud = HudTargets();
 }
 
+// The HUD panel's picture for a back buffer of w x h: the panel covers about 60 degrees of view, and 1920 pixels across
+// are sharper than the headset.
+void HudPanelSize(UINT w, UINT h, UINT* pw, UINT* ph)
+{
+    *pw = std::min(w, 1920u);
+    *ph = (UINT)((unsigned long long)h * *pw / w);
+}
+
 bool EnsureHudTargets(IDirect3DDevice9* dev)
 {
     if (g_hud.tex && g_hud.w == g_screenW && g_hud.h == g_screenH) return true;
     if (g_hud.failed || g_screenW == 0) return false;
     ReleaseHudTargets();
-    UINT w = g_screenW, h = g_screenH;
-    // The panel covers about 60 degrees of view: 1920 pixels across are sharper than the headset.
-    UINT pw = std::min(w, 1920u), ph = (UINT)((unsigned long long)h * pw / w);
+    UINT w = g_screenW, h = g_screenH, pw, ph;
+    HudPanelSize(w, h, &pw, &ph);
     bool ok = SUCCEEDED(dev->CreateTexture(w, h, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &g_hud.tex, nullptr)) &&
               SUCCEEDED(g_hud.tex->GetSurfaceLevel(0, &g_hud.rt)) &&
               SUCCEEDED(dev->CreateDepthStencilSurface(w, h, D3DFMT_D24S8, D3DMULTISAMPLE_NONE, 0, TRUE, &g_hud.ds, nullptr)) &&
@@ -1364,9 +1371,50 @@ void SubmitVrScreen(IDirect3DDevice9* dev)
     {
         xr::SubmitScreen(g_vrt.screen, g_vrt.screenW, g_vrt.screenH);
         g_vrStats.screenFrames++;
+        // The races' HUD panel's swapchain, made here in the menus rather than as a race starts (see xr.cpp's QueueLock).
+        UINT pw, ph;
+        HudPanelSize(g_vrt.screenW, g_vrt.screenH, &pw, &ph);
+        if (g_cfg.vrHud) xr::PrepareHud(pw, ph);
     }
     else
         xr::EndFrameEmpty();
+}
+
+// A race's first frames, as it comes in after the loading screen, draw much for the first time: DXVK makes shaders
+// and uploads textures as they are first used. The first ones take long (some 0.05 s on a fast PC, near a second
+// on others), and the race stood still in the headset in between. The headset keeps showing the loading screen
+// instead, steady in its place, while they render (and the HUD's swapchain is made): the eyes are shown from the
+// third frame in a row that comes within one and a half headset frames of the last, or after two seconds.
+struct
+{
+    bool screenShown;  // the headset's last frame was the flat screen's
+    bool holding;      // the race's first frames: the screen's last picture stays
+    int frames, inTime;
+    double since;
+    int gaps[8];       // the first frames' times from the last (ms), for the log
+} g_hold;
+
+// At the race's frame's Present, the time since the last Present given: true while the screen's picture stays.
+bool HoldLoadingScreen(double now, double gap)
+{
+    if (g_hold.screenShown)
+    {
+        g_hold = {};
+        g_hold.holding = true;
+        g_hold.since = now;
+    }
+    if (!g_hold.holding) return false;
+    if (g_hold.frames < 8) g_hold.gaps[g_hold.frames] = (int)(1000.0 * gap + 0.5);
+    g_hold.frames++;
+    double period = xr::DisplayPeriod();
+    g_hold.inTime = period > 0 && gap <= 1.5 * period ? g_hold.inTime + 1 : 0;
+    if (g_hold.inTime < 3 && now - g_hold.since < 2.0) return true;
+    g_hold.holding = false;
+    std::string gaps;
+    for (int i = 0; i < g_hold.frames && i < 8; i++) gaps += " " + std::to_string(g_hold.gaps[i]);
+    Log("eyes: the race shown in the headset from its frame %d, %.2f s after the first (the loading screen stayed meanwhile; the "
+        "frames' times:%s%s ms)", g_hold.frames, now - g_hold.since, gaps.c_str(), g_hold.frames > 8 ? " ..." : "");
+    return false;
 }
 
 HRESULT __stdcall ResetHook(IDirect3DDevice9* dev, D3DPRESENT_PARAMETERS* pp)
@@ -2219,6 +2267,31 @@ using EnginePresentFn = int(__thiscall*)(void* self);
 const auto oEnginePresent = (EnginePresentFn)fo2::kEnginePresent;
 void* g_loggedVtbl;
 
+// Whether the game's window has the focus, logged when that changes, with the program in front then (SteamVR's windows
+// take it as the game starts SteamVR; in VR the game is not told: see KeepGameActive).
+void NoteFocus(IDirect3DDevice9* dev)
+{
+    static int last = -1;
+    D3DDEVICE_CREATION_PARAMETERS cp;
+    if (FAILED(dev->GetCreationParameters(&cp)) || !cp.hFocusWindow) return;
+    HWND front = GetForegroundWindow();
+    int state = (front == cp.hFocusWindow ? 1 : 0) | (IsIconic(cp.hFocusWindow) ? 2 : 0);
+    if (state == last) return;
+    last = state;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(front, &pid);
+    wchar_t exe[MAX_PATH] = L"nothing";
+    if (HANDLE p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid))
+    {
+        DWORD n = MAX_PATH;
+        if (!QueryFullProcessImageNameW(p, 0, exe, &n)) wcscpy(exe, L"?");
+        CloseHandle(p);
+    }
+    const wchar_t* name = wcsrchr(exe, L'\\');
+    Log("window: the game's window %s%s (in front: %ls)", state & 1 ? "has the focus" : "lost the focus", state & 2 ? ", minimized" : "",
+        name ? name + 1 : exe);
+}
+
 int __fastcall EnginePresentHook(void* self, void*)
 {
     IDirect3DDevice9* dev = *(IDirect3DDevice9**)fo2::kD3DDevice;
@@ -2229,6 +2302,7 @@ int __fastcall EnginePresentHook(void* self, void*)
         Log("device %p vtable now %p", (void*)dev, g_loggedVtbl);
     }
     rec::MenuTick();
+    if (xr::Available()) NoteFocus(dev);
     if (g_renderViewsEnd > 0)
     {
         g_frameHud = NowSeconds() - g_renderViewsEnd;
@@ -2251,6 +2325,9 @@ int __fastcall EnginePresentHook(void* self, void*)
     }
 
     double now = NowSeconds();
+    static double lastPresent;
+    double sincePresent = now - lastPresent;
+    lastPresent = now;
     g_stats.frames++;
 
     if (g_trace == Trace::Running)
@@ -2321,7 +2398,10 @@ int __fastcall EnginePresentHook(void* self, void*)
         g_eyesPending = false;
         double s0 = NowSeconds();
         bool hud = g_cfg.vrHud && g_hud.captured && hudShown;
-        xr::SubmitEyes(g_vrt.tex[0], g_vrt.tex[1], hud ? g_hud.panel : nullptr, g_hud.panelW, g_hud.panelH);
+        if (HoldLoadingScreen(now, sincePresent))
+            xr::SubmitLastScreen(g_cfg.vrHud ? g_hud.panelW : 0, g_cfg.vrHud ? g_hud.panelH : 0);
+        else
+            xr::SubmitEyes(g_vrt.tex[0], g_vrt.tex[1], hud ? g_hud.panel : nullptr, g_hud.panelW, g_hud.panelH);
         g_vrStats.submit += NowSeconds() - s0;
         g_vrStats.submitT.Add(NowSeconds() - s0);
         g_vrStats.eyeFrames++;
@@ -2342,7 +2422,10 @@ int __fastcall EnginePresentHook(void* self, void*)
         bool render = xr::BeginFrame();
         g_vrStats.wait += NowSeconds() - w0;
         if (render)
+        {
             SubmitVrScreen(dev);
+            g_hold.screenShown = true;
+        }
         else
             xr::EndFrameEmpty();
     }
@@ -6020,15 +6103,17 @@ bool RenderVrEyes(IDirect3DDevice9* dev, BYTE* ctx, BYTE** cams, float* fovScale
         MulMatrix(t, anchor, pastAnchor[i]);
     }
     UseEyeFilterTextures(dev);
-    // The speed blur ([VR] SpeedBlur): from where the game camera looks, in each eye (EyeBlurCenter); or
-    // off, with the eyes' speed factor 0 (the game sets it anew every frame). The blur's settings are
-    // only filled in at its first use, inside an eye's render: until then they are left alone.
+    // The speed blur ([VR] SpeedBlur): from where the game camera looks, in each eye (EyeBlurCenter), with
+    // the eyes' speed factor SpeedBlur times the game's (which it sets anew every frame); 0 is off. The
+    // blur's settings are only filled in at its first use, inside an eye's render: until then they are
+    // left alone.
     float* blurSpeed = (float*)fo2::kRadialBlurSpeed;
     float* blurCenter = (float*)fo2::kRadialBlurCenter;
     float savedBlurSpeed[4], savedBlurCenter[2] = {};
     bool blurCenterSaved = false;
     memcpy(savedBlurSpeed, blurSpeed, sizeof(savedBlurSpeed));
-    if (!g_cfg.vrSpeedBlur || flying) memset(blurSpeed, 0, sizeof(savedBlurSpeed));
+    float blurScale = flying ? 0.0f : g_cfg.vrSpeedBlur;
+    for (int i = 0; i < 4; i++) blurSpeed[i] *= blurScale;
     NoteParticleLists();
     ReverseEyeDepth(dev, true);  // ([VR] FloatDepth) the eyes' and the mirrors'
     // The side mirrors' pictures for this frame, laid on their glass in each eye as it renders (MirrorsIntoEye).
@@ -6053,7 +6138,7 @@ bool RenderVrEyes(IDirect3DDevice9* dev, BYTE* ctx, BYTE** cams, float* fovScale
             BuildEyeMatrix(pastAnchor[i], pose[eye], pe);
             InvertCamera(pe, camViews + 16 * i);
         }
-        if (g_cfg.vrSpeedBlur && *(const BYTE*)fo2::kPostSettingsLoaded)
+        if (blurScale > 0 && *(const BYTE*)fo2::kPostSettingsLoaded)
         {
             if (!blurCenterSaved) memcpy(savedBlurCenter, blurCenter, sizeof(savedBlurCenter));
             blurCenterSaved = true;

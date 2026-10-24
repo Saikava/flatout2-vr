@@ -53,7 +53,12 @@ EyeFov Fov(int eye);
 // origin.
 void SubmitEyes(IDirect3DTexture9* left, IDirect3DTexture9* right, IDirect3DTexture9* hud = nullptr, unsigned hudW = 0, unsigned hudH = 0);
 void SubmitScreen(IDirect3DTexture9* screen, unsigned w, unsigned h);
+// The flat screen's last picture once more (nothing when it has none). With the HUD panel's size, its swapchain is
+// made meanwhile if there is none of that size (the race's first frames: see render.cpp's HoldLoadingScreen).
+void SubmitLastScreen(unsigned hudW = 0, unsigned hudH = 0);
 void EndFrameEmpty();
+// The HUD panel's swapchain made ahead (in the menus) for a panel of w x h, if there is none of that size.
+void PrepareHud(unsigned w, unsigned h);
 
 // The current head position and direction become "straight ahead" on the next frame.
 void Recenter();

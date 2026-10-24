@@ -8,9 +8,11 @@
 #include <windows.h>
 #include <d3d9.h>
 
+#define XR_NO_PROTOTYPES
 #define XR_USE_PLATFORM_WIN32
 #define XR_USE_GRAPHICS_API_VULKAN
 #include <openxr/openxr.h>
+#include <openxr/openxr_loader_negotiation.h>
 #include <openxr/openxr_platform.h>
 
 #include <algorithm>
@@ -22,6 +24,31 @@
 
 namespace xr {
 namespace {
+
+// The OpenXR functions the mod calls, all through xrGetInstanceProcAddr: the loader's (scripts\openxr_loader.dll), or
+// the runtime's own when the loader would not take Runtime= (LoadEntryPoints).
+#define FO2VR_XR_FUNCTIONS(X)                                                                                              \
+    X(xrDestroyInstance) X(xrGetInstanceProperties) X(xrResultToString) X(xrGetSystem) X(xrGetSystemProperties)            \
+    X(xrEnumerateViewConfigurationViews) X(xrCreateSession) X(xrBeginSession) X(xrEndSession) X(xrPollEvent)               \
+    X(xrCreateReferenceSpace) X(xrCreateActionSpace) X(xrLocateSpace) X(xrLocateViews) X(xrEnumerateSwapchainFormats)      \
+    X(xrCreateSwapchain) X(xrDestroySwapchain) X(xrEnumerateSwapchainImages) X(xrAcquireSwapchainImage)                    \
+    X(xrWaitSwapchainImage) X(xrReleaseSwapchainImage) X(xrWaitFrame) X(xrBeginFrame) X(xrEndFrame) X(xrStringToPath)      \
+    X(xrCreateActionSet) X(xrCreateAction) X(xrSuggestInteractionProfileBindings) X(xrAttachSessionActionSets)             \
+    X(xrSyncActions) X(xrGetActionStateFloat) X(xrGetActionStateBoolean) X(xrGetActionStateVector2f)                       \
+    X(xrApplyHapticFeedback) X(xrStopHapticFeedback)
+PFN_xrGetInstanceProcAddr xrGetInstanceProcAddr;
+PFN_xrCreateInstance xrCreateInstance;
+#define FO2VR_XR_DECLARE(f) PFN_##f f;
+FO2VR_XR_FUNCTIONS(FO2VR_XR_DECLARE)
+
+// An instance's functions (once it is made).
+bool LoadFunctions(XrInstance instance)
+{
+    bool ok = true;
+#define FO2VR_XR_LOAD(f) ok &= (XR_SUCCEEDED(xrGetInstanceProcAddr(instance, #f, (PFN_xrVoidFunction*)&f)) && f != nullptr);
+    FO2VR_XR_FUNCTIONS(FO2VR_XR_LOAD)
+    return ok;
+}
 
 XrInstance g_instance = XR_NULL_HANDLE;
 XrSystemId g_system = XR_NULL_SYSTEM_ID;
@@ -53,6 +80,7 @@ struct VkFns
     PFN_vkCreateFence CreateFence;
     PFN_vkWaitForFences WaitForFences;
     PFN_vkResetFences ResetFences;
+    PFN_vkGetFenceStatus GetFenceStatus;
 } vk;
 
 struct Slot
@@ -69,6 +97,7 @@ struct Swapchain
     XrSwapchain handle = XR_NULL_HANDLE;
     std::vector<VkImage> images;
     uint32_t w = 0, h = 0;
+    bool released = false;  // an image was released: a layer can show it again without a new one
 };
 Swapchain g_eyeSc[2], g_screenSc, g_hudSc;
 int64_t g_format;
@@ -80,10 +109,10 @@ bool g_frameOpen;
 XrView g_views[2];
 bool g_viewsValid;
 
-// Recenter origin (OpenXR LOCAL space): position and yaw.
+// Recenter origin (OpenXR LOCAL space): position and rotation.
 bool g_recenterPending = true;
 float g_originPos[3];
-float g_originYaw;
+XrQuaternionf g_originRot = { 0, 0, 0, 1 };  // a turn about the vertical (see ApplyRecenter)
 
 bool g_loggedImage;
 SubmitTimes g_times;
@@ -146,7 +175,10 @@ bool Check(XrResult r, const char* what)
     return false;
 }
 
-// The runtime may use DXVK's queue inside these calls; DXVK must not submit meanwhile.
+// The runtime may use DXVK's queue inside these calls; DXVK must not submit meanwhile. Not only in the frame's calls:
+// twice the GPU stopped with an error through Virtual Desktop (nvlddmkm 13 "Graphics Exception", then 153: a reset)
+// just as the HUD's swapchain was made, unlocked, while DXVK submitted a race's first frame (VDXR likely readies a new
+// swapchain's images on that queue); earlier runs through it ended so now and then at a race's start.
 struct QueueLock
 {
     QueueLock() { g_interop->LockSubmissionQueue(); }
@@ -163,14 +195,16 @@ void Rotate(const XrQuaternionf& q, const float v[3], float out[3])
     out[2] = v[2] + q.w * tz + (q.x * ty - q.y * tx);
 }
 
-// Rotates about +y by -g_originYaw, then converts OpenXR axes (right-handed, -z forward) to the
-// game's (left-handed, +z forward).
+// Into the recenter origin's axes (its rotation undone), then OpenXR axes (right-handed, -z forward) to the game's
+// (left-handed, +z forward).
 void ToGame(const float v[3], float out[3])
 {
-    float c = cosf(-g_originYaw), s = sinf(-g_originYaw);
-    out[0] = v[0] * c + v[2] * s;
-    out[1] = v[1];
-    out[2] = -(-v[0] * s + v[2] * c);
+    const XrQuaternionf undo = { -g_originRot.x, -g_originRot.y, -g_originRot.z, g_originRot.w };
+    float w[3];
+    Rotate(undo, v, w);
+    out[0] = w[0];
+    out[1] = w[1];
+    out[2] = -w[2];
 }
 
 // A pose in the LOCAL space relative to the recenter origin, in game axes.
@@ -190,6 +224,13 @@ EyePose ToGamePose(const XrPosef& p)
     return out;
 }
 
+// The head as it is now becomes the origin: where it is, and its turn about the vertical (the horizon stays level).
+// A head upside down (its up more than 120 degrees off the vertical; a headset left on the desk is not) means the
+// runtime's space is upside down: with SteamVR through Virtual Desktop (which gives SteamVR its headset as an Oculus
+// one, SteamVR's "oculus" driver) the game came in upside down at every start, until the headset was recentered (the
+// Meta button held: SteamVR then sets its zero pose anew). Its space was turned half a
+// turn about its forward axis (the head's up -0.02 -0.95 0.32 before, 0.01 0.95 0.32 after), with the origin on the
+// floor: that half turn is undone first, then the head's turn about the vertical, so its tilt stays its own.
 void ApplyRecenter()
 {
     const XrPosef& p0 = g_views[0].pose;
@@ -197,11 +238,17 @@ void ApplyRecenter()
     g_originPos[0] = 0.5f * (p0.position.x + p1.position.x);
     g_originPos[1] = 0.5f * (p0.position.y + p1.position.y);
     g_originPos[2] = 0.5f * (p0.position.z + p1.position.z);
-    const float fwd[3] = { 0, 0, -1 };  // OpenXR forward
-    float f[3];
+    const float fwd[3] = { 0, 0, -1 }, up[3] = { 0, 1, 0 };  // OpenXR forward, up
+    float f[3], u[3];
     Rotate(p0.orientation, fwd, f);
-    g_originYaw = atan2f(-f[0], -f[2]);
-    Log("xr: recentered at %.2f %.2f %.2f, yaw %.1f deg", g_originPos[0], g_originPos[1], g_originPos[2], g_originYaw * 57.29578f);
+    Rotate(p0.orientation, up, u);
+    bool upright = u[1] >= -0.5f;
+    // (upside down: the head's forward in the space turned back is -f.x, -f.y, f.z)
+    float yaw = upright ? atan2f(-f[0], -f[2]) : atan2f(f[0], -f[2]);
+    float s = sinf(0.5f * yaw), c = cosf(0.5f * yaw);
+    g_originRot = upright ? XrQuaternionf{ 0, s, 0, c } : XrQuaternionf{ -s, 0, c, 0 };  // (the half turn about z after the yaw)
+    Log("xr: recentered at %.2f %.2f %.2f, yaw %.1f deg (the head's up %.2f %.2f %.2f%s)", g_originPos[0], g_originPos[1], g_originPos[2],
+        yaw * 57.29578f, u[0], u[1], u[2], upright ? "" : ": the runtime's space is upside down - turned back");
 }
 
 template <class T>
@@ -233,6 +280,7 @@ bool LoadVulkan()
     ok &= LoadDeviceFn(vk.CreateFence, "vkCreateFence");
     ok &= LoadDeviceFn(vk.WaitForFences, "vkWaitForFences");
     ok &= LoadDeviceFn(vk.ResetFences, "vkResetFences");
+    ok &= LoadDeviceFn(vk.GetFenceStatus, "vkGetFenceStatus");
     return ok;
 }
 
@@ -267,7 +315,12 @@ bool CreateSwapchain(Swapchain& sc, uint32_t w, uint32_t h, const char* name)
     ci.faceCount = 1;
     ci.arraySize = 1;
     ci.mipCount = 1;
-    if (!Check(xrCreateSwapchain(g_session, &ci, &sc.handle), "xrCreateSwapchain")) return false;
+    XrResult r;
+    {
+        QueueLock lock;
+        r = xrCreateSwapchain(g_session, &ci, &sc.handle);
+    }
+    if (!Check(r, "xrCreateSwapchain")) return false;
     uint32_t n = 0;
     xrEnumerateSwapchainImages(sc.handle, 0, &n, nullptr);
     std::vector<XrSwapchainImageVulkanKHR> images(n, { XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR });
@@ -277,6 +330,15 @@ bool CreateSwapchain(Swapchain& sc, uint32_t w, uint32_t h, const char* name)
     sc.h = h;
     Log("xr: %s swapchain %ux%u, %u images", name, w, h, n);
     return true;
+}
+
+void DestroySwapchain(Swapchain& sc)
+{
+    {
+        QueueLock lock;
+        xrDestroySwapchain(sc.handle);
+    }
+    sc = Swapchain();
 }
 
 void ImageBarrier(VkCommandBuffer cmd, VkImage image, VkImageLayout from, VkImageLayout to, VkAccessFlags srcAccess, VkAccessFlags dstAccess,
@@ -299,6 +361,49 @@ bool SameChannelOrder(VkFormat a, int64_t b)
     auto bgra = [](int64_t f) { return f == VK_FORMAT_B8G8R8A8_UNORM || f == VK_FORMAT_B8G8R8A8_SRGB; };
     auto rgba = [](int64_t f) { return f == VK_FORMAT_R8G8B8A8_UNORM || f == VK_FORMAT_R8G8B8A8_SRGB; };
     return (bgra(a) && bgra(b)) || (rgba(a) && rgba(b));
+}
+
+// The GPU was lost (VK_ERROR_DEVICE_LOST): it stopped with an error and Windows reset its driver (the system's log has
+// it: nvlddmkm 13 and 153 on an NVIDIA card, at a race's start). Neither DXVK nor the runtime can go on after
+// it: Virtual Desktop failed every frame and the game stood still in DXVK soon after, frozen in the headset. The game
+// ends instead, saying why: the VR session first (the headset goes back to its own view, where the window can be
+// seen), then the window, over the game's minimized one.
+[[noreturn]] void DeviceLost(const char* what)
+{
+    Log("xr: %s: the GPU was lost (VK_ERROR_DEVICE_LOST) - its driver was reset; the game ends", what);
+    if (!BackgroundMode())
+    {
+        HANDLE t = CreateThread(nullptr, 0, [](void*) -> DWORD { return xrDestroyInstance(g_instance); }, nullptr, 0, nullptr);
+        if (t && WaitForSingleObject(t, 2000) != WAIT_OBJECT_0) Log("xr: the runtime did not end the session in 2 s");
+        EnumWindows(
+            [](HWND w, LPARAM) -> BOOL {
+                DWORD pid = 0;
+                GetWindowThreadProcessId(w, &pid);
+                if (pid == GetCurrentProcessId() && IsWindowVisible(w)) ShowWindow(w, SW_MINIMIZE);
+                return TRUE;
+            },
+            0);
+        TASKDIALOGCONFIG c = { sizeof(c) };
+        c.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION;
+        c.pszWindowTitle = L"FlatOut 2 VR";
+        c.pszMainIcon = TD_ERROR_ICON;
+        c.pszMainInstruction = L"The graphics driver was reset";
+        c.pszContent = L"The graphics card stopped with an error and Windows reset its driver (the system's event log has it, as "
+                       L"nvlddmkm on an NVIDIA card). The game cannot draw after that and closes now: start it again.\n\n"
+                       L"Details: scripts\\FO2VR.log";
+        c.dwCommonButtons = TDCBF_OK_BUTTON;
+        ShowTaskDialog(c, nullptr);
+    }
+    TerminateProcess(GetCurrentProcess(), 1);
+    for (;;) Sleep(INFINITE);
+}
+
+// After the runtime failed a frame's call: whether the GPU was lost meanwhile (the runtime then fails every frame, and
+// the mod's own copy, which would see it, is not reached).
+void CheckDeviceLost(const char* what)
+{
+    VkFence f = g_slots[0].fence;
+    if (g_vkDevice && f && vk.GetFenceStatus && vk.GetFenceStatus(g_vkDevice, f) == VK_ERROR_DEVICE_LOST) DeviceLost(what);
 }
 
 // Copies D3D9 textures (from the given offsets in them, if any) into newly acquired images of the given swapchains on
@@ -351,14 +456,18 @@ bool CopyToSwapchains(IDirect3DTexture9* const* textures, Swapchain* const* chai
         if (!Check(r, "xrAcquireSwapchainImage")) return false;
         XrSwapchainImageWaitInfo wi = { XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
         wi.timeout = XR_INFINITE_DURATION;
-        Check(xrWaitSwapchainImage(chains[i]->handle, &wi), "xrWaitSwapchainImage");
+        {
+            QueueLock lock;
+            r = xrWaitSwapchainImage(chains[i]->handle, &wi);
+        }
+        Check(r, "xrWaitSwapchainImage");
         g_times.wait += NowSeconds() - a1;
     }
 
     g_slot = (g_slot + 1) % 3;
     Slot& s = g_slots[g_slot];
     double f0 = NowSeconds();
-    vk.WaitForFences(g_vkDevice, 1, &s.fence, VK_TRUE, 1000000000ull);
+    if (vk.WaitForFences(g_vkDevice, 1, &s.fence, VK_TRUE, 1000000000ull) == VK_ERROR_DEVICE_LOST) DeviceLost("vkWaitForFences");
     double f1 = NowSeconds();
     g_times.fence += f1 - f0;
     vk.ResetFences(g_vkDevice, 1, &s.fence);
@@ -417,11 +526,12 @@ bool CopyToSwapchains(IDirect3DTexture9* const* textures, Swapchain* const* chai
         for (int i = 0; i < count; i++)
         {
             XrSwapchainImageReleaseInfo ri = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
-            xrReleaseSwapchainImage(chains[i]->handle, &ri);
+            chains[i]->released |= XR_SUCCEEDED(xrReleaseSwapchainImage(chains[i]->handle, &ri));
         }
     }
     g_times.submit += NowSeconds() - f1;
     g_times.count++;
+    if (vr == VK_ERROR_DEVICE_LOST) DeviceLost("vkQueueSubmit");
     if (vr != VK_SUCCESS) Log("xr: vkQueueSubmit failed %d", (int)vr);
     return vr == VK_SUCCESS;
 }
@@ -716,7 +826,7 @@ void EndFrame(const XrCompositionLayerBaseHeader* layer, const XrCompositionLaye
         r = xrEndFrame(g_session, &ei);
     }
     if (layer) g_times.endFrame += NowSeconds() - t0;
-    Check(r, "xrEndFrame");
+    if (!Check(r, "xrEndFrame")) CheckDeviceLost("xrEndFrame");
     g_frameOpen = false;
 }
 
@@ -805,7 +915,13 @@ DWORD WINAPI RuntimeThread(void* param)
     XrInstance instance = XR_NULL_HANDLE;
     XrSystemId system = XR_NULL_SYSTEM_ID;
     std::wstring problem;
-    XrResult r = xrCreateInstance(&ci, &instance);
+    XrResult r = xrCreateInstance ? xrCreateInstance(&ci, &instance) : XR_ERROR_RUNTIME_UNAVAILABLE;  // (none: see LoadEntryPoints)
+    if (XR_SUCCEEDED(r) && !LoadFunctions(instance))
+    {
+        Log("xr: the runtime lacks some of OpenXR's functions");
+        if (xrDestroyInstance) xrDestroyInstance(instance);
+        r = XR_ERROR_RUNTIME_FAILURE;
+    }
     if (!Check(r, "xrCreateInstance"))
     {
         instance = XR_NULL_HANDLE;
@@ -969,6 +1085,107 @@ StartChoice AskAboutRuntime(RuntimeStart*& start)
     return button == kQuit ? StartChoice::Quit : StartChoice::WithoutVr;  // (or the window closed)
 }
 
+// The process runs at a high integrity level (as administrator), as the loader tells it.
+bool HighIntegrity()
+{
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return false;
+    alignas(8) BYTE buf[64];
+    DWORD size = 0;
+    bool high = false;
+    if (GetTokenInformation(token, TokenIntegrityLevel, buf, sizeof(buf), &size))
+    {
+        PSID sid = ((TOKEN_MANDATORY_LABEL*)buf)->Label.Sid;
+        high = *GetSidSubAuthority(sid, *GetSidSubAuthorityCount(sid) - 1) >= SECURITY_MANDATORY_HIGH_RID;
+    }
+    CloseHandle(token);
+    return high;
+}
+
+// The runtime's own xrGetInstanceProcAddr (see LoadEntryPoints), loaded as the loader does it: the library its .json
+// names (relative to the .json's folder), and the loader's handshake with it.
+PFN_xrGetInstanceProcAddr LoadRuntime(const std::wstring& json)
+{
+    std::string text;
+    HANDLE f = CreateFileW(json.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f != INVALID_HANDLE_VALUE)
+    {
+        char buf[4096];
+        DWORD got = 0;
+        while (ReadFile(f, buf, sizeof(buf), &got, nullptr) && got > 0 && text.size() < 65536) text.append(buf, got);
+        CloseHandle(f);
+    }
+    // "library_path": "..." (with JSON's escapes)
+    size_t key = text.find("\"library_path\"");
+    size_t colon = key == std::string::npos ? key : text.find(':', key + 14);
+    size_t open = colon == std::string::npos ? colon : text.find('"', colon + 1);
+    std::string lib;
+    for (size_t i = open == std::string::npos ? text.size() : open + 1; i < text.size() && text[i] != '"'; i++)
+        lib += text[i] == '\\' && i + 1 < text.size() ? text[++i] : text[i];
+    if (lib.empty())
+    {
+        Log("xr: %ls names no runtime library", json.c_str());
+        return nullptr;
+    }
+    wchar_t wide[MAX_PATH] = L"";
+    MultiByteToWideChar(CP_UTF8, 0, lib.c_str(), -1, wide, MAX_PATH);
+    std::wstring path = wide;
+    bool absolute = path.size() > 1 && (path[1] == L':' || (path[0] == L'\\' && path[1] == L'\\'));
+    if (!absolute) path = json.substr(0, json.find_last_of(L"/\\") + 1) + path;
+    std::replace(path.begin(), path.end(), L'/', L'\\');
+    HMODULE m = LoadLibraryExW(path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+    auto negotiate = m ? (PFN_xrNegotiateLoaderRuntimeInterface)GetProcAddress(m, "xrNegotiateLoaderRuntimeInterface") : nullptr;
+    if (!negotiate)
+    {
+        Log("xr: cannot load the runtime %ls (error %u)", path.c_str(), (unsigned)GetLastError());
+        return nullptr;
+    }
+    XrNegotiateLoaderInfo li = { XR_LOADER_INTERFACE_STRUCT_LOADER_INFO, XR_LOADER_INFO_STRUCT_VERSION, sizeof(li) };
+    li.minInterfaceVersion = 1;
+    li.maxInterfaceVersion = XR_CURRENT_LOADER_RUNTIME_VERSION;
+    li.minApiVersion = XR_MAKE_VERSION(1, 0, 0);
+    li.maxApiVersion = XR_MAKE_VERSION(1, 0x3ff, 0xfff);  // (the loader's: any 1.x)
+    XrNegotiateRuntimeRequest rr = { XR_LOADER_INTERFACE_STRUCT_RUNTIME_REQUEST, XR_RUNTIME_INFO_STRUCT_VERSION, sizeof(rr) };
+    XrResult r = negotiate(&li, &rr);
+    if (XR_FAILED(r) || !rr.getInstanceProcAddr)
+    {
+        Log("xr: the runtime %ls refused the loader's handshake (%d)", path.c_str(), (int)r);
+        return nullptr;
+    }
+    Log("xr: runtime library %ls loaded (interface %u, API %u.%u.%u)", path.c_str(), rr.runtimeInterfaceVersion,
+        XR_VERSION_MAJOR(rr.runtimeApiVersion), XR_VERSION_MINOR(rr.runtimeApiVersion), XR_VERSION_PATCH(rr.runtimeApiVersion));
+    return rr.getInstanceProcAddr;
+}
+
+// xrGetInstanceProcAddr and xrCreateInstance: the loader's, or with Runtime= in a game run as administrator the
+// runtime's own. The loader ignores XR_RUNTIME_JSON in an elevated process (another program could otherwise make an
+// administrator's load its library through it) and starts the system's active runtime instead: the Steam release,
+// started by a Steam run as administrator, went to Virtual Desktop (the active runtime) with Runtime=steamvr. Runtime=
+// comes from the mod's own ini, so the runtime it names is loaded without the loader then (and without the loader's
+// API layers). False: no loader (the runtime's failure is the start's: RuntimeThread).
+bool LoadEntryPoints()
+{
+    if (!g_runtimePath.empty() && HighIntegrity())
+    {
+        Log("xr: the game runs as administrator: the OpenXR loader would start the system's active runtime, not Runtime= - "
+            "the runtime is loaded without it");
+        xrGetInstanceProcAddr = LoadRuntime(g_runtimePath);
+    }
+    else
+    {
+        std::wstring loader = ModuleDir() + L"openxr_loader.dll";
+        HMODULE m = LoadLibraryW(loader.c_str());
+        if (!m)
+        {
+            Log("xr: cannot load %ls (error %u)", loader.c_str(), (unsigned)GetLastError());
+            return false;
+        }
+        xrGetInstanceProcAddr = (PFN_xrGetInstanceProcAddr)GetProcAddress(m, "xrGetInstanceProcAddr");
+    }
+    if (xrGetInstanceProcAddr) xrGetInstanceProcAddr(XR_NULL_HANDLE, "xrCreateInstance", (PFN_xrVoidFunction*)&xrCreateInstance);
+    return true;
+}
+
 }  // namespace
 
 // [Test] FakeHeadset: no runtime at all. The session counts as running, never has a frame, and its
@@ -988,7 +1205,7 @@ bool InitInstance()
         Log("xr: no runtime ([Test] FakeHeadset): eyes %ux%u straight ahead", g_eyeW, g_eyeH);
         return true;
     }
-    // Runtime choice: the loader reads XR_RUNTIME_JSON when it is loaded.
+    // Runtime choice: the loader reads XR_RUNTIME_JSON when it is loaded (but see LoadEntryPoints).
     std::wstring runtime = g_cfg.vrRuntime;
     if (_wcsicmp(runtime.c_str(), L"steamvr") == 0)
     {
@@ -1005,12 +1222,7 @@ bool InitInstance()
         g_runtimePath = runtime;
         Log("xr: runtime %ls", runtime.c_str());
     }
-    std::wstring loader = ModuleDir() + L"openxr_loader.dll";
-    if (!LoadLibraryW(loader.c_str()))
-    {
-        Log("xr: cannot load %ls (error %u)", loader.c_str(), (unsigned)GetLastError());
-        return false;
-    }
+    if (!LoadEntryPoints()) return false;
     // Most starts take a second or two; a runtime that keeps the game waiting longer, or fails, gets the window
     // (not in background mode: tests wait as before).
     RuntimeStart* start = BeginRuntimeStart();
@@ -1189,14 +1401,22 @@ bool WaitFrame()
     if (g_frameOpen) return true;
     XrFrameWaitInfo wi = { XR_TYPE_FRAME_WAIT_INFO };
     g_frameState = { XR_TYPE_FRAME_STATE };
-    if (!Check(xrWaitFrame(g_session, &wi, &g_frameState), "xrWaitFrame")) return false;
+    if (!Check(xrWaitFrame(g_session, &wi, &g_frameState), "xrWaitFrame"))
+    {
+        CheckDeviceLost("xrWaitFrame");
+        return false;
+    }
     XrFrameBeginInfo bi = { XR_TYPE_FRAME_BEGIN_INFO };
     XrResult r;
     {
         QueueLock lock;
         r = xrBeginFrame(g_session, &bi);
     }
-    if (!Check(r, "xrBeginFrame")) return false;
+    if (!Check(r, "xrBeginFrame"))
+    {
+        CheckDeviceLost("xrBeginFrame");
+        return false;
+    }
     g_frameOpen = true;
     return true;
 }
@@ -1204,6 +1424,38 @@ bool WaitFrame()
 bool ShouldRender() { return g_frameOpen && g_frameState.shouldRender; }
 double DisplayTime() { return (double)g_frameState.predictedDisplayTime * 1e-9; }
 double DisplayPeriod() { return (double)g_frameState.predictedDisplayPeriod * 1e-9; }
+
+// The eyes as the runtime gives them, logged when they change: how far apart, the angle between them and each one's
+// field of view. (With SteamVR through Virtual Desktop the picture seemed cross-eyed after the game had lost the focus
+// and got it back.)
+void NoteViews()
+{
+    static float last[10];
+    static bool logged;
+    static double lastLog;
+    const XrVector3f& a = g_views[0].pose.position;
+    const XrVector3f& b = g_views[1].pose.position;
+    const float fwd[3] = { 0, 0, -1 };
+    float f0[3], f1[3];
+    Rotate(g_views[0].pose.orientation, fwd, f0);
+    Rotate(g_views[1].pose.orientation, fwd, f1);
+    float dot = std::clamp(f0[0] * f1[0] + f0[1] * f1[1] + f0[2] * f1[2], -1.0f, 1.0f);
+    const XrFovf& l = g_views[0].fov;
+    const XrFovf& r = g_views[1].fov;
+    const float now[10] = { sqrtf((b.x - a.x) * (b.x - a.x) + (b.y - a.y) * (b.y - a.y) + (b.z - a.z) * (b.z - a.z)), acosf(dot),
+                            l.angleLeft, l.angleRight, l.angleUp, l.angleDown, r.angleLeft, r.angleRight, r.angleUp, r.angleDown };
+    bool changed = !logged || fabsf(now[0] - last[0]) > 0.0005f;  // half a millimetre
+    for (int i = 1; i < 10; i++) changed |= fabsf(now[i] - last[i]) > 0.0035f;  // a fifth of a degree
+    double t = NowSeconds();
+    if (!changed || t - lastLog < 1.0) return;
+    memcpy(last, now, sizeof(last));
+    logged = true;
+    lastLog = t;
+    const float deg = 57.29578f;
+    Log("xr: the eyes %.1f mm apart, %.2f deg between them; fields of view (left right up down, deg): left eye %.1f %.1f %.1f %.1f, "
+        "right eye %.1f %.1f %.1f %.1f", 1000.0f * now[0], deg * now[1], deg * now[2], deg * now[3], deg * now[4], deg * now[5],
+        deg * now[6], deg * now[7], deg * now[8], deg * now[9]);
+}
 
 bool BeginFrame()
 {
@@ -1219,6 +1471,7 @@ bool BeginFrame()
     g_viewsValid = XR_SUCCEEDED(xrLocateViews(g_session, &li, &vs, 2, &n, g_views)) && n == 2 &&
                    (vs.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) != 0;
     if (!g_viewsValid) DefaultViews();
+    if (g_viewsValid) NoteViews();
     if (g_viewsValid && g_recenterPending)
     {
         g_recenterPending = false;
@@ -1276,21 +1529,38 @@ EyeFov Fov(int eye)
 XrPosef PanelPose(float distance, float height)
 {
     XrPosef p;
-    float c = cosf(g_originYaw * 0.5f), s = sinf(g_originYaw * 0.5f);
-    p.orientation = { 0, s, 0, c };
-    p.position = { g_originPos[0] - sinf(g_originYaw) * distance, g_originPos[1] + height, g_originPos[2] - cosf(g_originYaw) * distance };
+    p.orientation = g_originRot;
+    const float ahead[3] = { 0, height, -distance };
+    float a[3];
+    Rotate(g_originRot, ahead, a);
+    p.position = { g_originPos[0] + a[0], g_originPos[1] + a[1], g_originPos[2] + a[2] };
     return p;
+}
+
+// The HUD panel's swapchain, made anew for another size.
+bool EnsureHudSwapchain(unsigned w, unsigned h)
+{
+    if (g_hudSc.handle && (g_hudSc.w != w || g_hudSc.h != h)) DestroySwapchain(g_hudSc);
+    return g_hudSc.handle || CreateSwapchain(g_hudSc, w, h, "HUD");
+}
+
+// The flat screen in front of the recenter origin, showing its swapchain's last released image.
+XrCompositionLayerQuad ScreenQuad()
+{
+    XrCompositionLayerQuad quad = { XR_TYPE_COMPOSITION_LAYER_QUAD };
+    quad.space = g_local;
+    quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+    quad.subImage.swapchain = g_screenSc.handle;
+    quad.subImage.imageRect = { { 0, 0 }, { (int32_t)g_screenSc.w, (int32_t)g_screenSc.h } };
+    quad.pose = PanelPose(g_cfg.vrScreenDistance, 0.0f);
+    quad.size = { g_cfg.vrScreenWidth, g_cfg.vrScreenWidth * (float)g_screenSc.h / (float)g_screenSc.w };
+    return quad;
 }
 
 void SubmitEyes(IDirect3DTexture9* left, IDirect3DTexture9* right, IDirect3DTexture9* hud, unsigned hudW, unsigned hudH)
 {
     if (!g_frameOpen) return;
-    if (hud && g_hudSc.handle && (g_hudSc.w != hudW || g_hudSc.h != hudH))
-    {
-        xrDestroySwapchain(g_hudSc.handle);
-        g_hudSc = Swapchain();
-    }
-    if (hud && !g_hudSc.handle && !CreateSwapchain(g_hudSc, hudW, hudH, "HUD")) hud = nullptr;
+    if (hud && !EnsureHudSwapchain(hudW, hudH)) hud = nullptr;
     IDirect3DTexture9* tex[3] = { left, right, hud };
     Swapchain* chains[3] = { &g_eyeSc[0], &g_eyeSc[1], &g_hudSc };
     const uint32_t offsets[3][2] = { { g_eyeOffset[0][0], g_eyeOffset[0][1] }, { g_eyeOffset[1][0], g_eyeOffset[1][1] }, { 0, 0 } };
@@ -1326,11 +1596,7 @@ void SubmitEyes(IDirect3DTexture9* left, IDirect3DTexture9* right, IDirect3DText
 void SubmitScreen(IDirect3DTexture9* screen, unsigned w, unsigned h)
 {
     if (!g_frameOpen) return;
-    if (g_screenSc.handle && (g_screenSc.w != w || g_screenSc.h != h))
-    {
-        xrDestroySwapchain(g_screenSc.handle);
-        g_screenSc = Swapchain();
-    }
+    if (g_screenSc.handle && (g_screenSc.w != w || g_screenSc.h != h)) DestroySwapchain(g_screenSc);
     if (!g_screenSc.handle && !CreateSwapchain(g_screenSc, w, h, "screen"))
     {
         EndFrame(nullptr);
@@ -1342,15 +1608,29 @@ void SubmitScreen(IDirect3DTexture9* screen, unsigned w, unsigned h)
         EndFrame(nullptr);
         return;
     }
-    // A flat screen in front of the recenter origin.
-    XrCompositionLayerQuad quad = { XR_TYPE_COMPOSITION_LAYER_QUAD };
-    quad.space = g_local;
-    quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
-    quad.subImage.swapchain = g_screenSc.handle;
-    quad.subImage.imageRect = { { 0, 0 }, { (int32_t)w, (int32_t)h } };
-    quad.pose = PanelPose(g_cfg.vrScreenDistance, 0.0f);
-    quad.size = { g_cfg.vrScreenWidth, g_cfg.vrScreenWidth * (float)h / (float)w };
+    XrCompositionLayerQuad quad = ScreenQuad();
     EndFrame((const XrCompositionLayerBaseHeader*)&quad);
+}
+
+void SubmitLastScreen(unsigned hudW, unsigned hudH)
+{
+    if (!g_frameOpen) return;
+    if (hudW && hudH) EnsureHudSwapchain(hudW, hudH);
+    if (!g_screenSc.released)
+    {
+        EndFrame(nullptr);
+        return;
+    }
+    XrCompositionLayerQuad quad = ScreenQuad();
+    EndFrame((const XrCompositionLayerBaseHeader*)&quad);
+}
+
+void PrepareHud(unsigned w, unsigned h)
+{
+    static unsigned tried[2];  // (once a size: a failure is not retried every frame)
+    if (!g_session || !w || !h || (tried[0] == w && tried[1] == h)) return;
+    tried[0] = w, tried[1] = h;
+    EnsureHudSwapchain(w, h);
 }
 
 void EndFrameEmpty()
