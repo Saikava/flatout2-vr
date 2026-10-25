@@ -1630,20 +1630,6 @@ bool CockpitEye(float* anchor)
     return true;
 }
 
-// The player at this PC (see game.h: in the stunts kLocalPlayer stays empty).
-BYTE* LocalPlayer()
-{
-    BYTE* player = *(BYTE**)fo2::kLocalPlayer;
-    BYTE* gf = *(BYTE**)fo2::kGameFlow;
-    BYTE* race = gf && !player ? *(BYTE**)(gf + fo2::kGfRace) : nullptr;
-    if (!race) return player;
-    BYTE** begin = *(BYTE***)(race + fo2::kRacePlayers);
-    BYTE** end = *(BYTE***)(race + fo2::kRacePlayers + 4);
-    for (BYTE** p = begin; p && p < end && p - begin < 16; p++)
-        if (*p && *(int*)(*p + fo2::kPlayerType) == 1) return *p;
-    return nullptr;
-}
-
 // A turn (the rows right, up, forward of a matrix) as a quaternion (x, y, z, w), and back.
 void RowsToQuat(const float* m, float* q)
 {
@@ -2216,7 +2202,8 @@ static __declspec(naked) void DynamicBatchDrawHook()
 // [VR] Hud=2: the HUD panel is left out while the race runs, and comes back for its start (the
 // countdown), the pause menu and the results. The race state stays "racing" in the pause menu; that
 // the game is paused shows in the physics instead: a running race steps the world in every frame, a
-// paused one not at all. The Hud key switches between 1 and 2.
+// paused one not at all. A stunt's round results come with the world running, once the player's part
+// is over (PlayerRunOver). The Hud key switches between 1 and 2.
 constexpr int kRaceStateRacing = 8;
 bool g_hudKeyWasDown;
 int g_lastPhysicsSteps, g_framesWithoutStep;
@@ -2240,7 +2227,7 @@ bool HudPanelShown()
     int steps = PhysicsSteps();
     g_framesWithoutStep = steps != g_lastPhysicsSteps ? 0 : g_framesWithoutStep + 1;
     g_lastPhysicsSteps = steps;
-    bool leftOut = g_cfg.vrHud == 2 && InRace() && RaceState() == kRaceStateRacing && g_framesWithoutStep < 2;
+    bool leftOut = g_cfg.vrHud == 2 && InRace() && RaceState() == kRaceStateRacing && g_framesWithoutStep < 2 && !PlayerRunOver();
     if (leftOut != g_hudLeftOut)
     {
         g_hudLeftOut = leftOut;
@@ -6319,6 +6306,26 @@ void __stdcall RenderViewsHook(BYTE* ctx, BYTE** cams, float* fovScale)
 }
 
 }  // namespace
+
+// (see game.h: in the stunts kLocalPlayer stays empty)
+BYTE* LocalPlayer()
+{
+    BYTE* player = *(BYTE**)fo2::kLocalPlayer;
+    BYTE* gf = *(BYTE**)fo2::kGameFlow;
+    BYTE* race = gf && !player ? *(BYTE**)(gf + fo2::kGfRace) : nullptr;
+    if (!race) return player;
+    BYTE** begin = *(BYTE***)(race + fo2::kRacePlayers);
+    BYTE** end = *(BYTE***)(race + fo2::kRacePlayers + 4);
+    for (BYTE** p = begin; p && p < end && p - begin < 16; p++)
+        if (*p && *(int*)(*p + fo2::kPlayerType) == 1) return *p;
+    return nullptr;
+}
+
+bool PlayerRunOver()
+{
+    BYTE* player = LocalPlayer();
+    return player && *(int*)(player + fo2::kPlayerInputOff) != 0;
+}
 
 bool SteeringWheel(float hub[3], float axes[9]) { return WheelPose(hub, axes); }
 

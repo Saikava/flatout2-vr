@@ -41,7 +41,7 @@
 // The mod puts its own DirectInput between the game and the game's (InputProxy, from just before the game lists its
 // controllers), which
 // - adds "VR controllers" to the list (VrPad): the VR controllers read as a gamepad, with force feedback played as their
-//   vibration;
+//   vibration; with the keyboard chosen, the race's player drives with them too (ShareVrPadWithKeyboard);
 // - in VR opens the game controllers for use without the window in front (the window on the monitor is not what the
 //   player looks at: started from the headset, it may never have had the focus, and the controller did nothing);
 // - gives an Xbox controller force feedback (PadProxy): DirectInput has none for them, only XInput can make them
@@ -69,7 +69,7 @@ bool g_driving;  // the player drives (ControllersMenuKeys, once a frame)
 float EngineHum()
 {
     if (g_cfg.vrEngineRumble <= 0 || !g_driving) return 0;
-    BYTE* player = *(BYTE**)fo2::kLocalPlayer;
+    BYTE* player = LocalPlayer();
     BYTE* car = player ? *(BYTE**)(player + fo2::kPlayerCar) : nullptr;
     if (!car) return 0;
     float revs = *(float*)(car + fo2::kCarEngineRevs), idle = *(float*)(car + fo2::kCarEngineIdle), limit = *(float*)(car + fo2::kCarEngineLimit);
@@ -1417,6 +1417,36 @@ private:
 
 bool VrPadWanted() { return g_cfg.vrMotionControllers && xr::Available(); }
 
+// The player's steering, throttle and brake take a controller's axis over the keyboard's keys once it is 1% off its rest
+// (the game's 1e-6 took the VR controllers' triggers at rest: game.h, kAxisOverKeysOperands).
+float g_axisOverKeys = 0.01f;
+
+// VR: with the keyboard chosen in the game's options, the race's player drives with the VR controllers as well: given
+// the "VR controllers" (which the game reads in every frame whichever is chosen), whose button reads take the
+// keyboard's keys too (game.h, kPlayerController). Once a frame, since the race gives the player the chosen controller
+// as it starts. A game controller chosen is left as it is.
+void ShareVrPadWithKeyboard()
+{
+    BYTE* input = *(BYTE**)fo2::kInput;
+    BYTE* gf = *(BYTE**)fo2::kGameFlow;
+    if (!VrPadWanted() || !input || !gf || *(int*)(gf + fo2::kGameState) != 2 || *(int*)(gf + fo2::kRaceState) < 5 ||
+        *(int*)fo2::kChosenController != 0)
+        return;
+    BYTE* player = LocalPlayer();
+    int count = *(int*)(input + fo2::kInputControllers);
+    BYTE** list = (BYTE**)(input + fo2::kInputControllerList);
+    if (!player || count < 2 || *(BYTE**)(player + fo2::kPlayerController) != list[0]) return;
+    for (int i = 1; i < count && i < 4; i++)
+        if (list[i] && *(GUID*)(list[i] + fo2::kControllerGuid) == kVrPadProduct)
+        {
+            *(BYTE**)(player + fo2::kPlayerController) = list[i];
+            static bool logged;
+            if (!logged) Log("controllers: the keyboard is chosen - the player drives with the VR controllers too (and the keyboard)");
+            logged = true;
+            return;
+        }
+}
+
 bool IsKeyboardOrMouse(REFGUID g)
 {
     return g == GUID_SysKeyboard || g == GUID_SysMouse || g == GUID_SysKeyboardEm || g == GUID_SysMouseEm || g == GUID_SysKeyboardEm2 ||
@@ -1554,6 +1584,13 @@ bool InstallControllers()
         Log("controllers: the game's controller list is called differently - no VR controllers, no vibration for Xbox controllers");
         return false;
     }
+    if (g_cfg.vrEnabled && g_cfg.vrMotionControllers)
+    {
+        bool ok = true;
+        for (uintptr_t operand : fo2::kAxisOverKeysOperands) ok &= PatchPointer(operand, fo2::kTinyValue, &g_axisOverKeys);
+        Log("controllers: %s", ok ? "the keyboard's steering, throttle and brake count beside a game controller's axes at rest"
+                                  : "the player's input is not as expected - the keyboard's throttle and brake do not count beside a game controller");
+    }
     const std::wstring& name = g_cfg.vrPauseButton;
     for (const PauseButtonName& p : kPauseButtons)
         if (_wcsicmp(name.c_str(), p.name) == 0) g_pauseButton = p.button;
@@ -1687,7 +1724,8 @@ void GameKey(int vk, bool down)
 
 bool g_paused;  // the race's pause (Driving)
 
-// The player drives: a race running (its countdown too; not its pause, its "start race" or its end).
+// The player drives: a race running (its countdown too; not its pause, its "start race" or its end), with the player's
+// part not over (a stunt's round results come with the world running: PlayerRunOver).
 bool Driving()
 {
     static int lastSteps, framesWithoutStep;
@@ -1699,7 +1737,7 @@ bool Driving()
     if (!gf || *(int*)(gf + fo2::kGameState) != 2) return false;
     int race = *(int*)(gf + fo2::kRaceState);
     g_paused = race == 8 && framesWithoutStep >= 2;
-    return race == 7 || (race == 8 && framesWithoutStep < 2);
+    return race == 7 || (race == 8 && framesWithoutStep < 2 && !PlayerRunOver());
 }
 
 bool Remapping()
@@ -1790,11 +1828,19 @@ bool PauseButtonDown(const xr::Controller& l, const xr::Controller& r, double no
 Source g_vrWays[4], g_vrA, g_vrB, g_vrMenu, g_vrPause;
 Source g_padWays[4][4], g_padA[4], g_padB[4], g_padStart[4], g_padBack[4];
 
+// The game loses the headset's focus while the player drives (SteamVR's dashboard, the Quest's or Virtual Desktop's
+// menu comes over it, and takes the controllers): the race is paused, as VR games pause then (Esc held a tenth of a
+// second). Through SteamVR the menu button may open its dashboard instead of reaching the game: it pauses all the same.
+Source g_focusPause;
+bool g_hadFocus = true;
+double g_focusPauseUntil;
+
 }  // namespace
 
 void ControllersMenuKeys()
 {
     if (!g_cfg.vrEnabled) return;
+    ShareVrPadWithKeyboard();
     double now = NowSeconds();
     bool driving = Driving(), off = Remapping() || rec::Replaying();
     g_driving = driving;
@@ -1806,6 +1852,14 @@ void ControllersMenuKeys()
         Log("controllers: %s (game state %d, race state %d)", driving ? "driving" : "menus", gf ? *(int*)(gf + fo2::kGameState) : -1,
             gf ? *(int*)(gf + fo2::kRaceState) : -1);
     }
+    bool focus = !xr::Running() || xr::Focused();
+    if (g_hadFocus && !focus && driving)
+    {
+        g_focusPauseUntil = now + 0.1;
+        Log("controllers: the game lost the headset's focus while driving - the race paused");
+    }
+    g_hadFocus = focus;
+    Feed(g_focusPause, now < g_focusPauseUntil, kMenu, driving, off, now);
     const Press ways[4] = { kArrowUp, kArrowDown, kArrowLeft, kArrowRight };
     if (VrPadWanted())
     {

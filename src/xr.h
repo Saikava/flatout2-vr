@@ -29,6 +29,11 @@ bool Available();  // InitInstance succeeded
 void OnDevice(IDirect3DDevice9* dev);
 void PollEvents();
 bool Running();
+// The session has the input focus: not while the runtime's own menu is over the game (SteamVR's dashboard, the Quest's
+// or Virtual Desktop's menu).
+bool Focused();
+// [Test] without a headset: the focus taken away and given back by hand (the background command "focus").
+void SetTestFocus(bool focused);
 
 // Eye render size (recommended size times RenderScale).
 void EyeSize(unsigned* w, unsigned* h);

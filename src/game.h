@@ -565,6 +565,17 @@ constexpr uintptr_t kActionValue = 0x55EA50;
 // else the steering from its controls, an axis's (kPlayerSteerKeys clear) or the keys'.
 constexpr int kPlayerInputOff = 0x378;
 constexpr int kPlayerSteerKeys = 0x668;
+// The player's controller (one of the input's list: kInputControllerList), which the race gives the player from the
+// options' choice (kChosenController: 0 the keyboard) as it starts (0x45F9F0). A game controller's button reads take
+// the keyboard's key for the same control as well (0x55D760): the keyboard's keys drive beside a chosen game controller.
+// Its steering, throttle and brake each take the axis over the keys when the axis is off its rest by more than the float
+// at kTinyValue (1e-6, a constant the game shares elsewhere): the operands of those three comparisons (fcomp) are at
+// kAxisOverKeysOperands. A trigger at rest comes out at 0.0018 there (the VR controllers' as the game reads it), so the
+// keyboard's throttle and brake never counted beside a gamepad.
+constexpr int kPlayerController = 0x32C;
+constexpr uintptr_t kChosenController = 0x8D7BE4;  // int
+constexpr uintptr_t kTinyValue = 0x67DCFC;
+constexpr uintptr_t kAxisOverKeysOperands[] = { 0x46D2BA, 0x46D33B, 0x46D392 };
 // The player's steering (0x46F6C4) bends the controller's again, (1 - c) y + c y^3 with c here (0.5, from the game's
 // data), moves toward it at a limited rate (centre to full lock in half a second), and the car's steering is that times
 // a factor that falls with the speed (0x46FA50: 1 up to 20, 0.8 at 40, 0.5 at 100, 0.25 at 250). The steering wheel in

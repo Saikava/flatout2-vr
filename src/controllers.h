@@ -14,7 +14,8 @@ void FocusGameWindow(HWND window);
 void LockGameFocus();
 // Per frame: true once when both thumbsticks of the VR controllers are pressed together (recenter the view).
 bool ControllersRecenter();
-// Per frame: in the game's menus (which take only the keyboard) the VR controllers and Xbox controllers press its keys.
+// Per frame: in the game's menus (which take only the keyboard) the VR controllers and Xbox controllers press its keys;
+// with the keyboard chosen in the game's options, the race's player drives with the VR controllers too.
 void ControllersMenuKeys();
 // The player's own steering wheel's turn, for the cockpit's (render.cpp): -1 to 1 for the cockpit wheel's 90 degrees
 // either way. The hands' turn while they hold the cockpit's wheel ([VR] GrabWheel), or a game controller's steering axis

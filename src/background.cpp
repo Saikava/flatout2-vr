@@ -341,6 +341,15 @@ void RunCommand(std::string line)
             p[2], yaw, pitch, c.trigger, c.stick[0], c.stick[1], button, c.grip);
         return;
     }
+    if (cmd == "focus")
+    {
+        // focus <0 | 1>: the pretend headset's session loses the input focus (as when SteamVR's dashboard opens over
+        // the game) or gets it back.
+        bool focused = atoi(arg.c_str()) != 0;
+        xr::SetTestFocus(focused);
+        Log("input file: focus %s", focused ? "given back" : "taken away");
+        return;
+    }
     if (cmd == "camera")
     {
         float* o = g_cfg.vrCameraOffset;

@@ -20,6 +20,22 @@ using CreateDeviceFn = HRESULT(__stdcall*)(IDirect3D9*, UINT, D3DDEVTYPE, HWND, 
 CreateDeviceFn oCreateDevice;
 bool g_xrTried;
 
+// The game's window against Windows' display scaling: a window unaware of it is sized in scaled pixels (at 150% a full
+// screen of 3840x2160 covers one and a half 4K monitors).
+void LogWindow(HWND window)
+{
+    RECT r = {};
+    GetWindowRect(window, &r);
+    HMODULE user = GetModuleHandleW(L"user32.dll");
+    auto context = (HANDLE(WINAPI*)(HWND))GetProcAddress(user, "GetWindowDpiAwarenessContext");
+    auto awareness = (int(WINAPI*)(HANDLE))GetProcAddress(user, "GetAwarenessFromDpiAwarenessContext");
+    auto dpi = (UINT(WINAPI*)(HWND))GetProcAddress(user, "GetDpiForWindow");
+    int a = context && awareness ? awareness(context(window)) : -1;
+    const char* names[] = { "unaware of the display scaling", "aware of the system's display scaling", "aware of each monitor's display scaling" };
+    Log("window: %ldx%ld at %ld,%ld, %s (%u dpi)", r.right - r.left, r.bottom - r.top, r.left, r.top, a >= 0 && a <= 2 ? names[a] : "(DPI awareness unknown)",
+        dpi ? dpi(window) : 0);
+}
+
 HRESULT __stdcall CreateDeviceHook(IDirect3D9* d3d, UINT adapter, D3DDEVTYPE type, HWND wnd, DWORD flags, D3DPRESENT_PARAMETERS* pp,
                                    IDirect3DDevice9** out)
 {
@@ -31,6 +47,7 @@ HRESULT __stdcall CreateDeviceHook(IDirect3D9* d3d, UINT adapter, D3DDEVTYPE typ
         pp ? pp->Windowed : -1, pp ? (int)pp->MultiSampleType : -1, pp ? (unsigned)pp->PresentationInterval : 0, (unsigned)hr);
     if (SUCCEEDED(hr) && out && *out)
     {
+        LogWindow(pp && pp->hDeviceWindow ? pp->hDeviceWindow : wnd);
         BackgroundAfterDevice(pp && pp->hDeviceWindow ? pp->hDeviceWindow : wnd);
         if (xr::Available() && !BackgroundMode()) KeepGameActive(pp && pp->hDeviceWindow ? pp->hDeviceWindow : wnd);
         FocusGameWindow(pp && pp->hDeviceWindow ? pp->hDeviceWindow : wnd);
@@ -72,6 +89,11 @@ IDirect3D9* WINAPI Direct3DCreate9Hook(UINT sdk)
     {
         g_xrTried = true;
         EnsureLargeAddressAware();
+        // The game makes its window after Direct3D, and DXVK makes the process aware of Windows' display scaling as it
+        // starts (SetProcessDPIAware; GOG's installer sets its FlatOut2.exe so too). The runtime starts first: the
+        // process is made aware before it, so that nothing the runtime starts leaves the window unaware (the Steam copy
+        // started with SteamVR came up stretched over two 4K monitors scaled to 150%: see LogWindow).
+        SetProcessDPIAware();
         if (!xr::InitInstance()) Log("VR not available - the game runs on the monitor only");
         if (g_cfg.vrFloatDepth) UseFloatDepth();
     }

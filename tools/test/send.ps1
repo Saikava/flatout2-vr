@@ -5,6 +5,7 @@
 #   HAND:hand x y z yaw pitch [trigger [stick-x stick-y [button]]] (or HAND:hand off) = test controller (FakeHeadset)
 #   EJECT = the player's driver thrown out of the car, TRACE = log one frame of render calls
 #   MIRROR:l|r loose|off = knock the player's car's mirror loose or off
+#   FOCUS:0|1 = the test headset's session loses the input focus (as with SteamVR's dashboard over the game) or gets it back
 param([string[]]$Keys, [int]$DelayMs = 800)
 $file = "C:\GOG Games\FlatOut 2\scripts\fo2vr_input.txt"
 function Put([string]$line) { [System.IO.File]::AppendAllText($file, $line + "`n") }
@@ -18,6 +19,7 @@ foreach ($k in $Keys) {
   if ($k.StartsWith('CAMERA:')) { Put ('camera ' + $k.Substring(7)); continue }
   if ($k.StartsWith('HAND:')) { Put ('hand ' + $k.Substring(5)); continue }
   if ($k.StartsWith('MIRROR:')) { Put ('mirror ' + $k.Substring(7)); continue }
+  if ($k.StartsWith('FOCUS:')) { Put ('focus ' + $k.Substring(6)); continue }
   if ($k.StartsWith('+')) { Put ('down ' + $k.Substring(1)); continue }
   if ($k.StartsWith('-')) { Put ('up ' + $k.Substring(1)); continue }
   Put ('tap ' + $k)

@@ -55,6 +55,8 @@ XrSystemId g_system = XR_NULL_SYSTEM_ID;
 XrSession g_session = XR_NULL_HANDLE;
 XrSpace g_local = XR_NULL_HANDLE;
 bool g_running;
+XrSessionState g_sessionState = XR_SESSION_STATE_UNKNOWN;
+bool g_testUnfocused;  // [Test] FakeHeadset: the focus taken away (SetTestFocus)
 
 // DXVK's Vulkan objects.
 ID3D9VkInteropDevice* g_interop;
@@ -1358,6 +1360,7 @@ void PollEvents()
         {
             auto* e = (XrEventDataSessionStateChanged*)&ev;
             Log("xr: session state %d", (int)e->state);
+            g_sessionState = e->state;
             if (e->state == XR_SESSION_STATE_READY)
             {
                 XrSessionBeginInfo bi = { XR_TYPE_SESSION_BEGIN_INFO };
@@ -1382,6 +1385,10 @@ void PollEvents()
 }
 
 bool Running() { return g_running || g_fake; }
+
+bool Focused() { return g_fake ? !g_testUnfocused : g_sessionState == XR_SESSION_STATE_FOCUSED; }
+
+void SetTestFocus(bool focused) { g_testUnfocused = !focused; }
 
 void EyeSize(unsigned* w, unsigned* h)
 {

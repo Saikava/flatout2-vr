@@ -92,8 +92,10 @@ The game's controls are unchanged.
 
 ### VR controllers
 
-To drive with them, choose **VR controllers** in the game's Options > Controller options > Controller
-(and Force feedback On there for their vibration). Until you change them in the game's Configure controls:
+They drive as they are, beside the keyboard, with the keyboard chosen in the game's Options > Controller
+options > Controller (as it is at first). Choose **VR controllers** there to change their controls in
+Configure controls (the keyboard still drives beside them), and turn Force feedback On there for their
+vibration in crashes. Until you change them:
 
 | VR controller | In a race |
 | --- | --- |
@@ -113,6 +115,8 @@ The menu button is on the left controller, under the thumb that steers. To pause
 `PauseButton=RightStick` (the right thumbstick pressed) or `RightGrip` in `scripts\FO2VR.ini`: that button
 then pauses and continues the race, and does nothing else (with `RightStick`, move Look back to the left
 thumbstick pressed in the game's Configure controls). The game's Configure controls has no Pause of its own.
+A race also pauses when SteamVR's dashboard, the Quest's menu or Virtual Desktop's menu comes over the game
+(through SteamVR the menu button may open the dashboard instead: it then pauses all the same).
 
 Experimental, off by default (`GrabWheel=1`): steer by holding the cockpit's steering wheel. Reach for it
 as you sit (recentered), squeeze a grip at its rim and turn it with your hands; 90 degrees is full lock, as
