@@ -161,6 +161,9 @@ const char* ResultName(XrResult r)
     case XR_ERROR_API_VERSION_UNSUPPORTED: return "XR_ERROR_API_VERSION_UNSUPPORTED";
     case XR_ERROR_LIMIT_REACHED: return "XR_ERROR_LIMIT_REACHED";
     case XR_ERROR_OUT_OF_MEMORY: return "XR_ERROR_OUT_OF_MEMORY";
+    case XR_ERROR_FILE_ACCESS_ERROR: return "XR_ERROR_FILE_ACCESS_ERROR";
+    case XR_ERROR_FILE_CONTENTS_INVALID: return "XR_ERROR_FILE_CONTENTS_INVALID";
+    case XR_ERROR_API_LAYER_NOT_PRESENT: return "XR_ERROR_API_LAYER_NOT_PRESENT";
     default: return "";
     }
 }
@@ -832,6 +835,110 @@ void EndFrame(const XrCompositionLayerBaseHeader* layer, const XrCompositionLaye
     g_frameOpen = false;
 }
 
+// ---- The loader's implicit API layers ----------------------------------------------------------------------------
+// Programs register implicit API layers (in HKLM's or HKCU's Software\Khronos\OpenXR\1\ApiLayers\Implicit, the 32-bit
+// registry's for a 32-bit game) that the loader puts into every OpenXR program. When a layer's library does not load and
+// no layer loaded before it, the loader fails xrCreateInstance (XR_ERROR_FILE_ACCESS_ERROR): ReShade set up for OpenXR
+// in some game registers its 32-bit layer for all, its library refuses to load into a program ReShade is not set up
+// for (its DllMain returns FALSE), and VR did not start (issue #3). Each implicit layer names an environment variable
+// that turns it off (disable_environment, read at each xrCreateInstance): after such a failure the start is tried again
+// with them all off.
+bool g_viaLoader;  // xrCreateInstance is the loader's (LoadEntryPoints)
+
+// The process runs at a high integrity level (as administrator), as the loader tells it.
+bool HighIntegrity()
+{
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return false;
+    alignas(8) BYTE buf[64];
+    DWORD size = 0;
+    bool high = false;
+    if (GetTokenInformation(token, TokenIntegrityLevel, buf, sizeof(buf), &size))
+    {
+        PSID sid = ((TOKEN_MANDATORY_LABEL*)buf)->Label.Sid;
+        high = *GetSidSubAuthority(sid, *GetSidSubAuthorityCount(sid) - 1) >= SECURITY_MANDATORY_HIGH_RID;
+    }
+    CloseHandle(token);
+    return high;
+}
+
+// A runtime's or a layer's .json.
+std::string ReadManifest(const std::wstring& path)
+{
+    std::string text;
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f != INVALID_HANDLE_VALUE)
+    {
+        char buf[4096];
+        DWORD got = 0;
+        while (ReadFile(f, buf, sizeof(buf), &got, nullptr) && got > 0 && text.size() < 65536) text.append(buf, got);
+        CloseHandle(f);
+    }
+    return text;
+}
+
+// "key": "..." in a manifest (the first such key, with JSON's escapes).
+std::string ManifestString(const std::string& text, const char* key)
+{
+    std::string quoted = std::string("\"") + key + "\"";
+    size_t at = text.find(quoted);
+    size_t colon = at == std::string::npos ? at : text.find(':', at + quoted.size());
+    size_t open = colon == std::string::npos ? colon : text.find('"', colon + 1);
+    std::string value;
+    for (size_t i = open == std::string::npos ? text.size() : open + 1; i < text.size() && text[i] != '"'; i++)
+        value += text[i] == '\\' && i + 1 < text.size() ? text[++i] : text[i];
+    return value;
+}
+
+struct ImplicitLayer
+{
+    std::wstring manifest;
+    std::string name, disableEnv;
+};
+
+// The implicit layers the loader puts in (those turned on: 0 in the registry; HKCU's not in a process run as
+// administrator).
+std::vector<ImplicitLayer> ImplicitLayers()
+{
+    std::vector<ImplicitLayer> layers;
+    for (HKEY hive : { HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER })
+    {
+        HKEY key;
+        if (hive == HKEY_CURRENT_USER && HighIntegrity()) continue;
+        if (RegOpenKeyExW(hive, L"SOFTWARE\\Khronos\\OpenXR\\1\\ApiLayers\\Implicit", 0, KEY_QUERY_VALUE, &key) != ERROR_SUCCESS) continue;
+        for (DWORD i = 0;; i++)
+        {
+            wchar_t name[1024];
+            DWORD nameLen = 1024, type = 0, on = 1, size = sizeof(on);
+            LSTATUS s = RegEnumValueW(key, i, name, &nameLen, nullptr, &type, (BYTE*)&on, &size);
+            if (s == ERROR_NO_MORE_ITEMS) break;
+            if (s != ERROR_SUCCESS || type != REG_DWORD || on != 0) continue;
+            std::string text = ReadManifest(name);
+            layers.push_back({ name, ManifestString(text, "name"), ManifestString(text, "disable_environment") });
+        }
+        RegCloseKey(key);
+    }
+    return layers;
+}
+
+// After the loader failed to load a layer: turns the implicit layers off; false if they are off already.
+bool ImplicitLayersOff(XrResult r)
+{
+    if (!g_viaLoader || (r != XR_ERROR_FILE_ACCESS_ERROR && r != XR_ERROR_FILE_CONTENTS_INVALID && r != XR_ERROR_API_LAYER_NOT_PRESENT))
+        return false;
+    std::string off;
+    for (const ImplicitLayer& l : ImplicitLayers())
+        if (!l.disableEnv.empty() && !GetEnvironmentVariableA(l.disableEnv.c_str(), nullptr, 0))
+        {
+            SetEnvironmentVariableA(l.disableEnv.c_str(), "1");
+            off += " " + l.name;
+        }
+    if (off.empty()) return false;
+    Log("xr: xrCreateInstance failed: %d %s - the OpenXR loader could not load an API layer; tried again with the implicit "
+        "layers off:%s", (int)r, ResultName(r), off.c_str());
+    return true;
+}
+
 // ---- The runtime's start -----------------------------------------------------------------------------------------
 // xrCreateInstance and xrGetSystem run on a thread of their own. A runtime that cannot start may take half a minute to
 // say so, or never return, and the game stood still with nothing on the screen: SteamVR 2.18 does not come up when
@@ -918,6 +1025,7 @@ DWORD WINAPI RuntimeThread(void* param)
     XrSystemId system = XR_NULL_SYSTEM_ID;
     std::wstring problem;
     XrResult r = xrCreateInstance ? xrCreateInstance(&ci, &instance) : XR_ERROR_RUNTIME_UNAVAILABLE;  // (none: see LoadEntryPoints)
+    if (ImplicitLayersOff(r)) r = xrCreateInstance(&ci, &instance);
     if (XR_SUCCEEDED(r) && !LoadFunctions(instance))
     {
         Log("xr: the runtime lacks some of OpenXR's functions");
@@ -1087,43 +1195,11 @@ StartChoice AskAboutRuntime(RuntimeStart*& start)
     return button == kQuit ? StartChoice::Quit : StartChoice::WithoutVr;  // (or the window closed)
 }
 
-// The process runs at a high integrity level (as administrator), as the loader tells it.
-bool HighIntegrity()
-{
-    HANDLE token = nullptr;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return false;
-    alignas(8) BYTE buf[64];
-    DWORD size = 0;
-    bool high = false;
-    if (GetTokenInformation(token, TokenIntegrityLevel, buf, sizeof(buf), &size))
-    {
-        PSID sid = ((TOKEN_MANDATORY_LABEL*)buf)->Label.Sid;
-        high = *GetSidSubAuthority(sid, *GetSidSubAuthorityCount(sid) - 1) >= SECURITY_MANDATORY_HIGH_RID;
-    }
-    CloseHandle(token);
-    return high;
-}
-
 // The runtime's own xrGetInstanceProcAddr (see LoadEntryPoints), loaded as the loader does it: the library its .json
 // names (relative to the .json's folder), and the loader's handshake with it.
 PFN_xrGetInstanceProcAddr LoadRuntime(const std::wstring& json)
 {
-    std::string text;
-    HANDLE f = CreateFileW(json.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
-    if (f != INVALID_HANDLE_VALUE)
-    {
-        char buf[4096];
-        DWORD got = 0;
-        while (ReadFile(f, buf, sizeof(buf), &got, nullptr) && got > 0 && text.size() < 65536) text.append(buf, got);
-        CloseHandle(f);
-    }
-    // "library_path": "..." (with JSON's escapes)
-    size_t key = text.find("\"library_path\"");
-    size_t colon = key == std::string::npos ? key : text.find(':', key + 14);
-    size_t open = colon == std::string::npos ? colon : text.find('"', colon + 1);
-    std::string lib;
-    for (size_t i = open == std::string::npos ? text.size() : open + 1; i < text.size() && text[i] != '"'; i++)
-        lib += text[i] == '\\' && i + 1 < text.size() ? text[++i] : text[i];
+    std::string lib = ManifestString(ReadManifest(json), "library_path");
     if (lib.empty())
     {
         Log("xr: %ls names no runtime library", json.c_str());
@@ -1183,6 +1259,9 @@ bool LoadEntryPoints()
             return false;
         }
         xrGetInstanceProcAddr = (PFN_xrGetInstanceProcAddr)GetProcAddress(m, "xrGetInstanceProcAddr");
+        g_viaLoader = true;
+        for (const ImplicitLayer& l : ImplicitLayers())
+            Log("xr: the OpenXR loader's implicit API layer %s (%ls)", l.name.c_str(), l.manifest.c_str());
     }
     if (xrGetInstanceProcAddr) xrGetInstanceProcAddr(XR_NULL_HANDLE, "xrCreateInstance", (PFN_xrVoidFunction*)&xrCreateInstance);
     return true;

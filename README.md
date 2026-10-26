@@ -187,7 +187,9 @@ The log, `scripts\FO2VR.log`, usually says what went wrong.
   Play without VR and Quit. Start SteamVR (or connect the headset in Virtual Desktop) before the game, and
   check `Runtime=` in `scripts\FO2VR.ini`. If SteamVR hangs while it starts (its window never shows the
   headset), close it, end `vrserver.exe` in the Task Manager if it stays, and start SteamVR from Steam: when
-  Virtual Desktop's Streamer runs as administrator, the SteamVR it starts may not come up.
+  Virtual Desktop's Streamer runs as administrator, the SteamVR it starts may not come up. When another
+  program's OpenXR API layer does not load into the game (ReShade's does not, set up for OpenXR in another game), the
+  mod starts VR again without such layers; the log names them.
 - **Memory: a track does not load** (the game stands still at the loading screen; `FlatOut2_d3d9.log` ends with
   "Memory allocation failed"). FlatOut2.exe is a 32-bit program and, as released, may use only 2 GB of memory,
   which it shares with the VR runtime and the graphics driver; larger tracks can run out of it in VR. The mod
