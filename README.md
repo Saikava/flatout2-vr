@@ -111,6 +111,11 @@ vibration in crashes. Until you change them:
 In the menus (whichever controller is chosen) the thumbsticks move, A selects, B and the menu button go
 back. Index and Windows Mixed Reality controllers work with what they have of these.
 
+To drive with the keyboard, put the VR controllers down. A Quest then tracks your hands, and Virtual Desktop
+makes controllers of them (a pinch pulls the trigger), which would take the throttle and the brake from the
+keys. So the triggers and grips count from a thumbstick moved or a button pressed until the keyboard steers,
+accelerates or brakes; with Virtual Desktop's own runtime the hands are left out altogether.
+
 The menu button is on the left controller, under the thumb that steers. To pause with the right hand, set
 `PauseButton=RightStick` (the right thumbstick pressed) or `RightGrip` in `scripts\FO2VR.ini`: that button
 then pauses and continues the race, and does nothing else (with `RightStick`, move Look back to the left

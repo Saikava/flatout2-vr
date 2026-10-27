@@ -1021,6 +1021,41 @@ float AxisForSteering(float s)
 bool g_wheelHeld;
 float g_wheelHeldTurn;
 
+// The keyboard's steering, throttle or brake keys held (as a game controller's button read takes them: 0x55D760).
+bool KeyboardDriving()
+{
+    BYTE* input = *(BYTE**)fo2::kInput;
+    BYTE* keyboard = input && *(int*)(input + fo2::kInputControllers) > 0 ? ((BYTE**)(input + fo2::kInputControllerList))[0] : nullptr;
+    if (!keyboard) return false;
+    using ReadEntry = int(__thiscall*)(BYTE*, int);
+    ReadEntry read = *(ReadEntry*)(*(BYTE**)keyboard + fo2::kControllerReadEntry);
+    for (int control = 0; control < fo2::kDrivingControls; control++)
+    {
+        BYTE entry = keyboard[fo2::kControllerControls + control];
+        if (entry != 0xFF && read(keyboard, entry)) return true;
+    }
+    return false;
+}
+
+// Virtual Desktop makes Touch controllers of the hands a Quest tracks once its controllers are put down (a pinch pulls
+// the trigger, a fist squeezes the grip). xr leaves those out where the runtime tells them from the controllers (Virtual
+// Desktop's own), not through SteamVR: there, with the hands on the keyboard, their triggers took the throttle and the
+// brake from its keys (the game takes an axis off its rest over the keys). The hands make neither the thumbsticks nor
+// the buttons: the triggers and the grips count from a thumbstick moved or a button pressed until the keyboard's
+// steering, throttle or brake keys are (and not before).
+bool g_vrPadInUse;
+
+void UpdateVrPadInUse(const xr::Controller& l, const xr::Controller& r)
+{
+    bool used = std::hypot(l.stick[0], l.stick[1]) > 0.5f || std::hypot(r.stick[0], r.stick[1]) > 0.5f || l.button || l.lower ||
+                r.button || r.lower || l.thumb || r.thumb;
+    bool inUse = used || (g_vrPadInUse && !KeyboardDriving());
+    if (inUse != g_vrPadInUse)
+        Log(inUse ? "controllers: the VR controllers' triggers and grips count (a thumbstick or a button used)"
+                  : "controllers: the VR controllers' triggers and grips left out (the keyboard's steering, throttle or brake used)");
+    g_vrPadInUse = inUse;
+}
+
 // (action, controller): a control's value as the game reads it, 0 to 1 (game.h, kActionValue).
 uintptr_t g_actionValueFn = fo2::kActionValue;
 __declspec(naked) float __stdcall ActionValue(const BYTE*, const BYTE*)
@@ -1344,6 +1379,8 @@ private:
         memset(&s, 0, sizeof(s));
         for (DWORD& pov : s.rgdwPOV) pov = 0xFFFFFFFF;
         xr::Controller l = xr::Hand(0), r = xr::Hand(1);
+        UpdateVrPadInUse(l, r);
+        if (!g_vrPadInUse) l.trigger = r.trigger = l.grip = r.grip = 0;
         // The thumbsticks rest a little off the middle: a small round dead zone of their own first.
         auto stick = [](const float in[2], float out[2]) {
             float m = std::hypot(in[0], in[1]), k = m > 0.08f ? std::min((m - 0.08f) / 0.92f, 1.0f) / m : 0.0f;
@@ -1802,8 +1839,9 @@ void StickWays(const float s[2], bool ways[4])
         ways[y > 0 ? 0 : 1] = true;
 }
 
-// [VR] PauseButton held (a grip past most of the way, let go past less than half, as VrPad has them). A thumbstick's
-// press counts once held a tenth of a second without the other one's (both pressed recenter the view).
+// [VR] PauseButton held (a grip past most of the way, let go past less than half, as VrPad has them; while the VR
+// controllers are in use: g_vrPadInUse). A thumbstick's press counts once held a tenth of a second without the other
+// one's (both pressed recenter the view).
 bool PauseButtonDown(const xr::Controller& l, const xr::Controller& r, double now)
 {
     static bool grip, spoilt;
@@ -1813,8 +1851,8 @@ bool PauseButtonDown(const xr::Controller& l, const xr::Controller& r, double no
     {
     case 2: down = l.lower; break;
     case 3: down = l.button; break;
-    case 4: down = grip = grip ? l.grip > 0.4f : l.grip > 0.6f; break;
-    case 5: down = grip = grip ? r.grip > 0.4f : r.grip > 0.6f; break;
+    case 4: down = grip = g_vrPadInUse && (grip ? l.grip > 0.4f : l.grip > 0.6f); break;
+    case 5: down = grip = g_vrPadInUse && (grip ? r.grip > 0.4f : r.grip > 0.6f); break;
     case 8: down = l.thumb; break;
     case 9: down = r.thumb; break;
     }

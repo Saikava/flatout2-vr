@@ -561,6 +561,12 @@ constexpr int kActionType = 8;
 constexpr int kActionSteerLeft = 12;
 constexpr int kActionSteerRight = 13;
 constexpr uintptr_t kActionValue = 0x55EA50;
+// A controller's read of its player's controls (0 steer left, 1 steer right, 2 throttle, 3 brake, ...: the player's
+// input asks for those four, 0x46D22F): each control's entry (a byte at kControllerControls on, 0xFF none), read by the
+// controller's virtual kControllerReadEntry (thiscall, the entry: nonzero while held).
+constexpr int kControllerControls = 0x78C;
+constexpr int kControllerReadEntry = 0x2C;  // vtable offset
+constexpr int kDrivingControls = 4;
 // The player's input (0x46D22F, every frame): none while kPlayerInputOff is set (the steering put back to the middle);
 // else the steering from its controls, an axis's (kPlayerSteerKeys clear) or the keys'.
 constexpr int kPlayerInputOff = 0x378;

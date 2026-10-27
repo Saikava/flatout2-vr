@@ -125,6 +125,18 @@ XrAction g_aimAction, g_holdAction, g_triggerAction, g_gripAction, g_buttonActio
 XrPath g_handPath[2];
 XrSpace g_aimSpace[2], g_holdSpace[2];
 Controller g_hands[2], g_testHands[2];
+
+// A Quest switches to tracking the hands with its cameras when the controllers are put down, and Virtual Desktop then
+// makes Touch controllers of the hands (a pinch pulls the trigger): with the hands on the keyboard their triggers sat
+// some way off their rest most of the time and took the throttle and the brake from W and S. A hand the headset's
+// cameras track (XR_EXT_hand_tracking with XR_EXT_hand_tracking_data_source's unobstructed source only: not the hand
+// joints a runtime makes up from a controller held) has its controller left out (ReadInput).
+bool g_handExtensions;  // the runtime has both extensions (enabled at xrCreateInstance)
+PFN_xrCreateHandTrackerEXT g_createHandTracker;
+PFN_xrLocateHandJointsEXT g_locateHandJoints;
+XrHandTrackerEXT g_handTracker[2];
+bool g_handSeen[2];  // the hand is tracked by the cameras (its controller put down)
+
 // The controllers' vibration (Haptics): what each hand plays, and when it was last sent to the runtime.
 struct Vibration
 {
@@ -658,6 +670,62 @@ void PrepareDxvkExtensions()
     set(instList.c_str(), devList.c_str());
 }
 
+// The hand trackers (see g_handExtensions), when the headset tracks hands.
+void CreateHandTrackers()
+{
+    if (!g_handExtensions)
+    {
+        Log("xr: the runtime cannot tell the hands tracked by the headset's cameras from the controllers");
+        return;
+    }
+    // SteamVR (2.18.4, through Virtual Desktop) says the cameras track the hands also while the controllers are held,
+    // which left them out: Virtual Desktop's own runtime only.
+    XrInstanceProperties ip = { XR_TYPE_INSTANCE_PROPERTIES };
+    xrGetInstanceProperties(g_instance, &ip);
+    if (!strstr(ip.runtimeName, "VirtualDesktop"))
+    {
+        Log("xr: %s's hand tracking does not tell the hands from the controllers held - not used", ip.runtimeName);
+        return;
+    }
+    XrSystemHandTrackingPropertiesEXT hp = { XR_TYPE_SYSTEM_HAND_TRACKING_PROPERTIES_EXT };
+    XrSystemProperties sp = { XR_TYPE_SYSTEM_PROPERTIES, &hp };
+    xrGetInstanceProcAddr(g_instance, "xrCreateHandTrackerEXT", (PFN_xrVoidFunction*)&g_createHandTracker);
+    xrGetInstanceProcAddr(g_instance, "xrLocateHandJointsEXT", (PFN_xrVoidFunction*)&g_locateHandJoints);
+    if (!XR_SUCCEEDED(xrGetSystemProperties(g_instance, g_system, &sp)) || !hp.supportsHandTracking || !g_createHandTracker || !g_locateHandJoints)
+    {
+        Log("xr: the headset does not track hands");
+        return;
+    }
+    XrHandTrackingDataSourceEXT cameras = XR_HAND_TRACKING_DATA_SOURCE_UNOBSTRUCTED_EXT;
+    XrHandTrackingDataSourceInfoEXT ds = { XR_TYPE_HAND_TRACKING_DATA_SOURCE_INFO_EXT };
+    ds.requestedDataSourceCount = 1;
+    ds.requestedDataSources = &cameras;
+    for (int h = 0; h < 2; h++)
+    {
+        XrHandTrackerCreateInfoEXT ci = { XR_TYPE_HAND_TRACKER_CREATE_INFO_EXT, &ds };
+        ci.hand = h == 0 ? XR_HAND_LEFT_EXT : XR_HAND_RIGHT_EXT;
+        ci.handJointSet = XR_HAND_JOINT_SET_DEFAULT_EXT;
+        if (!Check(g_createHandTracker(g_session, &ci, &g_handTracker[h]), "xrCreateHandTrackerEXT")) g_handTracker[h] = XR_NULL_HANDLE;
+    }
+    if (g_handTracker[0] && g_handTracker[1]) Log("xr: hands tracked by the headset's cameras are told from the controllers");
+}
+
+// Whether the headset's cameras track the hand at the open frame's display time (its controller put down).
+bool HandSeen(int h)
+{
+    if (!g_handTracker[h]) return false;
+    XrHandJointLocationEXT joints[XR_HAND_JOINT_COUNT_EXT];
+    XrHandTrackingDataSourceStateEXT source = { XR_TYPE_HAND_TRACKING_DATA_SOURCE_STATE_EXT };
+    XrHandJointLocationsEXT locations = { XR_TYPE_HAND_JOINT_LOCATIONS_EXT, &source };
+    locations.jointCount = XR_HAND_JOINT_COUNT_EXT;
+    locations.jointLocations = joints;
+    XrHandJointsLocateInfoEXT li = { XR_TYPE_HAND_JOINTS_LOCATE_INFO_EXT };
+    li.baseSpace = g_local;
+    li.time = g_frameState.predictedDisplayTime;
+    return XR_SUCCEEDED(g_locateHandJoints(g_handTracker[h], &li, &locations)) && locations.isActive && source.isActive &&
+           source.dataSource == XR_HAND_TRACKING_DATA_SOURCE_UNOBSTRUCTED_EXT;
+}
+
 // The controllers: one action set with the aim pose, the trigger, the grip, B/Y, A/X, the menu button, the thumbstick
 // and its click of either hand, and their vibration, bound for the Touch controllers (Virtual Desktop gives the game
 // other headsets' controllers as these too), the Index and Windows Mixed Reality controllers (what they have of it) and
@@ -762,6 +830,7 @@ void CreateInput()
     ai.countActionSets = 1;
     ai.actionSets = &g_actionSet;
     if (Check(xrAttachSessionActionSets(g_session, &ai), "xrAttachSessionActionSets")) Log("xr: controller actions ready");
+    CreateHandTrackers();
 }
 
 // The controllers at the open frame's display time.
@@ -811,6 +880,14 @@ void ReadInput()
             XrActionStateVector2f v = { XR_TYPE_ACTION_STATE_VECTOR2F };
             gi.action = g_stickAction;
             if (XR_SUCCEEDED(xrGetActionStateVector2f(g_session, &gi, &v)) && v.isActive) c.stick[0] = v.currentState.x, c.stick[1] = v.currentState.y;
+            bool seen = HandSeen(h);
+            if (seen != g_handSeen[h])
+            {
+                g_handSeen[h] = seen;
+                Log(seen ? "xr: the %s controller is put down, the headset tracks the hand - its controller is left out"
+                         : "xr: the %s controller is back", h == 0 ? "left" : "right");
+            }
+            if (seen) c = Controller();
         }
         g_hands[h] = c;
     }
@@ -1013,14 +1090,29 @@ std::wstring ResultText(XrResult r)
 DWORD WINAPI RuntimeThread(void* param)
 {
     RuntimeStart* s = (RuntimeStart*)param;
-    const char* exts[] = { XR_KHR_VULKAN_ENABLE_EXTENSION_NAME };
+    std::vector<const char*> exts = { XR_KHR_VULKAN_ENABLE_EXTENSION_NAME };
+    // The hands told from the controllers (see g_handExtensions), when the runtime can.
+    PFN_xrEnumerateInstanceExtensionProperties enumerate = nullptr;
+    if (xrGetInstanceProcAddr) xrGetInstanceProcAddr(XR_NULL_HANDLE, "xrEnumerateInstanceExtensionProperties", (PFN_xrVoidFunction*)&enumerate);
+    uint32_t count = 0;
+    std::vector<XrExtensionProperties> have;
+    if (enumerate && XR_SUCCEEDED(enumerate(nullptr, 0, &count, nullptr)))
+    {
+        have.resize(count, { XR_TYPE_EXTENSION_PROPERTIES });
+        if (!XR_SUCCEEDED(enumerate(nullptr, count, &count, have.data()))) have.clear();
+    }
+    auto has = [&](const char* name) {
+        return std::any_of(have.begin(), have.end(), [&](const XrExtensionProperties& e) { return strcmp(e.extensionName, name) == 0; });
+    };
+    g_handExtensions = has(XR_EXT_HAND_TRACKING_EXTENSION_NAME) && has(XR_EXT_HAND_TRACKING_DATA_SOURCE_EXTENSION_NAME);
+    if (g_handExtensions) exts.insert(exts.end(), { XR_EXT_HAND_TRACKING_EXTENSION_NAME, XR_EXT_HAND_TRACKING_DATA_SOURCE_EXTENSION_NAME });
     XrInstanceCreateInfo ci = { XR_TYPE_INSTANCE_CREATE_INFO };
     strcpy(ci.applicationInfo.applicationName, "FlatOut 2 VR");
     ci.applicationInfo.applicationVersion = 1;
     strcpy(ci.applicationInfo.engineName, "FO2VR");
     ci.applicationInfo.apiVersion = XR_API_VERSION_1_0;
-    ci.enabledExtensionCount = 1;
-    ci.enabledExtensionNames = exts;
+    ci.enabledExtensionCount = (uint32_t)exts.size();
+    ci.enabledExtensionNames = exts.data();
     XrInstance instance = XR_NULL_HANDLE;
     XrSystemId system = XR_NULL_SYSTEM_ID;
     std::wstring problem;
