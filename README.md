@@ -1,5 +1,9 @@
 # FlatOut 2 VR
 
+[![FlatOut 2 in VR from the driver's seat: the gauges, position and lap on the dashboard, a wreck by the road ahead](docs/img/cockpit.jpg)](https://www.youtube.com/watch?v=8zOytwA1jQg)
+
+▶ [Watch the trailer on YouTube](https://www.youtube.com/watch?v=8zOytwA1jQg)
+
 **Play FlatOut 2 in VR.** A free mod for the PC game: the races in true stereo 3D with head tracking,
 smooth at your headset's refresh rate, with the HUD on a panel in front of you. You drive with the game's
 own controls (gamepad, wheel or keyboard) or with your VR controllers. Works with the GOG and the Steam
