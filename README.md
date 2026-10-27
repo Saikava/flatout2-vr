@@ -1,6 +1,6 @@
 # FlatOut 2 VR
 
-[![FlatOut 2 in VR from the driver's seat: the hands on the steering wheel, the side mirror and the glass flying in a crash](docs/img/cockpit.jpg)](https://www.youtube.com/watch?v=8zOytwA1jQg)
+[![FlatOut 2 in VR from the driver's seat: the hands on the steering wheel, the side mirror and the glass flying in a crash](docs/img/cockpit-crash.jpg)](https://www.youtube.com/watch?v=8zOytwA1jQg)
 
 ▶ [Watch the trailer on YouTube](https://www.youtube.com/watch?v=8zOytwA1jQg)
 
