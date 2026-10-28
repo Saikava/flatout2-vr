@@ -1550,9 +1550,15 @@ constexpr float kDriverEye[3] = { 0.0f, 0.60f, -0.01f };
 
 // The eyes from the driver's place in the car's axes, worked out once a car from its driver's head as the
 // driving animation poses it (the male and the female drivers are made differently), and then kept: the
-// head nods with the animation, the eyes stay put.
+// head nods with the animation, the eyes stay put. The cockpit's cards and mirrors are laid out once the car
+// has them. A head not found posed for kEyeWait while the driver sits in the car leaves the car kDriverEye
+// instead, so that they do not wait for it all the race (issue #4: a race after the main menu logged no eyes,
+// and kept the game's HUD and dark mirrors to its end).
 BYTE* g_eyeCar;
 float g_eyeFromSeat[3];
+BYTE* g_eyeTryCar;
+double g_eyeTrySince;
+constexpr double kEyeWait = 1.0;  // seconds
 
 bool HeadEyeFromSeat(BYTE* car, float* out)
 {
@@ -1572,10 +1578,30 @@ bool HeadEyeFromSeat(BYTE* car, float* out)
 
 void DriverEyeFromSeat(BYTE* car, float* out)
 {
-    if (car != g_eyeCar && HeadEyeFromSeat(car, g_eyeFromSeat))
+    float eye[3] = {};
+    if (car != g_eyeCar && HeadEyeFromSeat(car, eye))
     {
         g_eyeCar = car;
+        memcpy(g_eyeFromSeat, eye, sizeof(eye));
         Log("cockpit: the eyes %.3f %.3f %.3f from the driver's place", g_eyeFromSeat[0], g_eyeFromSeat[1], g_eyeFromSeat[2]);
+    }
+    else if (car != g_eyeCar)
+    {
+        double now = NowSeconds();
+        // (a driver thrown out is not posed: the wait starts as he is back in)
+        if (car != g_eyeTryCar || *(const int*)(car + fo2::kCarRagdoll + fo2::kRagdollOut)) g_eyeTryCar = car, g_eyeTrySince = now;
+        if (now - g_eyeTrySince > kEyeWait)
+        {
+            g_eyeCar = car;
+            memcpy(g_eyeFromSeat, kDriverEye, sizeof(kDriverEye));
+            if (*(BYTE**)(car + fo2::kCarRagdoll + fo2::kRagdollSegments))
+                Log("cockpit: the driver's head not posed in %.1f s (it gives the eyes %.3f %.3f %.3f from the driver's place) - the eyes "
+                    "put at %.3f %.3f %.3f",
+                    kEyeWait, eye[0], eye[1], eye[2], kDriverEye[0], kDriverEye[1], kDriverEye[2]);
+            else
+                Log("cockpit: the driver has no head in %.1f s (his ragdoll's segments) - the eyes put at %.3f %.3f %.3f from the driver's place",
+                    kEyeWait, kDriverEye[0], kDriverEye[1], kDriverEye[2]);
+        }
     }
     memcpy(out, car == g_eyeCar ? g_eyeFromSeat : kDriverEye, sizeof(g_eyeFromSeat));
 }
@@ -2279,6 +2305,8 @@ void NoteFocus(IDirect3DDevice9* dev)
         name ? name + 1 : exe);
 }
 
+void ForgetRaceState();
+
 int __fastcall EnginePresentHook(void* self, void*)
 {
     IDirect3DDevice9* dev = *(IDirect3DDevice9**)fo2::kD3DDevice;
@@ -2289,6 +2317,7 @@ int __fastcall EnginePresentHook(void* self, void*)
         Log("device %p vtable now %p", (void*)dev, g_loggedVtbl);
     }
     rec::MenuTick();
+    if (!InRace()) ForgetRaceState();
     if (xr::Available()) NoteFocus(dev);
     if (g_renderViewsEnd > 0)
     {
@@ -3146,8 +3175,12 @@ IDirect3DSurface9* CurrentTarget(IDirect3DDevice9* dev)
 // A draw of the HUD's other than its sprites' (vertices from v, `stride` apart; null: from stream 0), the
 // vertices from `first`: the instrument whose place it lies in, when that one is shown in the car; else -1.
 // These (the map's disc, a model) have their positions in the screen's pixels first in the vertex: their
-// box is read once for each place in the game's code that draws them (reading the vertices back costs a
-// wait for the GPU).
+// box is read once a race for each place in the game's code that draws them (reading the vertices back costs
+// a wait for the GPU). A derby's arena map and a race's map are drawn by the same code with as many vertices,
+// on canvases of their own: a race after a derby, with the derby's box, kept its map on the panel.
+struct { unsigned key; ScreenBox box; } g_hudDrawBoxes[16];
+int g_hudDrawBoxCount;
+
 int HudCardOf(IDirect3DDevice9* dev, const void* v, UINT stride, UINT first, UINT count)
 {
     if (!g_hud.active || count == 0 || !HudCardsRouted() || CurrentTarget(dev) != g_hud.rt) return -1;
@@ -3157,8 +3190,8 @@ int HudCardOf(IDirect3DDevice9* dev, const void* v, UINT stride, UINT first, UIN
     unsigned ret[3];
     prof::GameCallers(_AddressOfReturnAddress(), ret);
     unsigned key = ret[0] ^ (ret[1] * 3u) ^ (ret[2] * 7u) ^ (count * 13u);
-    static struct { unsigned key; ScreenBox box; } known[16];
-    static int knownCount;
+    auto& known = g_hudDrawBoxes;
+    int& knownCount = g_hudDrawBoxCount;
     int n = 0;
     while (n < knownCount && known[n].key != key) n++;
     ScreenBox box;
@@ -6207,6 +6240,17 @@ bool RenderVrEyes(IDirect3DDevice9* dev, BYTE* ctx, BYTE** cams, float* fovScale
     return true;
 }
 
+// The cockpit's eyes and instruments are worked out once a car, and the HUD's draws placed once a race:
+// forgotten in every frame outside a race (EnginePresentHook; the game renders no views in its menus), so
+// the next race has them anew, its car where the last one's was too (issue #4: that one's cards and
+// mirrors), its HUD a race's after a derby's (the derby's map was left on the panel).
+void ForgetRaceState()
+{
+    g_eyeCar = g_eyeTryCar = g_dash.car = g_cabin.car = g_mirrors.car = nullptr;
+    g_hudDrawBoxCount = 0;
+    g_steady.valid = false;  // (the monitor's steady view starts anew)
+}
+
 void __stdcall RenderViewsHook(BYTE* ctx, BYTE** cams, float* fovScale)
 {
     IDirect3DDevice9* dev = *(IDirect3DDevice9**)fo2::kD3DDevice;
@@ -6216,14 +6260,6 @@ void __stdcall RenderViewsHook(BYTE* ctx, BYTE** cams, float* fovScale)
     bool race = InRace();
     int views = *(int*)(ctx + fo2::kCtxViewCount);
     BYTE* cam = views == 1 && cams ? cams[0] : nullptr;
-    // The cockpit's eyes and instruments are worked out once a car, and the next race may have its car
-    // where the last one's was.
-    if (!race)
-    {
-        g_eyeCar = g_dash.car = g_cabin.car = g_mirrors.car = nullptr;
-        g_steady.valid = false;  // (the monitor's steady view starts anew)
-    }
-
     if (dev && g_screenW == 0)
     {
         IDirect3DSurface9* bb = nullptr;
