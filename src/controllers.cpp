@@ -43,7 +43,8 @@
 // - adds "VR controllers" to the list (VrPad): the VR controllers read as a gamepad, with force feedback played as their
 //   vibration; with the keyboard chosen, the race's player drives with them too (ShareVrPadWithKeyboard);
 // - in VR opens the game controllers for use without the window in front (the window on the monitor is not what the
-//   player looks at: started from the headset, it may never have had the focus, and the controller did nothing);
+//   player looks at: started from the headset, it may never have had the focus, and the controller did nothing), and
+//   when that fails, as the game opens them, then shared without force feedback (PadProxy::Acquire);
 // - gives an Xbox controller force feedback (PadProxy): DirectInput has none for them, only XInput can make them
 //   vibrate.
 // The VR controllers and Xbox controllers also press the keys of the menus and the race's pause (ControllersMenuKeys).
@@ -681,7 +682,27 @@ public:
         }
         return m_inner->SetProperty(prop, h);
     }
-    STDMETHOD(Acquire)() override { return m_inner->Acquire(); }
+    STDMETHOD(Acquire)() override
+    {
+        HRESULT hr = m_inner->Acquire();
+        // Opened for use in the background (SetCooperativeLevel), the controller may not be had so (another program
+        // holding it to itself in the background): it is then taken as the game takes it, while its window is in front
+        // (as without VR), and failing that shared, in the background but without force feedback (which needs the
+        // controller to itself).
+        while (FAILED(hr) && hr != DIERR_UNPLUGGED && hr != DIERR_INPUTLOST && (m_level == kBackground || m_level == kInFront))
+        {
+            bool front = m_level == kBackground && GetForegroundWindow() == m_window;
+            m_level = front ? kInFront : kShared;
+            DWORD flags = front ? m_flags : (m_flags & ~(DWORD)(DISCL_EXCLUSIVE | DISCL_FOREGROUND)) | DISCL_NONEXCLUSIVE | DISCL_BACKGROUND;
+            HRESULT failed = hr, set = m_inner->SetCooperativeLevel(m_window, flags);
+            hr = SUCCEEDED(set) ? m_inner->Acquire() : set;
+            Log("controllers: \"%s\" not acquired (%08X) - %s: %08X", m_name.c_str(), (unsigned)failed,
+                front ? "taken as the game takes it, while its window is in front" : "shared, in the background, without force feedback",
+                (unsigned)hr);
+        }
+        Note("acquired", hr);
+        return hr;
+    }
     STDMETHOD(Unacquire)() override
     {
         if (m_ff) Vibrate({});
@@ -690,7 +711,21 @@ public:
     STDMETHOD(GetDeviceState)(DWORD size, LPVOID data) override
     {
         Update();
-        return m_inner->GetDeviceState(size, data);
+        HRESULT hr = m_inner->GetDeviceState(size, data);
+        if (FAILED(hr))
+            Note("read", hr);
+        else if (!m_moved && data)
+        {
+            // (its first state kept, to log when it first changes: a controller read but never moving reads nothing)
+            if (m_first.size() != size)
+                m_first.assign((const BYTE*)data, (const BYTE*)data + size);
+            else if (memcmp(m_first.data(), data, size) != 0)
+            {
+                m_moved = true;
+                Log("controllers: \"%s\" read: its first input", m_name.c_str());
+            }
+        }
+        return hr;
     }
     STDMETHOD(GetDeviceData)(DWORD size, LPDIDEVICEOBJECTDATA data, LPDWORD inOut, DWORD flags) override
     {
@@ -701,12 +736,17 @@ public:
     STDMETHOD(SetCooperativeLevel)(HWND window, DWORD flags) override
     {
         // In VR (and in background mode) the controller is the game's whether or not its window is in front.
+        m_window = window, m_flags = flags, m_level = kAsked;
         if ((InVr() || BackgroundMode()) && (flags & DISCL_FOREGROUND))
         {
             DWORD background = (flags & ~(DWORD)DISCL_FOREGROUND) | DISCL_BACKGROUND;
             HRESULT hr = m_inner->SetCooperativeLevel(window, background);
             Log("controllers: \"%s\" read with the game's window in the background too: %08X", m_name.c_str(), (unsigned)hr);
-            if (SUCCEEDED(hr)) return hr;
+            if (SUCCEEDED(hr))
+            {
+                m_level = kBackground;
+                return hr;
+            }
         }
         return m_inner->SetCooperativeLevel(window, flags);
     }
@@ -734,7 +774,20 @@ public:
     STDMETHOD(GetForceFeedbackState)(LPDWORD out) override { return m_ff ? m_ff->GetState(out) : m_inner->GetForceFeedbackState(out); }
     STDMETHOD(SendForceFeedbackCommand)(DWORD flags) override
     {
-        return m_ff ? m_ff->Command(flags) : m_inner->SendForceFeedbackCommand(flags);
+        if (m_ff) return m_ff->Command(flags);
+        HRESULT hr = m_inner->SendForceFeedbackCommand(flags);
+        m_ffRetry = 0;
+        // The game reads a controller only once its actuators are switched on (or off, with Force feedback off in its
+        // options; 0x5616D5), trying again every frame: had other than as the game asked (see Acquire), a controller
+        // whose force feedback fails is still read, and the command is tried again once a second (RetryForceFeedback).
+        if (FAILED(hr) && m_level != kAsked)
+        {
+            Note("given force feedback commands - read without", hr);
+            m_ffRetry = flags;
+            m_ffRetryAt = NowSeconds() + 1.0;
+            return DI_OK;
+        }
+        return hr;
     }
     STDMETHOD(EnumCreatedEffectObjects)(LPDIENUMCREATEDEFFECTOBJECTSCALLBACK cb, LPVOID ref, DWORD flags) override
     {
@@ -744,7 +797,9 @@ public:
     STDMETHOD(Poll)() override
     {
         Update();
-        return m_inner->Poll();
+        HRESULT hr = m_inner->Poll();
+        if (m_ffRetry && SUCCEEDED(hr)) RetryForceFeedback();
+        return hr;
     }
     STDMETHOD(SendDeviceData)(DWORD size, LPCDIDEVICEOBJECTDATA data, LPDWORD inOut, DWORD flags) override
     {
@@ -781,6 +836,35 @@ private:
     {
         if (m_ff) Vibrate(m_ff->Output(NowSeconds()));
     }
+
+    // A force feedback command that failed (SendForceFeedbackCommand), tried again once a second until it is carried
+    // out or the game gives another.
+    void RetryForceFeedback()
+    {
+        double now = NowSeconds();
+        if (now < m_ffRetryAt) return;
+        m_ffRetryAt = now + 1.0;
+        if (FAILED(m_inner->SendForceFeedbackCommand(m_ffRetry))) return;
+        Log("controllers: \"%s\" given its force feedback command (%X) after all", m_name.c_str(), (unsigned)m_ffRetry);
+        m_ffRetry = 0;
+    }
+
+    // Logged once each: the controller acquired, and each way its acquiring and reading failed (the game tries every
+    // frame; a player's log then tells why a controller did nothing).
+    void Note(const char* what, HRESULT hr)
+    {
+        HRESULT key = SUCCEEDED(hr) ? S_OK : hr;
+        for (const auto& n : m_noted)
+            if (strcmp(n.first, what) == 0 && n.second == key) return;
+        m_noted.push_back({ what, key });
+        if (SUCCEEDED(hr))
+            Log("controllers: \"%s\" %s%s", m_name.c_str(), what,
+                m_level == kBackground ? " (for the game's use in the background)" : m_level == kInFront ? " (while the game's window is in front)"
+                : m_level == kShared                                             ? " (shared, without force feedback)"
+                                                                                 : "");
+        else
+            Log("controllers: \"%s\" not %s: %08X", m_name.c_str(), what, (unsigned)hr);
+    }
     void Vibrate(Motors m)
     {
         int user = XInputUser(m_xinput);
@@ -809,6 +893,16 @@ private:
     int m_user = -1;                // the XInput user last sent to
     XINPUT_VIBRATION m_sent = {};
     double m_sentAt = -10;
+    // How the controller is had (SetCooperativeLevel, Acquire): as the game asked, for its use in the background, as the
+    // game asked after all (while its window is in front), or shared in the background.
+    enum Level { kAsked, kBackground, kInFront, kShared } m_level = kAsked;
+    HWND m_window = nullptr;
+    DWORD m_flags = 0;  // the game's
+    std::vector<std::pair<const char*, HRESULT>> m_noted;
+    std::vector<BYTE> m_first;
+    bool m_moved = false;
+    DWORD m_ffRetry = 0;  // a force feedback command to try again (0: none)
+    double m_ffRetryAt = 0;
 };
 
 // ---- the VR controllers as a gamepad ------------------------------------------------------------------------------
