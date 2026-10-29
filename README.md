@@ -149,9 +149,9 @@ in `scripts\FO2VR.ini` to your wheel's range from lock to lock, in degrees, as s
 most), and the cockpit's wheel turns as yours, as far and as fast, up to its lock at 90 degrees either way,
 where the driver's hands stop (the game has no animation past that).
 
-In VR the mod opens a wheel (any game controller) for the game's use while its window is not in front. Should
-that fail (another program holding the wheel so), the wheel is opened as the game opens it, working while the
-game's window has the focus, or else shared, without force feedback; `scripts\FO2VR.log` says which.
+In VR a wheel with force feedback is the game's as without VR while the game's window (on the monitor) has the
+focus, and shared, still steering but without force feedback, while it has not; other game controllers are read
+whether or not it has. `scripts\FO2VR.log` says how each was opened.
 
 ## Settings
 

@@ -42,9 +42,9 @@
 // controllers), which
 // - adds "VR controllers" to the list (VrPad): the VR controllers read as a gamepad, with force feedback played as their
 //   vibration; with the keyboard chosen, the race's player drives with them too (ShareVrPadWithKeyboard);
-// - in VR opens the game controllers for use without the window in front (the window on the monitor is not what the
-//   player looks at: started from the headset, it may never have had the focus, and the controller did nothing), and
-//   when that fails, as the game opens them, then shared without force feedback (PadProxy::Acquire);
+// - in VR reads the game controllers without the window in front too (the window on the monitor is not what the
+//   player looks at: started from the headset, it may never have had the focus, and the controller did nothing): shared,
+//   or one with force feedback of its own as the game takes it while the window is in front (PadProxy::SetCooperativeLevel);
 // - gives an Xbox controller force feedback (PadProxy): DirectInput has none for them, only XInput can make them
 //   vibrate.
 // The VR controllers and Xbox controllers also press the keys of the menus and the race's pause (ControllersMenuKeys).
@@ -572,8 +572,8 @@ bool InVr() { return xr::Available(); }
 uintptr_t Prop(REFGUID g) { return (uintptr_t)&g; }
 
 // ---- the game's game controllers -------------------------------------------------------------------------------
-// A game controller as DirectInput gives it, passed through, but opened for use in the background in VR, and with
-// force feedback made of XInput's vibration for an Xbox controller.
+// A game controller as DirectInput gives it, passed through, but read with the game's window in the background too in
+// VR (see SetCooperativeLevel), and with force feedback made of XInput's vibration for an Xbox controller.
 class PadProxy : public IDirectInputDevice8A
 {
 public:
@@ -582,7 +582,7 @@ public:
         DIDEVICEINSTANCEA di = { sizeof(di) };
         if (SUCCEEDED(inner->GetDeviceInfo(&di))) m_name = di.tszProductName;
         DIDEVCAPS caps = { sizeof(caps) };
-        bool ff = SUCCEEDED(inner->GetCapabilities(&caps)) && (caps.dwFlags & DIDC_FORCEFEEDBACK);
+        bool ff = m_ownFf = SUCCEEDED(inner->GetCapabilities(&caps)) && (caps.dwFlags & DIDC_FORCEFEEDBACK);
         if (!ff && g_cfg.vrRumble > 0 && IsXInputController(inner) && LoadXInput())
         {
             static int xinputPads;
@@ -685,20 +685,14 @@ public:
     STDMETHOD(Acquire)() override
     {
         HRESULT hr = m_inner->Acquire();
-        // Opened for use in the background (SetCooperativeLevel), the controller may not be had so (another program
-        // holding it to itself in the background): it is then taken as the game takes it, while its window is in front
-        // (as without VR), and failing that shared, in the background but without force feedback (which needs the
-        // controller to itself).
-        while (FAILED(hr) && hr != DIERR_UNPLUGGED && hr != DIERR_INPUTLOST && (m_level == kBackground || m_level == kInFront))
+        // A controller with force feedback of its own, taken as the game takes it (SetCooperativeLevel), is not had while
+        // the game's window is not in front: it is then shared until the window is (TakeInFront).
+        if (FAILED(hr) && hr != DIERR_UNPLUGGED && hr != DIERR_INPUTLOST && m_level == kInFront)
         {
-            bool front = m_level == kBackground && GetForegroundWindow() == m_window;
-            m_level = front ? kInFront : kShared;
-            DWORD flags = front ? m_flags : (m_flags & ~(DWORD)(DISCL_EXCLUSIVE | DISCL_FOREGROUND)) | DISCL_NONEXCLUSIVE | DISCL_BACKGROUND;
-            HRESULT failed = hr, set = m_inner->SetCooperativeLevel(m_window, flags);
-            hr = SUCCEEDED(set) ? m_inner->Acquire() : set;
-            Log("controllers: \"%s\" not acquired (%08X) - %s: %08X", m_name.c_str(), (unsigned)failed,
-                front ? "taken as the game takes it, while its window is in front" : "shared, in the background, without force feedback",
-                (unsigned)hr);
+            HRESULT failed = hr;
+            hr = Share();
+            Log("controllers: \"%s\" not acquired (%08X) - shared while the game's window is not in front, without force feedback: %08X",
+                m_name.c_str(), (unsigned)failed, (unsigned)hr);
         }
         Note("acquired", hr);
         return hr;
@@ -735,17 +729,31 @@ public:
     STDMETHOD(SetEventNotification)(HANDLE e) override { return m_inner->SetEventNotification(e); }
     STDMETHOD(SetCooperativeLevel)(HWND window, DWORD flags) override
     {
-        // In VR (and in background mode) the controller is the game's whether or not its window is in front.
+        // In VR (and in background mode) the controller is read whether or not the game's window is in front: shared
+        // (DISCL_NONEXCLUSIVE | DISCL_BACKGROUND), which another's hold on it does not stop. Only force feedback needs
+        // the controller to itself: one with force feedback of its own is taken as the game takes it (to itself, while
+        // its window is in front) and shared while the window is not. Not for itself in the background: the Steam
+        // release's fo2_zoom.dll keeps every game controller open through SDL, whose DirectInput holds it so, and the two
+        // took it from each other: the game acquired a wheel again every frame and never read it (a player's SideWinder
+        // Force Feedback Wheel, its force feedback commands failing with DIERR_NOTEXCLUSIVEACQUIRED).
         m_window = window, m_flags = flags, m_level = kAsked;
         if ((InVr() || BackgroundMode()) && (flags & DISCL_FOREGROUND))
         {
-            DWORD background = (flags & ~(DWORD)DISCL_FOREGROUND) | DISCL_BACKGROUND;
-            HRESULT hr = m_inner->SetCooperativeLevel(window, background);
-            Log("controllers: \"%s\" read with the game's window in the background too: %08X", m_name.c_str(), (unsigned)hr);
-            if (SUCCEEDED(hr))
+            if (m_ownFf)
             {
-                m_level = kBackground;
-                return hr;
+                m_level = kInFront;
+                Log("controllers: \"%s\" taken as the game takes it while its window is in front, shared without force feedback while not",
+                    m_name.c_str());
+            }
+            else
+            {
+                HRESULT hr = m_inner->SetCooperativeLevel(window, SharedFlags());
+                Log("controllers: \"%s\" read with the game's window in the background too (shared): %08X", m_name.c_str(), (unsigned)hr);
+                if (SUCCEEDED(hr))
+                {
+                    m_level = kShared;
+                    return hr;
+                }
             }
         }
         return m_inner->SetCooperativeLevel(window, flags);
@@ -778,8 +786,8 @@ public:
         HRESULT hr = m_inner->SendForceFeedbackCommand(flags);
         m_ffRetry = 0;
         // The game reads a controller only once its actuators are switched on (or off, with Force feedback off in its
-        // options; 0x5616D5), trying again every frame: had other than as the game asked (see Acquire), a controller
-        // whose force feedback fails is still read, and the command is tried again once a second (RetryForceFeedback).
+        // options; 0x5616D5), trying again every frame: in VR (see SetCooperativeLevel) a controller whose force feedback
+        // fails is still read, and the command is tried again once a second (RetryForceFeedback).
         if (FAILED(hr) && m_level != kAsked)
         {
             Note("given force feedback commands - read without", hr);
@@ -797,7 +805,9 @@ public:
     STDMETHOD(Poll)() override
     {
         Update();
+        if (m_level == kShared && m_ownFf) TakeInFront();
         HRESULT hr = m_inner->Poll();
+        if (FAILED(hr)) Note("polled", hr);
         if (m_ffRetry && SUCCEEDED(hr)) RetryForceFeedback();
         return hr;
     }
@@ -837,6 +847,36 @@ private:
         if (m_ff) Vibrate(m_ff->Output(NowSeconds()));
     }
 
+    DWORD SharedFlags() const { return (m_flags & ~(DWORD)(DISCL_EXCLUSIVE | DISCL_FOREGROUND)) | DISCL_NONEXCLUSIVE | DISCL_BACKGROUND; }
+
+    // The controller shared (see SetCooperativeLevel), acquired.
+    HRESULT Share()
+    {
+        m_level = kShared;
+        HRESULT hr = m_inner->SetCooperativeLevel(m_window, SharedFlags());
+        return SUCCEEDED(hr) ? m_inner->Acquire() : hr;
+    }
+
+    // A controller with force feedback of its own, shared while the game's window was not in front, is taken as the game
+    // takes it again once the window is (tried at most once a second); its force feedback comes back with the commands
+    // tried again (RetryForceFeedback).
+    void TakeInFront()
+    {
+        double now = NowSeconds();
+        if (now < m_nextTake || GetForegroundWindow() != m_window) return;
+        m_nextTake = now + 1.0;
+        m_inner->Unacquire();
+        HRESULT set = m_inner->SetCooperativeLevel(m_window, m_flags), hr = SUCCEEDED(set) ? m_inner->Acquire() : set;
+        if (SUCCEEDED(hr))
+        {
+            m_level = kInFront;
+            Log("controllers: \"%s\" taken as the game takes it, its window in front", m_name.c_str());
+            return;
+        }
+        Note("taken with its window in front", hr);
+        Share();
+    }
+
     // A force feedback command that failed (SendForceFeedbackCommand), tried again once a second until it is carried
     // out or the game gives another.
     void RetryForceFeedback()
@@ -859,9 +899,7 @@ private:
         m_noted.push_back({ what, key });
         if (SUCCEEDED(hr))
             Log("controllers: \"%s\" %s%s", m_name.c_str(), what,
-                m_level == kBackground ? " (for the game's use in the background)" : m_level == kInFront ? " (while the game's window is in front)"
-                : m_level == kShared                                             ? " (shared, without force feedback)"
-                                                                                 : "");
+                m_level == kInFront ? " (as the game takes it)" : m_level == kShared ? " (shared)" : "");
         else
             Log("controllers: \"%s\" not %s: %08X", m_name.c_str(), what, (unsigned)hr);
     }
@@ -893,11 +931,13 @@ private:
     int m_user = -1;                // the XInput user last sent to
     XINPUT_VIBRATION m_sent = {};
     double m_sentAt = -10;
-    // How the controller is had (SetCooperativeLevel, Acquire): as the game asked, for its use in the background, as the
-    // game asked after all (while its window is in front), or shared in the background.
-    enum Level { kAsked, kBackground, kInFront, kShared } m_level = kAsked;
+    // How the controller is had (SetCooperativeLevel, Acquire): as the game asked (without VR), as the game asked while
+    // its window is in front (one with force feedback of its own, in VR), or shared in the background.
+    enum Level { kAsked, kInFront, kShared } m_level = kAsked;
+    bool m_ownFf = false;  // force feedback of its own (DIDC_FORCEFEEDBACK)
     HWND m_window = nullptr;
     DWORD m_flags = 0;  // the game's
+    double m_nextTake = 0;  // when TakeInFront may try again
     std::vector<std::pair<const char*, HRESULT>> m_noted;
     std::vector<BYTE> m_first;
     bool m_moved = false;
