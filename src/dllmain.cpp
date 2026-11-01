@@ -1,14 +1,18 @@
 #include "background.h"
 #include "controllers.h"
 #include "d3dcreate.h"
+#include "game.h"
 #include "largeaddress.h"
 #include "pacing.h"
 #include "record.h"
 #include "render.h"
 #include "sound.h"
 #include "util.h"
+#include "xr.h"
 
 #include <windows.h>
+
+#include <cstdio>
 
 // "FlatOut2.exe setup" (or -setup, the launchers' Settings): WinMain compares its whole command line
 // with these two, case aside (0x520EFC), and then only shows the settings dialog (render device,
@@ -29,6 +33,37 @@ static bool SettingsDialog()
         while (*p > L' ') p++;
     while (*p && *p <= L' ') p++;
     return _wcsicmp(p, L"setup") == 0 || _wcsicmp(p, L"-setup") == 0;
+}
+
+// The game's exit (game.h, kIatExitProcess). Through Virtual Desktop the game crashed in VirtualDesktop.LibOVRRT32_1.dll
+// as it exited (0xC0000409; the system's log had it at nearly every exit from VR), and once it hung in the OpenXR
+// loader's teardown instead (freeing memory in a loop: one core busy, no window, until the process was ended by hand):
+// the VR session was still open, and the runtime's and the loader's DLLs took it down as Windows unloaded them, in
+// whatever order. The mod ends the session and the instance itself first (xr::Shutdown), while all the threads still
+// run, then the process, without the DLLs' unloading (the game's own shutdown is done by then; the mod's files are
+// flushed). Without VR the game exits as it always did.
+using ExitProcessFn = void(WINAPI*)(UINT);
+static ExitProcessFn g_exitProcess;
+
+static void WINAPI ExitProcessHook(UINT code)
+{
+    Log("the game exits (code %u)", code);
+    if (xr::Shutdown())
+    {
+        Log("the process ends without unloading its DLLs");
+        _flushall();
+        TerminateProcess(GetCurrentProcess(), code);
+    }
+    g_exitProcess(code);
+}
+
+static void InstallExitHook()
+{
+    ExitProcessFn current = *(ExitProcessFn*)fo2::kIatExitProcess;
+    if (current != (ExitProcessFn)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "ExitProcess"))
+        Log("exit: the game's ExitProcess import is another's (%p) - the hook goes before it", (void*)current);
+    g_exitProcess = current;
+    if (!PatchPointer(fo2::kIatExitProcess, (uintptr_t)current, (const void*)&ExitProcessHook)) Log("exit: hook FAILED");
 }
 
 static void Init()
@@ -67,6 +102,7 @@ static void Init()
     rec::Install();
     StartInCockpit();
     PutAwayOldDxvk();
+    if (g_cfg.vrEnabled) InstallExitHook();
     if (g_cfg.vrEnabled || BackgroundMode()) Log("Direct3DCreate9 hook %s", InstallCreateHook() ? "installed" : "FAILED");
 }
 

@@ -111,8 +111,12 @@ bool g_frameOpen;
 XrView g_views[2];
 bool g_viewsValid;
 
-// Recenter origin (OpenXR LOCAL space): position and rotation.
+// Recenter origin (OpenXR LOCAL space): position and rotation. A recenter (the first one too, as the session begins)
+// waits for the headset to be tracked (HeadTracked), at most kRecenterWaitMax seconds.
 bool g_recenterPending = true;
+double g_recenterWaitSince = -1;  // when the pending recenter began to wait (-1: none waits)
+bool g_recenterWaitLogged;
+constexpr double kRecenterWaitMax = 10.0;
 float g_originPos[3];
 XrQuaternionf g_originRot = { 0, 0, 0, 1 };  // a turn about the vertical (see ApplyRecenter)
 
@@ -239,6 +243,19 @@ EyePose ToGamePose(const XrPosef& p)
     ToGame(f, out.forward);
     ToGame(pos, out.position);
     return out;
+}
+
+// Whether the views are the headset's as tracked. Virtual Desktop's runtime gives the first frames of a session a head
+// of its own making before it tracks the headset: exactly level and straight ahead, between the eyes at x and z 0 and
+// some 0.5 to 1.5 m below its space's origin (0 -1.22 0), and says it is tracked (the view flags all set). The view
+// centred on it at the start left the menus' screen and the cockpit that far below the eyes, at the feet, until the
+// player recentered. The real head came a third of a second later.
+bool HeadTracked(XrViewStateFlags flags)
+{
+    const XrViewStateFlags tracked = XR_VIEW_STATE_ORIENTATION_TRACKED_BIT | XR_VIEW_STATE_POSITION_VALID_BIT | XR_VIEW_STATE_POSITION_TRACKED_BIT;
+    const XrQuaternionf& q = g_views[0].pose.orientation;
+    bool madeUp = q.x == 0 && q.y == 0 && q.z == 0;  // (a head the headset tracks is never turned exactly so)
+    return (flags & tracked) == tracked && !madeUp;
 }
 
 // The head as it is now becomes the origin: where it is, and its turn about the vertical (the horizon stays level).
@@ -1441,6 +1458,32 @@ bool InitInstance()
 
 bool Available() { return g_instance != XR_NULL_HANDLE || g_fake; }
 
+// The game exits (dllmain.cpp, ExitProcessHook): the instance destroyed (with it the session and the swapchains, under
+// the queue lock as the swapchains' other calls), on a thread of its own so that a runtime that does not return does not
+// keep the game from ending.
+bool Shutdown()
+{
+    if (g_instance == XR_NULL_HANDLE) return false;
+    g_running = false;
+    double t0 = NowSeconds();
+    HANDLE t = CreateThread(
+        nullptr, 0,
+        [](void*) -> DWORD {
+            if (!g_interop) return (DWORD)xrDestroyInstance(g_instance);
+            QueueLock lock;
+            return (DWORD)xrDestroyInstance(g_instance);
+        },
+        nullptr, 0, nullptr);
+    DWORD result = 0;
+    if (t && WaitForSingleObject(t, 2000) == WAIT_OBJECT_0 && GetExitCodeThread(t, &result))
+        Log("xr: the session and the instance ended in %.0f ms (xrDestroyInstance: %d)", 1000.0 * (NowSeconds() - t0), (int)result);
+    else
+        Log("xr: the runtime did not end the session in 2 s");
+    if (t) CloseHandle(t);
+    g_instance = XR_NULL_HANDLE;
+    return true;
+}
+
 void OnDevice(IDirect3DDevice9* dev)
 {
     if (g_session || !g_instance) return;
@@ -1652,8 +1695,28 @@ bool BeginFrame()
     if (g_viewsValid) NoteViews();
     if (g_viewsValid && g_recenterPending)
     {
-        g_recenterPending = false;
-        ApplyRecenter();
+        double now = NowSeconds();
+        if (g_recenterWaitSince < 0) g_recenterWaitSince = now;
+        bool tracked = HeadTracked(vs.viewStateFlags);
+        if (tracked || now - g_recenterWaitSince > kRecenterWaitMax)
+        {
+            if (!tracked)
+                Log("xr: the headset still not tracked after %.0f s (view flags %X) - recentered on the runtime's head as it is",
+                    kRecenterWaitMax, (unsigned)vs.viewStateFlags);
+            g_recenterPending = false;
+            g_recenterWaitSince = -1;
+            g_recenterWaitLogged = false;
+            ApplyRecenter();
+        }
+        else if (!g_recenterWaitLogged)
+        {
+            g_recenterWaitLogged = true;
+            const XrQuaternionf& q = g_views[0].pose.orientation;
+            Log("xr: the recenter waits for the headset to be tracked (view flags %X, the runtime's head at %.2f %.2f %.2f, %s)",
+                (unsigned)vs.viewStateFlags, 0.5f * (g_views[0].pose.position.x + g_views[1].pose.position.x),
+                0.5f * (g_views[0].pose.position.y + g_views[1].pose.position.y), 0.5f * (g_views[0].pose.position.z + g_views[1].pose.position.z),
+                q.x == 0 && q.y == 0 && q.z == 0 ? "exactly level and straight ahead" : "turned");
+        }
     }
     ReadInput();
     return g_frameState.shouldRender && g_viewsValid;

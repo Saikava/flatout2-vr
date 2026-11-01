@@ -47,7 +47,8 @@
 //   or one with force feedback of its own as the game takes it while the window is in front (PadProxy::SetCooperativeLevel);
 // - gives an Xbox controller force feedback (PadProxy): DirectInput has none for them, only XInput can make them
 //   vibrate.
-// The VR controllers and Xbox controllers also press the keys of the menus and the race's pause (ControllersMenuKeys).
+// The VR controllers and Xbox controllers also press the keys of the menus and the race's pause (ControllersMenuKeys;
+// Xbox controllers not in the Steam release, whose fo2_zoom.dll does it).
 
 namespace {
 
@@ -1851,6 +1852,7 @@ bool ControllersWheelTurn(float& turn)
 // Start Enter ("press START") and Back Esc; while driving the menu button and Start Esc (the pause), and [VR]
 // PauseButton too, which also continues the race from its pause. What a button presses is chosen as it goes down and
 // held until it comes up. Not while a control waits for its new key or button (Configure controls), nor in a replay.
+// The Steam release presses the menus' keys for Xbox controllers itself (fo2_zoom.dll; see ControllersMenuKeys).
 namespace {
 
 enum Press
@@ -2045,6 +2047,16 @@ void ControllersMenuKeys()
         Feed(g_vrMenu, l.menu, kMenu, driving, off, now);
         if (g_pauseButton >= 0) Feed(g_vrPause, PauseButtonDown(l, r, now), kPause, driving, off, now);
     }
+    // The Steam release's fo2_zoom.dll reads the game controllers itself (SDL3) and presses the menus' keys for them with
+    // SendInput: A Enter, B Esc, Start Esc while driving and Enter in the menus, Y Delete, the D-pad and the left
+    // thumbstick the arrows, the triggers Page Up and Page Down. The mod's presses came on top of its: every press
+    // moved the menus twice (the pause menu's selection two icons on) and Start paused the race and went on with it at
+    // once. There the Xbox controllers are left to it (the mod still makes them vibrate).
+    static const bool zoomPadKeys = [] {
+        bool zoom = GetModuleHandleW(L"fo2_zoom.dll") != nullptr;
+        if (zoom) Log("controllers: Xbox controllers press the menus' keys through fo2_zoom.dll (the Steam release's own), not the mod");
+        return zoom;
+    }();
     if (LoadXInput())
     {
         ScanXInput(!driving);
@@ -2053,6 +2065,7 @@ void ControllersMenuKeys()
             XINPUT_STATE x = {};
             bool connected = g_xinputConnected[u] && g_xinputGetState(u, &x) == ERROR_SUCCESS;
             g_xinputConnected[u] = connected;
+            if (zoomPadKeys) continue;
             const XINPUT_GAMEPAD& g = x.Gamepad;
             const float stick[2] = { g.sThumbLX / 32767.0f, g.sThumbLY / 32767.0f };
             bool w[4] = {};

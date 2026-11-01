@@ -25,6 +25,8 @@ struct EyeFov
 // the game then runs without VR.
 bool InitInstance();
 bool Available();  // InitInstance succeeded
+// The game exits: the session and the instance ended (the runtime given at most 2 s). False: there was no instance.
+bool Shutdown();
 // The game's device was created: start the session (needs DXVK).
 void OnDevice(IDirect3DDevice9* dev);
 void PollEvents();

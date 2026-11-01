@@ -597,6 +597,12 @@ constexpr uintptr_t kKeysHeld = 0x8DA740;    // int
 // The game's import of GetProcAddress, through which its sound (FMOD 3.75, built in) gets DirectSoundCreate8.
 constexpr uintptr_t kIatGetProcAddress = 0x6521C8;
 
+// ---- exit ----------------------------------------------------------------------------------------
+// The game's import of ExitProcess (the same in the Steam release's FlatOut2.exe). Closing its window (Alt+F4, or Quit in
+// the menus) ends its main loop and its shutdown (the options written back); its C runtime then calls ExitProcess
+// (0x602B3E), which unloads the DLLs.
+constexpr uintptr_t kIatExitProcess = 0x6521F8;
+
 // ---- game state -----------------------------------------------------------------------------
 constexpr uintptr_t kGameFlow = 0x8E8410;  // GameFlow*
 constexpr int kGameState = 0x458;          // 1 = menu, 2 = race
