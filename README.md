@@ -73,8 +73,9 @@ the runtime itself.
 ## What's in the archive
 
 - `winmm.dll`: [Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader), which loads the mod;
-- `d3d9.dll`: the 32-bit [DXVK](https://github.com/doitsujin/dxvk), which the mod needs to hand the
-  game's picture to the headset;
+- `scripts\dxvk_d3d9.dll`: the 32-bit [DXVK](https://github.com/doitsujin/dxvk) (its `d3d9.dll`), which
+  the mod needs to hand the game's picture to the headset: the mod loads it for the game in VR (without VR the
+  game draws with Windows' Direct3D, as without the mod);
 - `scripts\FO2VR.asi`, `scripts\FO2VR.ini`, `scripts\openxr_loader.dll`, `scripts\wineopenxr.dll`:
   the mod.
 
@@ -218,8 +219,11 @@ The log, `scripts\FO2VR.log`, usually says what went wrong.
   reset its driver (the system's event log has it, as `nvlddmkm` on an NVIDIA card); the game cannot draw after
   that, so it closes rather than standing still in the headset. Start it again. If it keeps happening, open an
   issue with `scripts\FO2VR.log`.
-- **The log says "the game does not run on DXVK".** `d3d9.dll` from the archive is missing from the game
-  folder, or another mod replaced it.
+- **The Steam release does not start: `FlatOut2.exe` runs (the Task Manager lists it) but shows no window.**
+  If an earlier version of the mod put DXVK into the game folder as `d3d9.dll`, delete that file: DXVK comes as
+  `scripts\dxvk_d3d9.dll` now (the mod puts the old one away by itself, but only in a game that starts). The Steam release starts Direct3D as the game loads (its `fo2_zoom.dll`), and
+  with DXVK in the game folder that hung the game on some PCs.
+- **The log says "the game does not run on DXVK".** `scripts\dxvk_d3d9.dll` from the archive is missing.
 - **The log says "unsupported FlatOut2.exe".** The mod needs version 1.2 of the game (the GOG or the
   Steam release).
 - **The HUD looks stretched.** Choose a 16:9 resolution in the game's settings.
@@ -240,8 +244,8 @@ Visual Studio 2022 Build Tools (x86, C++), CMake and Ninja: run `build.cmd`. It 
 and `wineopenxr.dll` and copies them, with the OpenXR loader, into `..\scripts\`. The repository is
 meant to be checked out inside the game folder.
 
-`tools\package.ps1 -Version <n>` packs a release archive from the build, with the ASI loader and DXVK
-taken from the game folder.
+`tools\package.ps1 -Version <n>` packs a release archive from the build, with the ASI loader
+(`winmm.dll`) and DXVK (`scripts\dxvk_d3d9.dll`) taken from the game folder.
 
 ## License
 

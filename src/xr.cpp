@@ -1447,7 +1447,7 @@ void OnDevice(IDirect3DDevice9* dev)
     if (FAILED(dev->QueryInterface(__uuidof(ID3D9VkInteropDevice), (void**)&g_interop)))
     {
         g_interop = nullptr;
-        Log("xr: the game does not run on DXVK - no VR (put DXVK's 32-bit d3d9.dll into the game folder)");
+        Log("xr: the game does not run on DXVK - no VR (scripts\\dxvk_d3d9.dll, DXVK's 32-bit d3d9.dll from the mod's archive, is missing)");
         return;
     }
     g_interop->GetVulkanHandles(&g_vkInstance, &g_vkPhys, &g_vkDevice);

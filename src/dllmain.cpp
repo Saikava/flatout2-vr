@@ -66,6 +66,7 @@ static void Init()
     InstallSound();
     rec::Install();
     StartInCockpit();
+    PutAwayOldDxvk();
     if (g_cfg.vrEnabled || BackgroundMode()) Log("Direct3DCreate9 hook %s", InstallCreateHook() ? "installed" : "FAILED");
 }
 

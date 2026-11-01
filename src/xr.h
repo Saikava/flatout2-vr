@@ -1,5 +1,5 @@
 #pragma once
-// OpenXR output. The game's Direct3D 9 runs on DXVK (d3d9.dll from DXVK in the game folder); the
+// OpenXR output. The game's Direct3D 9 runs on DXVK (scripts\dxvk_d3d9.dll, see d3dcreate.cpp); the
 // OpenXR session uses DXVK's own Vulkan device and queue, and eye images rendered by the game into
 // D3D9 textures are copied into OpenXR swapchains on that queue (DXVK interop).
 #include <cstdint>

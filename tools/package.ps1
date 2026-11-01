@@ -1,7 +1,8 @@
 # Packs a release: FlatOut2-VR-<version>.zip, laid out like the game folder.
-#   powershell -File tools\package.ps1 -Version 1.0 [-AsiLoader <winmm.dll>] [-Dxvk <d3d9.dll>] [-Out <folder>]
-# The ASI loader (Ultimate ASI Loader, 32-bit, as winmm.dll) and DXVK's 32-bit d3d9.dll are taken from the game
-# folder by default (the ones this mod is tested with); the mod from the last build (build.cmd).
+#   powershell -File tools\package.ps1 -Version 1.0 [-AsiLoader <winmm.dll>] [-Dxvk <dxvk_d3d9.dll>] [-Out <folder>]
+# The ASI loader (Ultimate ASI Loader, 32-bit, as winmm.dll) and DXVK's 32-bit d3d9.dll (scripts\dxvk_d3d9.dll, which the mod
+# loads itself: see src\d3dcreate.cpp) are taken from the game folder by default (the ones this mod is tested with); the mod
+# from the last build (build.cmd).
 param(
     [Parameter(Mandatory = $true)][string]$Version,
     [string]$AsiLoader,
@@ -12,14 +13,14 @@ $ErrorActionPreference = "Stop"
 $repo = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $game = Split-Path $repo
 if (-not $AsiLoader) { $AsiLoader = Join-Path $game "winmm.dll" }
-if (-not $Dxvk) { $Dxvk = Join-Path $game "d3d9.dll" }
+if (-not $Dxvk) { $Dxvk = Join-Path $game "scripts\dxvk_d3d9.dll" }
 if (-not $Out) { $Out = Join-Path $repo "build\release" }
 $stage = Join-Path $Out "FlatOut2-VR-$Version"
 if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
 New-Item -ItemType Directory -Force "$stage\scripts\FO2VR-licenses" | Out-Null
 
 Copy-Item $AsiLoader "$stage\winmm.dll"
-Copy-Item $Dxvk "$stage\d3d9.dll"
+Copy-Item $Dxvk "$stage\scripts\dxvk_d3d9.dll"
 Copy-Item "$repo\build\FO2VR.asi" "$stage\scripts\"
 Copy-Item "$repo\build\wineopenxr.dll" "$stage\scripts\"
 Copy-Item "$repo\third_party\openxr\bin\openxr_loader.dll" "$stage\scripts\"
