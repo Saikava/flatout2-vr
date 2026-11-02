@@ -64,7 +64,7 @@ struct Motors
 class ForceFeedback;
 
 bool g_driving;  // the player drives (ControllersMenuKeys, once a frame)
-bool g_zoomLeavesDirectInput;  // the Steam release's SDL told to leave DirectInput's controllers alone (InstallControllers)
+bool g_zoomLeavesControllers;  // the Steam release's SDL told to leave controllers other than Xbox ones alone (InstallControllers)
 
 // [VR] EngineRumble: the engine as a light, steady vibration (the game's force feedback has nothing of it) while the
 // player drives: from a tenth of EngineRumble at idle with the foot off to all of it at the rev limit with the
@@ -1758,15 +1758,32 @@ void __cdecl WrapDirectInput()
     *slot = new InputProxy(*slot);
     Log("controllers: the game's DirectInput goes through the mod (VR controllers %s, vibration %.2f)",
         VrPadWanted() ? "on" : g_cfg.vrMotionControllers ? "off: no VR" : "off", g_cfg.vrRumble);
-    // What the Steam release's SDL makes of SDL_JOYSTICK_DIRECTINPUT (see InstallControllers), and whether its game
-    // controllers have started by now.
-    if (HMODULE sdl = g_zoomLeavesDirectInput ? GetModuleHandleW(L"SDL3.dll") : nullptr)
+    // What the Steam release's SDL makes of the variables (see InstallControllers), and whether its game controllers
+    // have started by now.
+    if (HMODULE sdl = g_zoomLeavesControllers ? GetModuleHandleW(L"SDL3.dll") : nullptr)
     {
         auto getHint = (const char*(__cdecl*)(const char*))GetProcAddress(sdl, "SDL_GetHint");
         auto wasInit = (DWORD(__cdecl*)(DWORD))GetProcAddress(sdl, "SDL_WasInit");
-        const char* hint = getHint ? getHint("SDL_JOYSTICK_DIRECTINPUT") : nullptr;
-        Log("controllers: fo2_zoom.dll's SDL: SDL_JOYSTICK_DIRECTINPUT %s, its game controllers %s", hint ? hint : "(not set)",
-            !wasInit ? "?" : wasInit(0x200) ? "started" : "not started yet");
+        const char* directInput = getHint ? getHint("SDL_JOYSTICK_DIRECTINPUT") : nullptr;
+        const char* wgi = getHint ? getHint("SDL_JOYSTICK_WGI") : nullptr;
+        Log("controllers: fo2_zoom.dll's SDL: SDL_JOYSTICK_DIRECTINPUT %s, SDL_JOYSTICK_WGI %s, its game controllers %s",
+            directInput ? directInput : "(not set)", wgi ? wgi : "(not set)", !wasInit ? "?" : wasInit(0x200) ? "started" : "not started yet");
+        // The ones it found (its path: a HID device's through raw input or DirectInput, none through Windows.Gaming.Input).
+        auto list = (DWORD*(__cdecl*)(int*))GetProcAddress(sdl, "SDL_GetJoysticks");
+        auto name = (const char*(__cdecl*)(DWORD))GetProcAddress(sdl, "SDL_GetJoystickNameForID");
+        auto path = (const char*(__cdecl*)(DWORD))GetProcAddress(sdl, "SDL_GetJoystickPathForID");
+        auto release = (void(__cdecl*)(void*))GetProcAddress(sdl, "SDL_free");
+        int n = 0;
+        if (DWORD* ids = wasInit && wasInit(0x200) && list && name && path && release ? list(&n) : nullptr)
+        {
+            for (int i = 0; i < n; i++)
+            {
+                const char* nm = name(ids[i]);
+                const char* p = path(ids[i]);
+                Log("controllers: fo2_zoom.dll's SDL has \"%s\" (%s)", nm ? nm : "?", p ? p : "no path");
+            }
+            release(ids);
+        }
     }
 }
 
@@ -1799,14 +1816,16 @@ bool InstallControllers()
     // feedback to whoever took it to itself or reset it last (the others' commands then fail with
     // DIERR_NOTEXCLUSIVEACQUIRED): without VR the game takes its controller as its menus start, after SDL, but in VR
     // (its window in front from the start) as it opens it, before; a player's SideWinder Force Feedback Wheel then had no
-    // force feedback and was never read moving. In VR SDL is told to leave DirectInput's controllers alone (the game's
-    // own then, as in the GOG release); Xbox controllers (XInput), which fo2_zoom.dll turns into the menus' keys, it
-    // still opens. SDL reads the variable as it starts its game controllers, after this.
+    // force feedback and was never read moving. In VR SDL is told to leave such controllers alone (the game's own then,
+    // as in the GOG release): not through DirectInput, nor through Windows.Gaming.Input, which SDL (3.2.0) otherwise
+    // opens them with instead (on by default, after DirectInput; the same wheel, so held, was then read neither in VR nor
+    // without VR). Xbox controllers, which fo2_zoom.dll turns into the menus' keys, it still opens (through raw input or
+    // XInput). SDL reads the variables as it starts its game controllers, after this.
     if (g_cfg.vrEnabled && GetModuleHandleW(L"fo2_zoom.dll"))
     {
-        g_zoomLeavesDirectInput = SetEnvironmentVariableW(L"SDL_JOYSTICK_DIRECTINPUT", L"0") != 0;
-        Log("controllers: fo2_zoom.dll's SDL told to leave DirectInput's game controllers to the game (SDL_JOYSTICK_DIRECTINPUT=0)%s",
-            g_zoomLeavesDirectInput ? "" : " - FAILED");
+        g_zoomLeavesControllers = SetEnvironmentVariableW(L"SDL_JOYSTICK_DIRECTINPUT", L"0") && SetEnvironmentVariableW(L"SDL_JOYSTICK_WGI", L"0");
+        Log("controllers: fo2_zoom.dll's SDL told to leave game controllers other than Xbox controllers to the game "
+            "(SDL_JOYSTICK_DIRECTINPUT=0, SDL_JOYSTICK_WGI=0)%s", g_zoomLeavesControllers ? "" : " - FAILED");
     }
     if (g_cfg.vrEnabled && g_cfg.vrMotionControllers)
     {
