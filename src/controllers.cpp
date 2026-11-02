@@ -743,7 +743,8 @@ public:
         // (InstallControllers). The same wheel in the Steam release with SteamVR running still lost its force feedback
         // half a second after the game took it (SDL holding only Steam's virtual controllers) and was never read moving;
         // taken again (Unacquire, Acquire) it did not get it back (1.6.10, 1.6.11). In the GOG release in VR, and in the
-        // Steam release without SteamVR, it works: most likely Steam Input, active in the game while SteamVR runs (the
+        // Steam release without SteamVR, it works: most likely Steam's handling of the player's Steam Frame, whose
+        // controllers Steam handed the game as a gamepad while SteamVR ran, Steam Input turned off for the game (the
         // README's Troubleshooting).
         m_window = window, m_flags = flags, m_level = kAsked;
         if ((InVr() || BackgroundMode()) && (flags & DISCL_FOREGROUND))
