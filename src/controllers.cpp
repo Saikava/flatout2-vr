@@ -740,7 +740,11 @@ public:
         // release's fo2_zoom.dll keeps every game controller open through SDL, whose DirectInput holds it so, and the two
         // took it from each other (a player's SideWinder Force Feedback Wheel, its force feedback commands failing with
         // DIERR_NOTEXCLUSIVEACQUIRED, was never read moving). In VR SDL now leaves such controllers alone
-        // (InstallControllers); should another still take the force feedback, the controller is taken back (TakeBack).
+        // (InstallControllers). The same wheel in the Steam release with SteamVR running still lost its force feedback
+        // half a second after the game took it (SDL holding only Steam's virtual controllers) and was never read moving;
+        // taken again (Unacquire, Acquire) it did not get it back (1.6.10, 1.6.11). In the GOG release in VR, and in the
+        // Steam release without SteamVR, it works: most likely Steam Input, active in the game while SteamVR runs (the
+        // README's Troubleshooting).
         m_window = window, m_flags = flags, m_level = kAsked;
         if ((InVr() || BackgroundMode()) && (flags & DISCL_FOREGROUND))
         {
@@ -789,7 +793,6 @@ public:
     {
         if (m_ff) return m_ff->Command(flags);
         HRESULT hr = m_inner->SendForceFeedbackCommand(flags);
-        if (hr == DIERR_NOTEXCLUSIVEACQUIRED && TakeBack()) hr = m_inner->SendForceFeedbackCommand(flags);
         m_ffRetry = 0;
         // The game reads a controller only once its actuators are switched on (or off, with Force feedback off in its
         // options; 0x5616D5), trying again every frame: in VR (see SetCooperativeLevel) a controller whose force feedback
@@ -891,28 +894,9 @@ private:
         if (now < m_ffRetryAt) return;
         m_ffRetryAt = now + 1.0;
         HRESULT hr = m_inner->SendForceFeedbackCommand(m_ffRetry);
-        if (hr == DIERR_NOTEXCLUSIVEACQUIRED && TakeBack()) hr = m_inner->SendForceFeedbackCommand(m_ffRetry);
         if (FAILED(hr)) return;
         Log("controllers: \"%s\" given its force feedback command (%X) after all", m_name.c_str(), (unsigned)m_ffRetry);
         m_ffRetry = 0;
-    }
-
-    // A controller with force feedback of its own, taken as the game takes it (to itself while its window is in front),
-    // whose force feedback another took since (DirectInput gives it to whoever took the controller to itself or reset it
-    // last; see InstallControllers): taken again, as the game would after losing it, which gives it back (no other can
-    // take it while the window stays in front). Once a force feedback command fails so, at most once a second.
-    bool TakeBack()
-    {
-        double now = NowSeconds();
-        if (m_level != kInFront || now < m_nextTakeBack || GetForegroundWindow() != m_window) return false;
-        m_nextTakeBack = now + 1.0;
-        m_inner->Unacquire();
-        HRESULT hr = m_inner->Acquire();
-        Note("taken back, its force feedback another's", hr);
-        if (SUCCEEDED(hr)) return true;
-        hr = Share();
-        Log("controllers: \"%s\" shared, without force feedback: %08X", m_name.c_str(), (unsigned)hr);
-        return false;
     }
 
     // Logged once each: the controller acquired, and each way its acquiring and reading failed (the game tries every
@@ -964,7 +948,6 @@ private:
     HWND m_window = nullptr;
     DWORD m_flags = 0;  // the game's
     double m_nextTake = 0;  // when TakeInFront may try again
-    double m_nextTakeBack = 0;  // when TakeBack may
     std::vector<std::pair<const char*, HRESULT>> m_noted;
     std::vector<BYTE> m_first;
     bool m_moved = false;

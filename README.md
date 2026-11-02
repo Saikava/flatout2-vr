@@ -232,6 +232,10 @@ The log, `scripts\FO2VR.log`, usually says what went wrong.
 - **The HUD looks stretched.** Choose a 16:9 resolution in the game's settings.
 - **The VR controllers or the gamepad do nothing in a race.** Choose them in the game's Options > Controller
   options > Controller: the game drives with the one chosen there (the keyboard works besides).
+- **Steam release: a steering wheel does nothing in VR, or has no force feedback** (without VR it works). Most
+  likely Steam Input, which is active in the game while SteamVR runs: turn it off for the game (in Steam:
+  FlatOut 2 > Properties > Controller > Disable Steam Input). A player's wheel that did nothing there worked in the
+  GOG release.
 - **It stutters in the headset.** Each frame has to be ready in the headset's time (8.3 ms at 120 Hz); the log's
   `frame avg/max ms` lines show how long the eyes take. In `scripts\FO2VR.ini`, `[VR]`, these cost the most:
   `Mirrors` (1 halves the mirrors' cost, 0 drops it), `MSAA` (2 or 0), `RenderScale` (0.8 or 0.9),
