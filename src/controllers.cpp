@@ -64,6 +64,7 @@ struct Motors
 class ForceFeedback;
 
 bool g_driving;  // the player drives (ControllersMenuKeys, once a frame)
+bool g_zoomLeavesDirectInput;  // the Steam release's SDL told to leave DirectInput's controllers alone (InstallControllers)
 
 // [VR] EngineRumble: the engine as a light, steady vibration (the game's force feedback has nothing of it) while the
 // player drives: from a tenth of EngineRumble at idle with the foot off to all of it at the rev limit with the
@@ -719,6 +720,8 @@ public:
                 m_moved = true;
                 Log("controllers: \"%s\" read: its first input", m_name.c_str());
             }
+            else if (++m_sameReads == 5000)
+                Log("controllers: \"%s\" read 5000 times, the same each time (not moved, or its input does not reach the game)", m_name.c_str());
         }
         return hr;
     }
@@ -735,8 +738,9 @@ public:
         // the controller to itself: one with force feedback of its own is taken as the game takes it (to itself, while
         // its window is in front) and shared while the window is not. Not for itself in the background: the Steam
         // release's fo2_zoom.dll keeps every game controller open through SDL, whose DirectInput holds it so, and the two
-        // took it from each other: the game acquired a wheel again every frame and never read it (a player's SideWinder
-        // Force Feedback Wheel, its force feedback commands failing with DIERR_NOTEXCLUSIVEACQUIRED).
+        // took it from each other (a player's SideWinder Force Feedback Wheel, its force feedback commands failing with
+        // DIERR_NOTEXCLUSIVEACQUIRED, was never read moving). In VR SDL now leaves such controllers alone
+        // (InstallControllers); should another still take the force feedback, the controller is taken back (TakeBack).
         m_window = window, m_flags = flags, m_level = kAsked;
         if ((InVr() || BackgroundMode()) && (flags & DISCL_FOREGROUND))
         {
@@ -785,6 +789,7 @@ public:
     {
         if (m_ff) return m_ff->Command(flags);
         HRESULT hr = m_inner->SendForceFeedbackCommand(flags);
+        if (hr == DIERR_NOTEXCLUSIVEACQUIRED && TakeBack()) hr = m_inner->SendForceFeedbackCommand(flags);
         m_ffRetry = 0;
         // The game reads a controller only once its actuators are switched on (or off, with Force feedback off in its
         // options; 0x5616D5), trying again every frame: in VR (see SetCooperativeLevel) a controller whose force feedback
@@ -885,9 +890,29 @@ private:
         double now = NowSeconds();
         if (now < m_ffRetryAt) return;
         m_ffRetryAt = now + 1.0;
-        if (FAILED(m_inner->SendForceFeedbackCommand(m_ffRetry))) return;
+        HRESULT hr = m_inner->SendForceFeedbackCommand(m_ffRetry);
+        if (hr == DIERR_NOTEXCLUSIVEACQUIRED && TakeBack()) hr = m_inner->SendForceFeedbackCommand(m_ffRetry);
+        if (FAILED(hr)) return;
         Log("controllers: \"%s\" given its force feedback command (%X) after all", m_name.c_str(), (unsigned)m_ffRetry);
         m_ffRetry = 0;
+    }
+
+    // A controller with force feedback of its own, taken as the game takes it (to itself while its window is in front),
+    // whose force feedback another took since (DirectInput gives it to whoever took the controller to itself or reset it
+    // last; see InstallControllers): taken again, as the game would after losing it, which gives it back (no other can
+    // take it while the window stays in front). Once a force feedback command fails so, at most once a second.
+    bool TakeBack()
+    {
+        double now = NowSeconds();
+        if (m_level != kInFront || now < m_nextTakeBack || GetForegroundWindow() != m_window) return false;
+        m_nextTakeBack = now + 1.0;
+        m_inner->Unacquire();
+        HRESULT hr = m_inner->Acquire();
+        Note("taken back, its force feedback another's", hr);
+        if (SUCCEEDED(hr)) return true;
+        hr = Share();
+        Log("controllers: \"%s\" shared, without force feedback: %08X", m_name.c_str(), (unsigned)hr);
+        return false;
     }
 
     // Logged once each: the controller acquired, and each way its acquiring and reading failed (the game tries every
@@ -939,9 +964,11 @@ private:
     HWND m_window = nullptr;
     DWORD m_flags = 0;  // the game's
     double m_nextTake = 0;  // when TakeInFront may try again
+    double m_nextTakeBack = 0;  // when TakeBack may
     std::vector<std::pair<const char*, HRESULT>> m_noted;
     std::vector<BYTE> m_first;
     bool m_moved = false;
+    int m_sameReads = 0;
     DWORD m_ffRetry = 0;  // a force feedback command to try again (0: none)
     double m_ffRetryAt = 0;
 };
@@ -1731,6 +1758,16 @@ void __cdecl WrapDirectInput()
     *slot = new InputProxy(*slot);
     Log("controllers: the game's DirectInput goes through the mod (VR controllers %s, vibration %.2f)",
         VrPadWanted() ? "on" : g_cfg.vrMotionControllers ? "off: no VR" : "off", g_cfg.vrRumble);
+    // What the Steam release's SDL makes of SDL_JOYSTICK_DIRECTINPUT (see InstallControllers), and whether its game
+    // controllers have started by now.
+    if (HMODULE sdl = g_zoomLeavesDirectInput ? GetModuleHandleW(L"SDL3.dll") : nullptr)
+    {
+        auto getHint = (const char*(__cdecl*)(const char*))GetProcAddress(sdl, "SDL_GetHint");
+        auto wasInit = (DWORD(__cdecl*)(DWORD))GetProcAddress(sdl, "SDL_WasInit");
+        const char* hint = getHint ? getHint("SDL_JOYSTICK_DIRECTINPUT") : nullptr;
+        Log("controllers: fo2_zoom.dll's SDL: SDL_JOYSTICK_DIRECTINPUT %s, its game controllers %s", hint ? hint : "(not set)",
+            !wasInit ? "?" : wasInit(0x200) ? "started" : "not started yet");
+    }
 }
 
 uintptr_t g_controllerEnum = fo2::kControllerEnum;
@@ -1755,6 +1792,21 @@ bool InstallControllers()
     {
         Log("controllers: the game's controller list is called differently - no VR controllers, no vibration for Xbox controllers");
         return false;
+    }
+    // The Steam release's fo2_zoom.dll opens every game controller through SDL as the game sets its keyboard hook, and
+    // keeps it open; SDL's DirectInput holds one to itself in the background, and one with force feedback of its own it
+    // also takes and resets as it opens it (Acquire, DISFFC_RESET, Unacquire). DirectInput gives a controller's force
+    // feedback to whoever took it to itself or reset it last (the others' commands then fail with
+    // DIERR_NOTEXCLUSIVEACQUIRED): without VR the game takes its controller as its menus start, after SDL, but in VR
+    // (its window in front from the start) as it opens it, before; a player's SideWinder Force Feedback Wheel then had no
+    // force feedback and was never read moving. In VR SDL is told to leave DirectInput's controllers alone (the game's
+    // own then, as in the GOG release); Xbox controllers (XInput), which fo2_zoom.dll turns into the menus' keys, it
+    // still opens. SDL reads the variable as it starts its game controllers, after this.
+    if (g_cfg.vrEnabled && GetModuleHandleW(L"fo2_zoom.dll"))
+    {
+        g_zoomLeavesDirectInput = SetEnvironmentVariableW(L"SDL_JOYSTICK_DIRECTINPUT", L"0") != 0;
+        Log("controllers: fo2_zoom.dll's SDL told to leave DirectInput's game controllers to the game (SDL_JOYSTICK_DIRECTINPUT=0)%s",
+            g_zoomLeavesDirectInput ? "" : " - FAILED");
     }
     if (g_cfg.vrEnabled && g_cfg.vrMotionControllers)
     {
