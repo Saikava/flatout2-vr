@@ -64,7 +64,6 @@ struct Motors
 class ForceFeedback;
 
 bool g_driving;  // the player drives (ControllersMenuKeys, once a frame)
-bool g_zoomLeavesControllers;  // the Steam release's SDL told to leave controllers other than Xbox ones alone (InstallControllers)
 
 // [VR] EngineRumble: the engine as a light, steady vibration (the game's force feedback has nothing of it) while the
 // player drives: from a tenth of EngineRumble at idle with the foot off to all of it at the rev limit with the
@@ -737,15 +736,13 @@ public:
         // (DISCL_NONEXCLUSIVE | DISCL_BACKGROUND), which another's hold on it does not stop. Only force feedback needs
         // the controller to itself: one with force feedback of its own is taken as the game takes it (to itself, while
         // its window is in front) and shared while the window is not. Not for itself in the background: the Steam
-        // release's fo2_zoom.dll keeps every game controller open through SDL, whose DirectInput holds it so, and the two
-        // took it from each other (a player's SideWinder Force Feedback Wheel, its force feedback commands failing with
-        // DIERR_NOTEXCLUSIVEACQUIRED, was never read moving). In VR SDL now leaves such controllers alone
-        // (InstallControllers). The same wheel in the Steam release with SteamVR running still lost its force feedback
-        // half a second after the game took it (SDL holding only Steam's virtual controllers) and was never read moving;
-        // taken again (Unacquire, Acquire) it did not get it back (1.6.10, 1.6.11). In the GOG release in VR, and in the
-        // Steam release without SteamVR, it works: most likely Steam's handling of the player's Steam Frame, whose
-        // controllers Steam handed the game as a gamepad while SteamVR ran, Steam Input turned off for the game (the
-        // README's Troubleshooting).
+        // release's fo2_zoom.dll keeps every game controller open through SDL, whose DirectInput holds it so. A player's
+        // SideWinder Force Feedback Wheel did nothing in the Steam release in VR (its force feedback commands failing
+        // with DIERR_NOTEXCLUSIVEACQUIRED, never read moving), whether SDL held it or not (1.6.10-1.6.11 told SDL to
+        // leave it alone: see WrapDirectInput), and taken again (Unacquire, Acquire) it did not get its force feedback
+        // back. In the GOG release in VR, and in the Steam release without VR, it works: most likely Steam's handling of
+        // the player's Steam Frame, whose controllers Steam handed the game as a gamepad while SteamVR ran, Steam Input
+        // turned off for the game (the README's Troubleshooting).
         m_window = window, m_flags = flags, m_level = kAsked;
         if ((InVr() || BackgroundMode()) && (flags & DISCL_FOREGROUND))
         {
@@ -894,8 +891,7 @@ private:
         double now = NowSeconds();
         if (now < m_ffRetryAt) return;
         m_ffRetryAt = now + 1.0;
-        HRESULT hr = m_inner->SendForceFeedbackCommand(m_ffRetry);
-        if (FAILED(hr)) return;
+        if (FAILED(m_inner->SendForceFeedbackCommand(m_ffRetry))) return;
         Log("controllers: \"%s\" given its force feedback command (%X) after all", m_name.c_str(), (unsigned)m_ffRetry);
         m_ffRetry = 0;
     }
@@ -1742,16 +1738,17 @@ void __cdecl WrapDirectInput()
     *slot = new InputProxy(*slot);
     Log("controllers: the game's DirectInput goes through the mod (VR controllers %s, vibration %.2f)",
         VrPadWanted() ? "on" : g_cfg.vrMotionControllers ? "off: no VR" : "off", g_cfg.vrRumble);
-    // What the Steam release's SDL makes of the variables (see InstallControllers), and whether its game controllers
-    // have started by now.
-    if (HMODULE sdl = g_zoomLeavesControllers ? GetModuleHandleW(L"SDL3.dll") : nullptr)
+    // The Steam release's fo2_zoom.dll opens every game controller through SDL as the game sets its keyboard hook, and
+    // keeps it open (SDL's DirectInput holds one to itself in the background), and presses the menus' keys for them:
+    // whether its game controllers have started by now, and which it has. In VR 1.6.10-1.6.11 told SDL to leave
+    // controllers other than Xbox ones to the game (SDL_JOYSTICK_DIRECTINPUT=0, and SDL_JOYSTICK_WGI=0: SDL 3.2.0
+    // otherwise opens them through Windows.Gaming.Input instead, and a wheel so held was read neither in VR nor
+    // without): a player's wheel did nothing in VR all the same (see PadProxy::SetCooperativeLevel), and wheels' buttons
+    // no longer worked the menus.
+    if (HMODULE sdl = GetModuleHandleW(L"fo2_zoom.dll") ? GetModuleHandleW(L"SDL3.dll") : nullptr)
     {
-        auto getHint = (const char*(__cdecl*)(const char*))GetProcAddress(sdl, "SDL_GetHint");
         auto wasInit = (DWORD(__cdecl*)(DWORD))GetProcAddress(sdl, "SDL_WasInit");
-        const char* directInput = getHint ? getHint("SDL_JOYSTICK_DIRECTINPUT") : nullptr;
-        const char* wgi = getHint ? getHint("SDL_JOYSTICK_WGI") : nullptr;
-        Log("controllers: fo2_zoom.dll's SDL: SDL_JOYSTICK_DIRECTINPUT %s, SDL_JOYSTICK_WGI %s, its game controllers %s",
-            directInput ? directInput : "(not set)", wgi ? wgi : "(not set)", !wasInit ? "?" : wasInit(0x200) ? "started" : "not started yet");
+        Log("controllers: fo2_zoom.dll's SDL: its game controllers %s", !wasInit ? "?" : wasInit(0x200) ? "started" : "not started yet");
         // The ones it found (its path: a HID device's through raw input or DirectInput, none through Windows.Gaming.Input).
         auto list = (DWORD*(__cdecl*)(int*))GetProcAddress(sdl, "SDL_GetJoysticks");
         auto name = (const char*(__cdecl*)(DWORD))GetProcAddress(sdl, "SDL_GetJoystickNameForID");
@@ -1793,23 +1790,6 @@ bool InstallControllers()
     {
         Log("controllers: the game's controller list is called differently - no VR controllers, no vibration for Xbox controllers");
         return false;
-    }
-    // The Steam release's fo2_zoom.dll opens every game controller through SDL as the game sets its keyboard hook, and
-    // keeps it open; SDL's DirectInput holds one to itself in the background, and one with force feedback of its own it
-    // also takes and resets as it opens it (Acquire, DISFFC_RESET, Unacquire). DirectInput gives a controller's force
-    // feedback to whoever took it to itself or reset it last (the others' commands then fail with
-    // DIERR_NOTEXCLUSIVEACQUIRED): without VR the game takes its controller as its menus start, after SDL, but in VR
-    // (its window in front from the start) as it opens it, before; a player's SideWinder Force Feedback Wheel then had no
-    // force feedback and was never read moving. In VR SDL is told to leave such controllers alone (the game's own then,
-    // as in the GOG release): not through DirectInput, nor through Windows.Gaming.Input, which SDL (3.2.0) otherwise
-    // opens them with instead (on by default, after DirectInput; the same wheel, so held, was then read neither in VR nor
-    // without VR). Xbox controllers, which fo2_zoom.dll turns into the menus' keys, it still opens (through raw input or
-    // XInput). SDL reads the variables as it starts its game controllers, after this.
-    if (g_cfg.vrEnabled && GetModuleHandleW(L"fo2_zoom.dll"))
-    {
-        g_zoomLeavesControllers = SetEnvironmentVariableW(L"SDL_JOYSTICK_DIRECTINPUT", L"0") && SetEnvironmentVariableW(L"SDL_JOYSTICK_WGI", L"0");
-        Log("controllers: fo2_zoom.dll's SDL told to leave game controllers other than Xbox controllers to the game "
-            "(SDL_JOYSTICK_DIRECTINPUT=0, SDL_JOYSTICK_WGI=0)%s", g_zoomLeavesControllers ? "" : " - FAILED");
     }
     if (g_cfg.vrEnabled && g_cfg.vrMotionControllers)
     {

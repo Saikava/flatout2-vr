@@ -153,9 +153,8 @@ where the driver's hands stop (the game has no animation past that).
 
 In VR a wheel with force feedback is the game's as without VR while the game's window (on the monitor) has the
 focus, and shared, still steering but without force feedback, while it has not; other game controllers are read
-whether or not it has. `scripts\FO2VR.log` says how each was opened. In the Steam release, whose own
-controller support otherwise kept the wheel from the game, VR leaves game controllers other than Xbox
-controllers (most wheels) to the game alone, so their buttons do not work the menus there.
+whether or not it has. `scripts\FO2VR.log` says how each was opened. In the Steam release a wheel works the
+menus too, as there without the mod (that release's own controller support).
 
 ## Settings
 
