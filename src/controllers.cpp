@@ -1163,20 +1163,21 @@ float AxisForSteering(float s)
 bool g_wheelHeld;
 float g_wheelHeldTurn;
 
-// The keyboard's steering, throttle or brake keys held (as a game controller's button read takes them: 0x55D760).
-bool KeyboardDriving()
+// The keyboard's steering, throttle or brake key held (as a game controller's button read takes them: 0x55D760): the
+// control (0 steer left, 1 steer right, 2 throttle, 3 brake), -1 none.
+int KeyboardDriving()
 {
     BYTE* input = *(BYTE**)fo2::kInput;
     BYTE* keyboard = input && *(int*)(input + fo2::kInputControllers) > 0 ? ((BYTE**)(input + fo2::kInputControllerList))[0] : nullptr;
-    if (!keyboard) return false;
+    if (!keyboard) return -1;
     using ReadEntry = int(__thiscall*)(BYTE*, int);
     ReadEntry read = *(ReadEntry*)(*(BYTE**)keyboard + fo2::kControllerReadEntry);
     for (int control = 0; control < fo2::kDrivingControls; control++)
     {
         BYTE entry = keyboard[fo2::kControllerControls + control];
-        if (entry != 0xFF && read(keyboard, entry)) return true;
+        if (entry != 0xFF && read(keyboard, entry)) return control;
     }
-    return false;
+    return -1;
 }
 
 // Virtual Desktop makes Touch controllers of the hands a Quest tracks once its controllers are put down (a pinch pulls
@@ -1184,17 +1185,33 @@ bool KeyboardDriving()
 // Desktop's own), not through SteamVR: there, with the hands on the keyboard, their triggers took the throttle and the
 // brake from its keys (the game takes an axis off its rest over the keys). The hands make neither the thumbsticks nor
 // the buttons: the triggers and the grips count from a thumbstick moved or a button pressed until the keyboard's
-// steering, throttle or brake keys are (and not before).
+// steering, throttle or brake keys are (and not before). The log names what each time.
 bool g_vrPadInUse;
 
 void UpdateVrPadInUse(const xr::Controller& l, const xr::Controller& r)
 {
-    bool used = std::hypot(l.stick[0], l.stick[1]) > 0.5f || std::hypot(r.stick[0], r.stick[1]) > 0.5f || l.button || l.lower ||
-                r.button || r.lower || l.thumb || r.thumb;
-    bool inUse = used || (g_vrPadInUse && !KeyboardDriving());
+    char used[64] = "";
+    for (int h = 0; h < 2 && !used[0]; h++)
+    {
+        const xr::Controller& c = h ? r : l;
+        const char* side = h ? "right" : "left";
+        if (std::hypot(c.stick[0], c.stick[1]) > 0.5f)
+            snprintf(used, sizeof(used), "the %s thumbstick at %.2f %.2f", side, c.stick[0], c.stick[1]);
+        else if (c.button || c.lower)
+            snprintf(used, sizeof(used), "the %s controller's %s", side, c.button ? (h ? "B" : "Y") : (h ? "A" : "X"));
+        else if (c.thumb)
+            snprintf(used, sizeof(used), "the %s thumbstick pressed", side);
+    }
+    int key = used[0] || !g_vrPadInUse ? -1 : KeyboardDriving();
+    bool inUse = used[0] || (g_vrPadInUse && key < 0);
     if (inUse != g_vrPadInUse)
-        Log(inUse ? "controllers: the VR controllers' triggers and grips count (a thumbstick or a button used)"
-                  : "controllers: the VR controllers' triggers and grips left out (the keyboard's steering, throttle or brake used)");
+    {
+        static const char* const kControls[] = { "steering left", "steering right", "throttle", "brake" };
+        if (inUse)
+            Log("controllers: the VR controllers' triggers and grips count (%s used)", used);
+        else
+            Log("controllers: the VR controllers' triggers and grips left out (the keyboard's %s used)", kControls[key]);
+    }
     g_vrPadInUse = inUse;
 }
 
@@ -1887,7 +1904,8 @@ bool ControllersWheelTurn(float& turn)
 // Start Enter ("press START") and Back Esc; while driving the menu button and Start Esc (the pause), and [VR]
 // PauseButton too, which also continues the race from its pause. What a button presses is chosen as it goes down and
 // held until it comes up. Not while a control waits for its new key or button (Configure controls), nor in a replay.
-// The Steam release presses the menus' keys for Xbox controllers itself (fo2_zoom.dll; see ControllersMenuKeys).
+// The Steam release presses the menus' keys for Xbox controllers itself (fo2_zoom.dll) in its menus and races, the mod
+// over its intro videos (see ControllersMenuKeys).
 namespace {
 
 enum Press
@@ -2086,12 +2104,22 @@ void ControllersMenuKeys()
     // SendInput: A Enter, B Esc, Start Esc while driving and Enter in the menus, Y Delete, the D-pad and the left
     // thumbstick the arrows, the triggers Page Up and Page Down. The mod's presses came on top of its: every press
     // moved the menus twice (the pause menu's selection two icons on) and Start paused the race and went on with it at
-    // once. There the Xbox controllers are left to it (the mod still makes them vibrate).
-    static const bool zoomPadKeys = [] {
-        bool zoom = GetModuleHandleW(L"fo2_zoom.dll") != nullptr;
-        if (zoom) Log("controllers: Xbox controllers press the menus' keys through fo2_zoom.dll (the Steam release's own), not the mod");
-        return zoom;
-    }();
+    // once. There the Xbox controllers are left to it (the mod still makes them vibrate) where it presses their keys: only
+    // with the game's flow in its menus or a race (its state 1 or 2), not over the intro videos before them, which an
+    // Xbox controller's A or Start (Enter) did not skip there. Over those the mod presses them.
+    static const bool zoom = GetModuleHandleW(L"fo2_zoom.dll") != nullptr;
+    BYTE* gf = *(BYTE**)fo2::kGameFlow;
+    int gameState = gf ? *(int*)(gf + fo2::kGameState) : -1;
+    bool zoomPadKeys = zoom && (gameState == 1 || gameState == 2);
+    static int zoomLogged = -1;
+    if (zoom && (int)zoomPadKeys != zoomLogged)
+    {
+        zoomLogged = zoomPadKeys;
+        if (zoomPadKeys)
+            Log("controllers: Xbox controllers press the menus' keys through fo2_zoom.dll (the Steam release's own), not the mod");
+        else
+            Log("controllers: Xbox controllers press the menus' keys through the mod while fo2_zoom.dll's do not (game state %d: the intro)", gameState);
+    }
     if (LoadXInput())
     {
         ScanXInput(!driving);
@@ -2100,7 +2128,7 @@ void ControllersMenuKeys()
             XINPUT_STATE x = {};
             bool connected = g_xinputConnected[u] && g_xinputGetState(u, &x) == ERROR_SUCCESS;
             g_xinputConnected[u] = connected;
-            if (zoomPadKeys) continue;
+            if (zoomPadKeys) x = {};  // (fo2_zoom.dll's: what the mod held is let go)
             const XINPUT_GAMEPAD& g = x.Gamepad;
             const float stick[2] = { g.sThumbLX / 32767.0f, g.sThumbLY / 32767.0f };
             bool w[4] = {};

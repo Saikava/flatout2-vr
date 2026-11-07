@@ -135,8 +135,9 @@ the cockpit's wheel turns (`WheelTurn`).
 ### Gamepads
 
 The game's menus take only the keyboard; with the mod an Xbox controller works them too: the left
-thumbstick or the D-pad moves, A or Start selects, B or Back goes back, and Start pauses a race (the Steam
-release does this itself, much the same, and the mod leaves it to the game there). With Force
+thumbstick or the D-pad moves, A or Start selects (and skips the intro videos), B or Back goes back, and Start
+pauses a race (the Steam release does this itself in its menus and races, much the same, and the mod leaves those
+to the game there). With Force
 feedback On in the game's options, an Xbox controller vibrates in crashes (and with `EngineRumble` with the
 engine's revs). In VR the game goes on, with its controllers and its sound, when its window on the monitor
 loses the focus: switch to another program and the game's window goes under it. Other programs may not take
