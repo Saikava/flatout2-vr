@@ -46,8 +46,11 @@ const Show& CurrentShow();
 IDirect3DTexture9* FontTexture(IDirect3DDevice9* dev);
 void ReleaseFont();
 
-// Draws the lyrics into the bound render target, at the bottom of the eye's picture: x, y, w, h in
-// pixels of it, the eye's field of view (tan units) to size and place the text as the markers are.
-void Draw(IDirect3DDevice9* dev, float x, float y, float w, float h, float tanLeft, float tanRight, float tanDown, float tanUp);
+// Draws the lyrics into the bound render target: x, y, w, h in pixels, the eye's field of view
+// (tan units). When in a race and cam is provided, renders the lyrics in 3D attached to the rear
+// bumper of the player's car in chase view; otherwise draws as a 2D overlay at the bottom.
+void Draw(IDirect3DDevice9* dev, float x, float y, float w, float h,
+          float tanLeft, float tanRight, float tanDown, float tanUp,
+          const void* cam = nullptr);
 
 }  // namespace lyrics

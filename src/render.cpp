@@ -6227,7 +6227,7 @@ bool RenderVrEyes(IDirect3DDevice9* dev, BYTE* ctx, BYTE** cams, float* fovScale
         if (cockpit) DrawCockpitCards(dev, cam, eye);
         DrawMarkers(dev, cam);
         if (g_cfg.lyricsEnabled && lyrics::CurrentShow().count > 0)
-            lyrics::Draw(dev, 0, 0, (float)g_vrt.w, (float)g_vrt.h, fov[eye].left, fov[eye].right, fov[eye].down, fov[eye].up);
+            lyrics::Draw(dev, 0, 0, (float)g_vrt.w, (float)g_vrt.h, fov[eye].left, fov[eye].right, fov[eye].down, fov[eye].up, cam);
         g_vrEye.active = false;
         IDirect3DSurface9* s = nullptr;
         if (SUCCEEDED(g_vrt.tex[eye]->GetSurfaceLevel(0, &s)))
