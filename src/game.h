@@ -597,6 +597,25 @@ constexpr uintptr_t kKeysHeld = 0x8DA740;    // int
 // The game's import of GetProcAddress, through which its sound (FMOD 3.75, built in) gets DirectSoundCreate8.
 constexpr uintptr_t kIatGetProcAddress = 0x6521C8;
 
+// ---- music --------------------------------------------------------------------------------------
+// The game's music (FMOD 3.75, built into the exe) plays one of three playlists: 1 in the menus and the
+// title screen, 2 in stunt events, 3 in races (music/playlist_*.bed: File, Artist, Song, StartPos for
+// each entry). The playlist advances in 0x41D5D0 (called every frame while a playlist is loaded): it
+// stops the current song (0x41DA80), then calls MusicPlay from one of these three return-address-checked
+// sites, one per playlist (eax the playlist's id, ecx the entry's StartPos, the .ogg's path on the stack,
+// bl whether it loops; cdecl - the caller cleans the one pushed argument). MusicPlay opens the stream
+// (0x619790), plays it and stores: the playlist's id (int, 1..3), the stream, the channel, and its state
+// (int: 0 stopped, 1 playing, 2 playing fading in, 3 playing fading in from a resume, 4 fading out to a
+// stop, 5 paused, 7 restarting). A pause/resume keeps the song (only the state changes), so a song's
+// position is its StartPos plus the time spent in the playing states.
+constexpr uintptr_t kMusicPlay = 0x41CB60;
+constexpr uintptr_t kMusicPlayCall[3] = { 0x41D6C0, 0x41D7F2, 0x41D960 };
+constexpr uintptr_t kMusicPlaylist = 0x8DA4B0;  // int: 1 menus, 2 stunts, 3 races
+constexpr uintptr_t kMusicState = 0x8DA4BC;      // int (see above)
+// What the game's music banner shows (only the menus' and the stunts' playlists fill the artist and the
+// song; in races both point at an empty string): the entry's index in its playlist, the artist, the song.
+constexpr uintptr_t kMusicBanner = 0x6B2C40;   // int; char* artist at +4, char* song at +8
+
 // ---- exit ----------------------------------------------------------------------------------------
 // The game's import of ExitProcess (the same in the Steam release's FlatOut2.exe). Closing its window (Alt+F4, or Quit in
 // the menus) ends its main loop and its shutdown (the options written back); its C runtime then calls ExitProcess

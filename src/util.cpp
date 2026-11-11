@@ -194,6 +194,20 @@ void LoadConfig()
     float range = IniFloat(p, L"VR", L"WheelRange", d.vrWheelRange);
     g_cfg.vrWheelRange = range > 0 ? std::clamp(range, 90.0f, 3600.0f) : 0.0f;
     g_cfg.vrEngineRumble = std::clamp(IniFloat(p, L"VR", L"EngineRumble", d.vrEngineRumble), 0.0f, 1.0f);
+    // [Lyrics]
+    g_cfg.lyricsEnabled = GetPrivateProfileIntW(L"Lyrics", L"Lyrics", d.lyricsEnabled, p) != 0;
+    g_cfg.lyricsLines = std::clamp((int)GetPrivateProfileIntW(L"Lyrics", L"Lines", d.lyricsLines, p), 1, 6);
+    g_cfg.lyricsScale = std::clamp(IniFloat(p, L"Lyrics", L"Scale", d.lyricsScale), 0.5f, 3.0f);
+    g_cfg.lyricsY = std::clamp(IniFloat(p, L"Lyrics", L"Y", d.lyricsY), 0.1f, 0.95f);
+    {
+        wchar_t buf[16] = L"";
+        GetPrivateProfileStringW(L"Lyrics", L"Colour", L"", buf, 16, p);
+        unsigned colour = buf[0] ? (unsigned)wcstoul(buf, nullptr, 16) : d.lyricsColour;
+        g_cfg.lyricsColour = colour ? colour : d.lyricsColour;
+        GetPrivateProfileStringW(L"Lyrics", L"SungColour", L"", buf, 16, p);
+        colour = buf[0] ? (unsigned)wcstoul(buf, nullptr, 16) : d.lyricsSungColour;
+        g_cfg.lyricsSungColour = colour ? colour : d.lyricsSungColour;
+    }
     g_cfg.keyRecenter = GetPrivateProfileIntW(L"Keys", L"Recenter", d.keyRecenter, p);
     g_cfg.logIntervalSeconds = IniFloat(p, L"Log", L"IntervalSeconds", d.logIntervalSeconds);
     g_cfg.keyScreenshot = GetPrivateProfileIntW(L"Keys", L"Screenshot", d.keyScreenshot, p);

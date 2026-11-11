@@ -10,6 +10,7 @@
 #include "eyeshare.h"
 #include "game.h"
 #include "largeaddress.h"
+#include "lyrics.h"
 #include "mirrorglass.h"
 #include "pacing.h"
 #include "profile.h"
@@ -467,8 +468,28 @@ void LogEyeCall(const char* what, const unsigned ret[3], const std::string& deta
 }
 
 using SpriteFn = void(__thiscall*)(void* self, const void* data);
-const auto oSpriteRect = (SpriteFn)fo2::kSpriteRect;
-const auto oSpriteQuad = (SpriteFn)fo2::kSpriteQuad;
+// (the function each slot held when hooked: the game's own, or another module's that already hooked it, like the
+// Steam release's fo2_zoom.dll, which then still gets called)
+SpriteFn oSpriteRect = (SpriteFn)fo2::kSpriteRect;
+SpriteFn oSpriteQuad = (SpriteFn)fo2::kSpriteQuad;
+
+// Hooks a vtable slot that holds `expected` or a function of another loaded module (chained: `orig` gets that function).
+bool PatchPointerChained(uintptr_t slot, uintptr_t expected, const void* hook, SpriteFn& orig)
+{
+    uintptr_t cur = *(const uintptr_t*)slot;
+    if (cur != expected)
+    {
+        HMODULE m = nullptr;
+        if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)cur, &m) ||
+            !m || m == GetModuleHandleW(nullptr))
+            return PatchPointer(slot, expected, hook);  // (logs the mismatch)
+        char name[MAX_PATH] = "?";
+        GetModuleFileNameA(m, name, MAX_PATH);
+        Log("PatchPointer %08X: holds %08X in %s, chained", (unsigned)slot, (unsigned)cur, name);
+    }
+    orig = (SpriteFn)cur;
+    return PatchPointer(slot, cur, hook);
+}
 
 // The game darkens the whole screen with the HUD (when the car is reset, behind a dialog; see game.h):
 // in VR that would land on the HUD panel alone, a dark sheet floating in front of the player. Their
@@ -1229,6 +1250,7 @@ void ReleaseVrTargets()
     if (g_vrt.screenResolve) g_vrt.screenResolve->Release();
     g_vrt = VrTargets();
     ReleaseHudTargets();
+    lyrics::ReleaseFont();
     g_gpu.Release();
 }
 
@@ -1358,6 +1380,15 @@ void SubmitVrScreen(IDirect3DDevice9* dev)
                 src = g_vrt.screenResolve;
             }
             ok = ok && SUCCEEDED(dev->StretchRect(src, nullptr, s, nullptr, D3DTEXF_NONE));
+            if (ok && g_cfg.lyricsEnabled && lyrics::CurrentShow().count > 0)
+            {
+                IDirect3DSurface9* oldRT = nullptr;
+                dev->GetRenderTarget(0, &oldRT);
+                dev->SetRenderTarget(0, s);
+                lyrics::Draw(dev, 0, 0, (float)d.Width, (float)d.Height, -1, 1, -1, 1);
+                dev->SetRenderTarget(0, oldRT);
+                if (oldRT) oldRT->Release();
+            }
             s->Release();
             if (!ok && !g_screenFailLogged)
             {
@@ -2318,6 +2349,13 @@ int __fastcall EnginePresentHook(void* self, void*)
     }
     rec::MenuTick();
     if (!InRace()) ForgetRaceState();
+    {
+        // The songs' clock (lyrics.h): advances while the game's music plays.
+        static double lastTick = 0;
+        double tickNow = NowSeconds();
+        lyrics::Tick(lastTick > 0 ? tickNow - lastTick : 0.0);
+        lastTick = tickNow;
+    }
     if (xr::Available()) NoteFocus(dev);
     if (g_renderViewsEnd > 0)
     {
@@ -6186,6 +6224,8 @@ bool RenderVrEyes(IDirect3DDevice9* dev, BYTE* ctx, BYTE** cams, float* fovScale
         prof::TraceDraws(false);  // a frame trace lists the left eye's draws only
         if (cockpit) DrawCockpitCards(dev, cam, eye);
         DrawMarkers(dev, cam);
+        if (g_cfg.lyricsEnabled && lyrics::CurrentShow().count > 0)
+            lyrics::Draw(dev, 0, 0, (float)g_vrt.w, (float)g_vrt.h, fov[eye].left, fov[eye].right, fov[eye].down, fov[eye].up);
         g_vrEye.active = false;
         IDirect3DSurface9* s = nullptr;
         if (SUCCEEDED(g_vrt.tex[eye]->GetSurfaceLevel(0, &s)))
@@ -6376,8 +6416,8 @@ bool InstallRenderHooks()
     if (!PatchCall(fo2::kRenderViewsCall, fo2::kRenderViews, (const void*)&RenderViewsHook)) return false;
     bool ok = PatchCall(fo2::kLensFlareCall, fo2::kLensFlare, (const void*)&LensFlareHook);
     ok &= PatchCall(fo2::kSunGlowCall, fo2::kSunGlow, (const void*)&SunGlowHook);
-    ok &= PatchPointer(fo2::kSlotSpriteRect, fo2::kSpriteRect, (const void*)&SpriteRectHook);
-    ok &= PatchPointer(fo2::kSlotSpriteQuad, fo2::kSpriteQuad, (const void*)&SpriteQuadHook);
+    ok &= PatchPointerChained(fo2::kSlotSpriteRect, fo2::kSpriteRect, (const void*)&SpriteRectHook, oSpriteRect);
+    ok &= PatchPointerChained(fo2::kSlotSpriteQuad, fo2::kSpriteQuad, (const void*)&SpriteQuadHook, oSpriteQuad);
     if (!prof::HookParticles()) Log("profiler: particle call differs - not timed");
     if (!PatchTrailFill()) Log("particles: trail fill differs - not patched");
     if (g_cfg.vrEnabled && !PatchLodDistance(g_cfg.vrLodDistance)) Log("level of detail: code differs - distances unchanged");

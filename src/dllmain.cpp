@@ -3,6 +3,7 @@
 #include "d3dcreate.h"
 #include "game.h"
 #include "largeaddress.h"
+#include "lyrics.h"
 #include "pacing.h"
 #include "record.h"
 #include "render.h"
@@ -57,6 +58,52 @@ static void WINAPI ExitProcessHook(UINT code)
     g_exitProcess(code);
 }
 
+// Logs the faults (access violations, breakpoints, stack overflows...) as they are raised: the game's own handler
+// (or fo2_zoom.dll's) may end the process with the exception's code and nothing more. Where, in which module, the
+// registers and the stack's return addresses.
+static LONG CALLBACK FaultLogger(EXCEPTION_POINTERS* ep)
+{
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    if (code != 0x80000003 && code != 0x80000002 && (code >> 28) != 0xC) return EXCEPTION_CONTINUE_SEARCH;
+    static LONG count;
+    if (InterlockedIncrement(&count) > 12) return EXCEPTION_CONTINUE_SEARCH;
+    auto where = [](uintptr_t a, char* out, size_t n) {
+        HMODULE m = nullptr;
+        char name[MAX_PATH] = "?";
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)a, &m) && m)
+        {
+            GetModuleFileNameA(m, name, MAX_PATH);
+            const char* base = strrchr(name, '\\');
+            snprintf(out, n, "%s+%X", base ? base + 1 : name, (unsigned)(a - (uintptr_t)m));
+        }
+        else
+            snprintf(out, n, "%08X", (unsigned)a);
+    };
+    const CONTEXT* c = ep->ContextRecord;
+    char w[300];
+    where((uintptr_t)ep->ExceptionRecord->ExceptionAddress, w, sizeof(w));
+    Log("FAULT %08X at %s (thread %lu), info %08X %08X; eax %08X ebx %08X ecx %08X edx %08X esi %08X edi %08X ebp %08X esp %08X",
+        (unsigned)code, w, GetCurrentThreadId(), (unsigned)ep->ExceptionRecord->ExceptionInformation[0],
+        (unsigned)ep->ExceptionRecord->ExceptionInformation[1], (unsigned)c->Eax, (unsigned)c->Ebx, (unsigned)c->Ecx,
+        (unsigned)c->Edx, (unsigned)c->Esi, (unsigned)c->Edi, (unsigned)c->Ebp, (unsigned)c->Esp);
+    const uintptr_t* sp = (const uintptr_t*)c->Esp;
+    int shown = 0;
+    for (int i = 0; i < 400 && shown < 14; i++)
+    {
+        if (IsBadReadPtr(sp + i, sizeof(*sp))) break;
+        uintptr_t v = sp[i];
+        HMODULE m = nullptr;
+        if (v > 0x10000 && GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)v, &m) && m)
+        {
+            where(v, w, sizeof(w));
+            Log("  stack[%d]: %s", i, w);
+            shown++;
+        }
+    }
+    _flushall();
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 static void InstallExitHook()
 {
     ExitProcessFn current = *(ExitProcessFn*)fo2::kIatExitProcess;
@@ -72,6 +119,7 @@ static void Init()
     WaitForOldGame();
     LogInit(ModuleDir() + L"FO2VR.log");
     LoadConfig();
+    AddVectoredExceptionHandler(1, FaultLogger);
 
     char exe[MAX_PATH];
     GetModuleFileNameA(nullptr, exe, MAX_PATH);
@@ -99,11 +147,14 @@ static void Init()
     InstallBackground();
     InstallControllers();
     InstallSound();
+    lyrics::Install();
     rec::Install();
     StartInCockpit();
     PutAwayOldDxvk();
     if (g_cfg.vrEnabled) InstallExitHook();
     if (g_cfg.vrEnabled || BackgroundMode()) Log("Direct3DCreate9 hook %s", InstallCreateHook() ? "installed" : "FAILED");
+    Log("config: Lyrics %d (%d lines, scale %.2f, y %.2f, colours %06X/%06X)", g_cfg.lyricsEnabled ? 1 : 0, g_cfg.lyricsLines,
+        g_cfg.lyricsScale, g_cfg.lyricsY, g_cfg.lyricsColour, g_cfg.lyricsSungColour);
 }
 
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID)

@@ -18,6 +18,7 @@ if (-not $Out) { $Out = Join-Path $repo "build\release" }
 $stage = Join-Path $Out "FlatOut2-VR-$Version"
 if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
 New-Item -ItemType Directory -Force "$stage\scripts\FO2VR-licenses" | Out-Null
+New-Item -ItemType Directory -Force "$stage\scripts\lyrics" | Out-Null
 
 Copy-Item $AsiLoader "$stage\winmm.dll"
 Copy-Item $Dxvk "$stage\scripts\dxvk_d3d9.dll"
@@ -25,6 +26,7 @@ Copy-Item "$repo\build\FO2VR.asi" "$stage\scripts\"
 Copy-Item "$repo\build\wineopenxr.dll" "$stage\scripts\"
 Copy-Item "$repo\third_party\openxr\bin\openxr_loader.dll" "$stage\scripts\"
 Copy-Item "$repo\install\FO2VR.ini" "$stage\scripts\"
+Copy-Item "$repo\install\lyrics\*" "$stage\scripts\lyrics\"
 Copy-Item "$repo\README.md" "$stage\scripts\FO2VR-README.md"
 Copy-Item "$repo\LICENSE" "$stage\scripts\FO2VR-licenses\FO2VR.txt"
 Copy-Item "$repo\install\licenses\*" "$stage\scripts\FO2VR-licenses\"

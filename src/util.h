@@ -82,6 +82,13 @@ struct Config
     float vrWheelTurn = 90.0f;        // GrabWheel: the hands' turn for full lock, degrees
     float vrWheelRange = 0.0f;        // a steering wheel's turn from lock to lock, degrees: the cockpit's wheel turns as it (0 = as the car's steering)
     float vrEngineRumble = 0.0f;      // the engine's revs and throttle as a steady vibration, this strong (0 = none)
+    // [Lyrics]
+    bool lyricsEnabled = true;       // the songs' lyrics, karaoke style, in the headset (lyrics\*.lrc next to the mod)
+    int lyricsLines = 3;             // how many lines show at once (1..6)
+    float lyricsScale = 1.0f;        // the text's size, this many times as tall
+    float lyricsY = 0.60f;           // in-race vertical position on screen (0.0 = top, 1.0 = bottom; default 0.60)
+    uint32_t lyricsColour = 0x00FFFFFF;      // the words not yet sung (0x00BBGGRR)
+    uint32_t lyricsSungColour = 0x0000FF00;  // the words already sung (0x00BBGGRR)
     // [Log]
     float logIntervalSeconds = 2.0f;
     // [Keys]

@@ -25,6 +25,7 @@ add_library(FO2VR SHARED
   src/eyeshare.cpp
   src/fo2vr.manifest
   src/largeaddress.cpp
+  src/lyrics.cpp
   src/pacing.cpp
   src/profile.cpp
   src/record.cpp
@@ -52,7 +53,8 @@ target_compile_options(wineopenxr PRIVATE /W4 /permissive-)
 add_dependencies(FO2VR wineopenxr)
 
 add_custom_command(TARGET FO2VR POST_BUILD
-  COMMAND ${CMAKE_COMMAND} -E make_directory "${FO2_GAME_DIR}/scripts"
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${FO2_GAME_DIR}/scripts/lyrics"
+  COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_SOURCE_DIR}/install/lyrics" "${FO2_GAME_DIR}/scripts/lyrics"
   COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:FO2VR>" "${FO2_GAME_DIR}/scripts/"
   COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_PDB_FILE:FO2VR>" "${FO2_GAME_DIR}/scripts/"
   COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:wineopenxr>" "${FO2_GAME_DIR}/scripts/"
@@ -81,7 +83,8 @@ foreach(dir IN LISTS FO2_EXTRA_GAME_DIRS)
     continue()
   endif()
   list(APPEND extra_install
-    COMMAND ${CMAKE_COMMAND} -E make_directory "${dir}/scripts"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${dir}/scripts/lyrics"
+    COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_SOURCE_DIR}/install/lyrics" "${dir}/scripts/lyrics"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:FO2VR>" "$<TARGET_FILE:wineopenxr>"
             "${OPENXR_DIR}/bin/openxr_loader.dll" "${dir}/scripts/"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_SOURCE_DIR}/README.md" "${dir}/scripts/FO2VR-README.md")

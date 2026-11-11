@@ -37,6 +37,8 @@ without SteamVR? Change one line in the settings: see [Runtimes](#runtimes).
 - **Effects made right for VR**: the sun's glow and lens flare, particle streaks and sparks, the stunt
   cars' jet flames, the speed blur and speed zoom, the colour grading, and the stunt stadium's video
   screens. Each matches in both eyes. Fades to black cover the whole view.
+- **The songs' lyrics, karaoke style**: the words at the bottom of the view, brightening as they are
+  sung. Soundtrack lyrics are included in `scripts\lyrics\` (or add your own `.lrc` files). See [Lyrics](#lyrics).
 - **Longer view distances** for the headset: full model detail and grass much further out.
   Everything is configurable.
 - **VR controllers and gamepads**: drive with the VR controllers (thumbstick and triggers), and work the
@@ -76,8 +78,8 @@ the runtime itself.
 - `scripts\dxvk_d3d9.dll`: the 32-bit [DXVK](https://github.com/doitsujin/dxvk) (its `d3d9.dll`), which
   the mod needs to hand the game's picture to the headset: the mod loads it for the game in VR (without VR the
   game draws with Windows' Direct3D, as without the mod);
-- `scripts\FO2VR.asi`, `scripts\FO2VR.ini`, `scripts\openxr_loader.dll`, `scripts\wineopenxr.dll`:
-  the mod.
+- `scripts\FO2VR.asi`, `scripts\FO2VR.ini`, `scripts\openxr_loader.dll`, `scripts\wineopenxr.dll`,
+  and `scripts\lyrics\*.lrc`: the mod.
 
 To uninstall, delete these files.
 
@@ -194,6 +196,42 @@ menus too, as there without the mod (that release's own controller support).
 | `GrabWheel` | 0 | Experimental: the VR controllers' grips take hold of the cockpit's steering wheel, which your hands then turn (instead of shifting gears) |
 | `WheelTurn` | 90 | How far your hands turn the wheel for full lock, degrees (at 90 the cockpit's wheel turns with them; more: slower steering) |
 | `WheelRange` | 0 | A steering wheel as the game controller: its range from lock to lock, degrees (as set in its software; 900 for most). The cockpit's steering wheel then turns as yours, up to its lock at 90 degrees either way (see [Steering wheels](#steering-wheels); 0: as the game steers the car, slower and less at speed) |
+
+### Lyrics
+
+Section `[Lyrics]` of `scripts\FO2VR.ini`:
+
+| Setting | Default | |
+| --- | --- | --- |
+| `Lyrics` | 1 | The songs' lyrics in the headset, karaoke style (0: off) |
+| `Lines` | 3 | How many lines show at once, the newest at the bottom (1-6) |
+| `Scale` | 1.0 | The text's size, this many times as tall (0.5-3) |
+| `Colour` | FFFFFF | The words not yet sung, `0xBBGGRR` hex |
+| `SungColour` | 00FF00 | The words already sung, `0xBBGGRR` hex |
+
+The lyrics for the game's soundtrack songs are included in `scripts\lyrics\`, next to `FO2VR.ini`,
+matched to each track by its `[ti:]` title and `[ar:]` artist tags, or by file name (`01.lrc` for
+`data/songs1/01.ogg`). You can also add or edit `.lrc` files there for any custom tracks.
+
+Two forms are read: the standard
+
+```
+[ti:Song title]
+[ar:Artist]
+[00:12.34]First line
+[00:15.60]Second line
+```
+
+with one time per line, and the extended `<mm:ss.xx>` form with each word's own time, so the words
+brighten one by one:
+
+```
+[00:12.34]<00:12.34>First <00:12.90>line
+```
+
+`[offset:+200]` shifts the whole file's timings. UTF-8 (with or without a BOM) and UTF-16 files are read,
+so Cyrillic and any other letters work. While the game's music plays the lines follow its clock: paused
+with it, restarted when the playlist moves to the next song.
 
 ## Troubleshooting
 
