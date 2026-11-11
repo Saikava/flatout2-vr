@@ -415,7 +415,6 @@ void OnPlay(int playlist, int lenBytes, const void* data)
     g_position = 0.0;
     g_song = -1;
     g_racing = playlist == 2 || playlist == 3;
-    if (!g_cfg.lyricsEnabled) return;
     if (!g_songsRead || g_songs.empty()) ReadSongs();
 
     std::string artist, title;
@@ -492,7 +491,6 @@ static __declspec(naked) void MusicPlayHook()
 
 bool Install()
 {
-    if (!g_cfg.lyricsEnabled) return true;
     if (!g_cfg.vrEnabled) return true;
     bool ok = true;
     for (uintptr_t site : fo2::kMusicPlayCall)
@@ -502,9 +500,16 @@ bool Install()
         Log("lyrics: the game's music play calls differ - no lyrics");
         return false;
     }
-    Log("lyrics: the game's music play calls hooked (the songs' lyrics from lyrics\\*.lrc, [Lyrics] Lyrics=%d)",
+    Log("lyrics: the game's music play calls hooked (lyrics from scripts\\lyrics\\*.lrc, [Lyrics] Lyrics=%d)",
         g_cfg.lyricsEnabled ? 1 : 0);
     return true;
+}
+
+void Toggle()
+{
+    g_cfg.lyricsEnabled = !g_cfg.lyricsEnabled;
+    SaveIniValue("Lyrics", "Lyrics", g_cfg.lyricsEnabled ? "1" : "0");
+    Log("Lyrics key: Lyrics=%d (%s)", g_cfg.lyricsEnabled ? 1 : 0, g_cfg.lyricsEnabled ? "on" : "off");
 }
 
 // The song's clock: the playing states advance it (see game.h), the others hold it.

@@ -2263,6 +2263,7 @@ static __declspec(naked) void DynamicBatchDrawHook()
 // is over (PlayerRunOver). The Hud key switches between 1 and 2.
 constexpr int kRaceStateRacing = 8;
 bool g_hudKeyWasDown;
+bool g_lyricsKeyWasDown;
 int g_lastPhysicsSteps, g_framesWithoutStep;
 bool g_hudLeftOut;
 
@@ -2398,6 +2399,7 @@ int __fastcall EnginePresentHook(void* self, void*)
     shot |= (bg & kPollShot) != 0;
     if ((bg & kPollTrace) && g_trace != Trace::Running) g_trace = Trace::Armed;
     if (KeyPressed(g_cfg.keyHud, g_hudKeyWasDown) || (bg & kPollHud)) ToggleHud();
+    if (KeyPressed(g_cfg.keyLyrics, g_lyricsKeyWasDown)) lyrics::Toggle();
     if (bg & kPollEject) ThrowDriverOut();
     char knockSide;
     int knockState;

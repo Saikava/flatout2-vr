@@ -94,6 +94,7 @@ The game's controls are unchanged.
 | --- | --- |
 | F8  | Recenter the view (sit as you want to sit in the car and press it) |
 | F9  | Hide the HUD while racing, or bring it back (it still shows for the countdown, the pause menu and the results); kept for the next game |
+| F10 | Toggle karaoke lyrics on or off; kept for the next game |
 | Numpad 8 2 4 6, + - | Move the view against the car while held: up, down, left, right, forward, back (slowly at first), e.g. to sit a little lower in the cockpit. Numpad 5 puts it back. The view stays where you left it for the next game. Num Lock must be on |
 | F11 | Screenshot of the monitor, both eyes and the HUD (into `scripts\shots\`) |
 
@@ -203,7 +204,7 @@ Section `[Lyrics]` of `scripts\FO2VR.ini`:
 
 | Setting | Default | |
 | --- | --- | --- |
-| `Lyrics` | 1 | The songs' lyrics in the headset, karaoke style (0: off) |
+| `Lyrics` | 0 | The songs' lyrics in the headset, karaoke style (1: on, 0: off; F10 toggles it) |
 | `Lines` | 3 | How many lines show at once, the newest at the bottom (1-6) |
 | `Scale` | 1.0 | The text's size, this many times as tall (0.5-3) |
 | `Colour` | FFFFFF | The words not yet sung, `0xBBGGRR` hex |

@@ -212,6 +212,7 @@ void LoadConfig()
     g_cfg.logIntervalSeconds = IniFloat(p, L"Log", L"IntervalSeconds", d.logIntervalSeconds);
     g_cfg.keyScreenshot = GetPrivateProfileIntW(L"Keys", L"Screenshot", d.keyScreenshot, p);
     g_cfg.keyHud = GetPrivateProfileIntW(L"Keys", L"Hud", d.keyHud, p);
+    g_cfg.keyLyrics = GetPrivateProfileIntW(L"Keys", L"Lyrics", d.keyLyrics, p);
     g_cfg.keyCameraUp = GetPrivateProfileIntW(L"Keys", L"CameraUp", d.keyCameraUp, p);
     g_cfg.keyCameraDown = GetPrivateProfileIntW(L"Keys", L"CameraDown", d.keyCameraDown, p);
     g_cfg.keyCameraLeft = GetPrivateProfileIntW(L"Keys", L"CameraLeft", d.keyCameraLeft, p);

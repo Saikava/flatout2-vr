@@ -83,7 +83,7 @@ struct Config
     float vrWheelRange = 0.0f;        // a steering wheel's turn from lock to lock, degrees: the cockpit's wheel turns as it (0 = as the car's steering)
     float vrEngineRumble = 0.0f;      // the engine's revs and throttle as a steady vibration, this strong (0 = none)
     // [Lyrics]
-    bool lyricsEnabled = true;       // the songs' lyrics, karaoke style, in the headset (lyrics\*.lrc next to the mod)
+    bool lyricsEnabled = false;      // the songs' lyrics, karaoke style, in the headset (lyrics\*.lrc next to the mod; default off)
     int lyricsLines = 3;             // how many lines show at once (1..6)
     float lyricsScale = 1.0f;        // the text's size, this many times as tall
     float lyricsY = 0.60f;           // in-race vertical position on screen (0.0 = top, 1.0 = bottom; default 0.60)
@@ -95,6 +95,7 @@ struct Config
     int keyScreenshot = 0x7A;  // F11
     int keyRecenter = 0x77;    // F8
     int keyHud = 0x78;         // F9: Hud 1 <-> 2
+    int keyLyrics = 0x79;      // F10: lyrics on/off
     // [VR] CameraOffset while held (the numeric keypad: 8 2 4 6, + -), and back to 0 (5)
     int keyCameraUp = 0x68, keyCameraDown = 0x62, keyCameraLeft = 0x64, keyCameraRight = 0x66;
     int keyCameraForward = 0x6B, keyCameraBack = 0x6D, keyCameraReset = 0x65;

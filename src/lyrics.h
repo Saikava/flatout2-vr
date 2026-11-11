@@ -15,6 +15,9 @@ bool Install();
 // the last call.
 void Tick(double dt);
 
+// Toggles lyrics display on/off and writes the setting to FO2VR.ini.
+void Toggle();
+
 // The lines of the playing song, in order, with the words not yet sung and those already sung (when the
 // .lrc file tells each word's time): up to `linesShown` lines around the song's position, each faded in
 // and out over its first and last kFade seconds. An empty out when nothing is to show.
