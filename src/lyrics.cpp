@@ -594,6 +594,7 @@ struct Glyph
 {
     RECT uv;       // in the atlas' pixels
     float advance; // the letter's width
+    float ox;      // left bearing (gmptGlyphOrigin.x)
 };
 struct Font
 {
@@ -620,8 +621,21 @@ bool BuildFont(IDirect3DDevice9* dev)
     use[L' '] = true;  // the space between the words, always
     HDC dc = GetDC(nullptr);
     HDC mem = CreateCompatibleDC(dc);
-    HFONT font = CreateFontW(-kFontPx, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-                             CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Arial");
+    const wchar_t* candidateFonts[] = {
+        L"Franklin Gothic Heavy",
+        L"Franklin Gothic Demi Cond",
+        L"Franklin Gothic Medium Cond",
+        L"Franklin Gothic Medium",
+        L"Impact",
+        L"Arial"
+    };
+    HFONT font = nullptr;
+    for (const wchar_t* face : candidateFonts)
+    {
+        font = CreateFontW(-kFontPx, 0, 0, 0, FW_HEAVY, TRUE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                           CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE, face);
+        if (font) break;
+    }
     if (!font)
     {
         DeleteDC(mem);
@@ -631,6 +645,8 @@ bool BuildFont(IDirect3DDevice9* dev)
     HGDIOBJ old = SelectObject(mem, font);
     TEXTMETRICW tm = {};
     GetTextMetricsW(mem, &tm);
+    wchar_t actualFace[64] = {};
+    GetTextFaceW(mem, 64, actualFace);
     int cellH = std::max((int)tm.tmHeight, kFontPx);
     g_font.lineHeight = cellH;
 
@@ -675,7 +691,8 @@ bool BuildFont(IDirect3DDevice9* dev)
         std::vector<BYTE> bits(need);
         if (GetGlyphOutlineW(mem, ch, GGO_GRAY8_BITMAP, &gm, need, bits.data(), &unit) == GDI_ERROR) continue;
 
-        int cellW = std::max(width, std::max(0, (int)gm.gmptGlyphOrigin.x) + (int)gm.gmBlackBoxX);
+        int cellW = (int)gm.gmBlackBoxX;
+        if (cellW <= 0) continue;
         if (x + cellW + 1 > kAtlas)
         {
             x = 1;
@@ -687,18 +704,18 @@ bool BuildFont(IDirect3DDevice9* dev)
         // GGO_GRAY8_BITMAP rows are DWORD-aligned, with grey values 0..64.
         int gw = std::min((int)gm.gmBlackBoxX, kAtlas), gh = std::min((int)gm.gmBlackBoxY, kAtlas);
         int stride = ((int)gm.gmBlackBoxX + 3) & ~3;
-        int gox = x + std::max(0, (int)gm.gmptGlyphOrigin.x);
         int goy = y + tm.tmAscent - gm.gmptGlyphOrigin.y;
         for (int r = 0; r < gh; r++)
             for (int col = 0; col < gw; col++)
             {
-                int px2 = gox + col, py2 = goy + r;
+                int px2 = x + col, py2 = goy + r;
                 if (px2 < x || px2 >= x + cellW || px2 >= kAtlas || py2 < y || py2 >= y + cellH || py2 >= kAtlas) continue;
                 DWORD a = r * stride + col < (int)bits.size() ? bits[r * stride + col] : 0;
                 a = std::min(a, 64ul) * 255 / 64;
                 px[py2 * lock.Pitch / 4 + px2] = 0x00FFFFFF | (a << 24);
             }
         g_font.glyph[c].uv = { x, y, x + cellW, y + cellH };
+        g_font.glyph[c].ox = (float)gm.gmptGlyphOrigin.x;
         x += cellW + 2;
         row = std::max(row, cellH);
     }
@@ -708,7 +725,7 @@ bool BuildFont(IDirect3DDevice9* dev)
     DeleteDC(mem);
     ReleaseDC(nullptr, dc);
     g_font.tex = tex;
-    Log("lyrics: font built (%d px tall)", cellH);
+    Log("lyrics: font built (\"%ls\", %d px tall)", actualFace, cellH);
     return true;
 }
 
@@ -858,7 +875,7 @@ void Draw(IDirect3DDevice9* dev, float x, float y, float w, float h,
         {
             float u0, v0, u1, v1;
             GlyphUv(ch, &u0, &v0, &u1, &v1);
-            float x0 = cx, x1 = cx + gw, y1 = y0 + lineH;
+            float x0 = cx + g.ox * scale, x1 = x0 + gw, y1 = y0 + lineH;
             verts.push_back({ x0, y0, 0, 1, c, u0, v0 });
             verts.push_back({ x1, y0, 0, 1, c, u1, v0 });
             verts.push_back({ x0, y1, 0, 1, c, u0, v1 });

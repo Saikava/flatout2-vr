@@ -87,8 +87,8 @@ struct Config
     int lyricsLines = 3;             // how many lines show at once (1..6)
     float lyricsScale = 1.0f;        // the text's size, this many times as tall
     float lyricsY = 0.82f;           // in-race vertical position on UI (0.0 = top, 1.0 = bottom; default 0.82)
-    uint32_t lyricsColour = 0x00FFFFFF;      // the words not yet sung (0x00BBGGRR)
-    uint32_t lyricsSungColour = 0x0000FF00;  // the words already sung (0x00BBGGRR)
+    uint32_t lyricsColour = 0x002828FF;      // the words not yet sung (FlatOut 2 game red, 0x00BBGGRR)
+    uint32_t lyricsSungColour = 0x0000D7FF;  // the words already sung / when to sing (FlatOut 2 yellow, 0x00BBGGRR)
     // [Log]
     float logIntervalSeconds = 2.0f;
     // [Keys]
