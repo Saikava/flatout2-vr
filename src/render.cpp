@@ -4432,6 +4432,11 @@ void DrawSteadyPanel(IDirect3DDevice9* dev)
 // picture and copied to the headset's panel texture.
 void EndHudCapture(IDirect3DDevice9* dev)
 {
+    if (g_cfg.lyricsEnabled && lyrics::CurrentShow().count > 0)
+    {
+        oSetRenderTarget(dev, 0, g_hud.rt);
+        lyrics::Draw(dev, 0, 0, (float)g_hud.w, (float)g_hud.h);
+    }
     g_hud.active = false;
     oSetRenderState(dev, D3DRS_SEPARATEALPHABLENDENABLE, FALSE);
     oSetRenderState(dev, D3DRS_COLORWRITEENABLE, g_hud.gameColorWrite);
@@ -6226,8 +6231,8 @@ bool RenderVrEyes(IDirect3DDevice9* dev, BYTE* ctx, BYTE** cams, float* fovScale
         prof::TraceDraws(false);  // a frame trace lists the left eye's draws only
         if (cockpit) DrawCockpitCards(dev, cam, eye);
         DrawMarkers(dev, cam);
-        if (g_cfg.lyricsEnabled && lyrics::CurrentShow().count > 0)
-            lyrics::Draw(dev, 0, 0, (float)g_vrt.w, (float)g_vrt.h, fov[eye].left, fov[eye].right, fov[eye].down, fov[eye].up, cam);
+        if (g_cfg.lyricsEnabled && lyrics::CurrentShow().count > 0 && !g_cfg.vrHud)
+            lyrics::Draw(dev, 0, 0, (float)g_vrt.w, (float)g_vrt.h, fov[eye].left, fov[eye].right, fov[eye].down, fov[eye].up);
         g_vrEye.active = false;
         IDirect3DSurface9* s = nullptr;
         if (SUCCEEDED(g_vrt.tex[eye]->GetSurfaceLevel(0, &s)))

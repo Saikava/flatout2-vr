@@ -86,7 +86,7 @@ struct Config
     bool lyricsEnabled = false;      // the songs' lyrics, karaoke style, in the headset (lyrics\*.lrc next to the mod; default off)
     int lyricsLines = 3;             // how many lines show at once (1..6)
     float lyricsScale = 1.0f;        // the text's size, this many times as tall
-    float lyricsY = 0.60f;           // in-race vertical position on screen (0.0 = top, 1.0 = bottom; default 0.60)
+    float lyricsY = 0.82f;           // in-race vertical position on UI (0.0 = top, 1.0 = bottom; default 0.82)
     uint32_t lyricsColour = 0x00FFFFFF;      // the words not yet sung (0x00BBGGRR)
     uint32_t lyricsSungColour = 0x0000FF00;  // the words already sung (0x00BBGGRR)
     // [Log]

@@ -751,12 +751,11 @@ void ReleaseFont()
 }
 
 void Draw(IDirect3DDevice9* dev, float x, float y, float w, float h,
-          float tanLeft, float tanRight, float tanDown, float tanUp,
-          const void* cam)
+          float tanLeft, float tanRight, float tanDown, float tanUp)
 {
-    (void)x; (void)y;
+    (void)x; (void)y; (void)tanLeft; (void)tanRight; (void)tanDown; (void)tanUp;
     const Show& show = CurrentShow();
-    if (!show.count || !dev) return;
+    if (!show.count || !dev || w <= 0 || h <= 0) return;
     IDirect3DTexture9* tex = g_font.tex;
     if (!tex && !(tex = FontTexture(dev))) return;
 
@@ -771,369 +770,166 @@ void Draw(IDirect3DDevice9* dev, float x, float y, float w, float h,
     DWORD dim = toRgb(g_cfg.lyricsColour);
     DWORD bright = toRgb(g_cfg.lyricsSungColour);
 
-    bool drewOnBumper = false;
-    if (InRace() && cam)
+    float lineH = 0.046f * h * g_cfg.lyricsScale;
+    float cellH = g_font.lineHeight > 0 ? (float)g_font.lineHeight : (float)kFontPx;
+    float scale = lineH / cellH;
+
+    float lineWidths[6] = {};
+    float lineAlphas[6] = {};
+    float maxW = 0.0f;
+    float maxAlpha = 0.0f;
+
+    for (int i = 0; i < show.count; i++)
     {
-        BYTE* player = *(BYTE**)fo2::kLocalPlayer;
-        BYTE* car = player ? *(BYTE**)(player + fo2::kPlayerCar) : nullptr;
-        if (car)
+        const Line& line = show.lines[i];
+        float alpha = 1.0f;
+        if (now < line.at)
         {
-            const float* carM = (const float*)(car + fo2::kCarMatrix);
-            const float* e = (const float*)((const BYTE*)cam + fo2::kCamMatrix);
-            float camNear = *(const float*)((const BYTE*)cam + fo2::kCamNear);
-
-            const float* lo = (const float*)(car + fo2::kCarCabinMin);
-            const float* hi = (const float*)(car + fo2::kCarCabinMax);
-            const float* com = (const float*)(car + fo2::kCarCentreOfMass);
-
-            // Compute rear bumper position in car's local coordinates.
-            float rearZ = -2.25f;
-            float bumperY = -0.15f;
-            if (lo && hi && com)
-            {
-                // Check if bottom collision box at car + 0x178 is present and valid
-                const float* bLo = (const float*)(car + 0x178);
-                if (bLo && bLo[2] < lo[2] - 0.3f && bLo[2] > -5.0f && bLo[2] < 0.0f)
-                {
-                    rearZ = bLo[2] - com[2];
-                    float bottomY = bLo[1] - com[1];
-                    float cabinBottomY = lo[1] - com[1];
-                    bumperY = bottomY + 0.40f * (cabinBottomY - bottomY);
-                }
-                else if (lo[2] < 0.0f && lo[2] > -5.0f)
-                {
-                    rearZ = (lo[2] - com[2]) - 1.10f;
-                    float cabinBottomY = lo[1] - com[1];
-                    bumperY = cabinBottomY - 0.25f;
-                }
-            }
-            // Vertical fine-tuning via g_cfg.lyricsY (default 0.60; larger lyricsY moves lower):
-            bumperY += (0.60f - g_cfg.lyricsY) * 0.8f;
-            // Float 3 cm off the bumper surface along car's backward vector:
-            rearZ -= 0.03f;
-
-            // Bumper center in world coordinates:
-            // carM[0..2] is Right, carM[4..6] is Up, carM[8..10] is Forward, carM[12..14] is Position
-            float bumperCenter[3];
-            for (int i = 0; i < 3; i++)
-                bumperCenter[i] = carM[12 + i] + bumperY * carM[4 + i] + rearZ * carM[8 + i];
-
-            // Vector from bumper center to eye
-            float toEye[3] = { e[12] - bumperCenter[0], e[13] - bumperCenter[1], e[14] - bumperCenter[2] };
-            float eyeDistSq = toEye[0] * toEye[0] + toEye[1] * toEye[1] + toEye[2] * toEye[2];
-            float eyeDist = sqrtf(eyeDistSq);
-
-            // Bumper outward normal is -Forward (-carM[8..10]).
-            // Camera faces bumper if vector to eye has positive dot product with -carMForward.
-            float dotNormal = -(toEye[0] * carM[8] + toEye[1] * carM[9] + toEye[2] * carM[10]);
-            float facing = eyeDist > 0.1f ? dotNormal / eyeDist : 0.0f;
-
-            if (facing > 0.05f && eyeDist > 0.3f && eyeDist < 25.0f)
-            {
-                // Chase camera is behind the car looking at the rear bumper!
-                auto toWorld = [&](float lx, float ly, float lz, float* out) {
-                    for (int i = 0; i < 3; i++)
-                        out[i] = carM[12 + i] + lx * carM[i] + ly * carM[4 + i] + lz * carM[8 + i];
-                };
-
-                auto project3D = [&](const float* p, float u, float v, DWORD col, V& out) -> bool {
-                    float d[3] = { p[0] - e[12], p[1] - e[13], p[2] - e[14] };
-                    float cx = d[0] * e[0] + d[1] * e[1] + d[2] * e[2];
-                    float cy = d[0] * e[4] + d[1] * e[5] + d[2] * e[6];
-                    float cz = d[0] * e[8] + d[1] * e[9] + d[2] * e[10];
-                    if (cz < camNear * 1.01f) return false;
-                    out.x = (cx / cz - tanLeft) / (tanRight - tanLeft) * w - 0.5f;
-                    out.y = (tanUp - cy / cz) / (tanUp - tanDown) * h - 0.5f;
-                    out.z = 0.0f;
-                    out.rhw = 1.0f / cz;
-                    out.colour = col;
-                    out.u = u;
-                    out.v = v;
-                    return true;
-                };
-
-                auto emitQuad3D = [&](float x0, float y0, float x1, float y1, float lz,
-                                      float u0, float v0, float u1, float v1, DWORD col) {
-                    float pBL[3], pBR[3], pTL[3], pTR[3];
-                    toWorld(x0, y0, lz, pBL);
-                    toWorld(x1, y0, lz, pBR);
-                    toWorld(x0, y1, lz, pTL);
-                    toWorld(x1, y1, lz, pTR);
-                    V vBL, vBR, vTL, vTR;
-                    if (project3D(pBL, u0, v1, col, vBL) &&
-                        project3D(pBR, u1, v1, col, vBR) &&
-                        project3D(pTL, u0, v0, col, vTL) &&
-                        project3D(pTR, u1, v0, col, vTR))
-                    {
-                        verts.push_back(vTL);
-                        verts.push_back(vTR);
-                        verts.push_back(vBL);
-                        verts.push_back(vTR);
-                        verts.push_back(vBR);
-                        verts.push_back(vBL);
-                    }
-                };
-
-                float lineH3D = 0.075f * g_cfg.lyricsScale;
-                float cellH = g_font.lineHeight > 0 ? (float)g_font.lineHeight : (float)kFontPx;
-                float scale3D = lineH3D / cellH;
-
-                float lineWidths[6] = {};
-                float lineAlphas[6] = {};
-                float maxLineW = 0.0f;
-                float maxAlpha = 0.0f;
-
-                for (int i = 0; i < show.count; i++)
-                {
-                    const Line& line = show.lines[i];
-                    float alpha = 1.0f;
-                    if (now < line.at)
-                    {
-                        double appearAt = i > 0 ? show.lines[i - 1].at : line.at - 4.0;
-                        if (now < appearAt) alpha = 0.0f;
-                        else if (now - appearAt < kFade) alpha = (float)((now - appearAt) / kFade);
-                    }
-                    else if (now - line.at < kFade && i == show.count - 1)
-                    {
-                        alpha = (float)((now - line.at) / kFade);
-                    }
-                    if (now > line.until)
-                    {
-                        double past = now - line.until;
-                        alpha = past >= kFade ? 0.0f : std::min(alpha, (float)(1.0 - past / kFade));
-                    }
-                    lineAlphas[i] = alpha;
-                    if (alpha > maxAlpha) maxAlpha = alpha;
-                    if (alpha > 0.0f)
-                    {
-                        lineWidths[i] = TextWidth(line.plain) * scale3D;
-                        if (lineWidths[i] > maxLineW) maxLineW = lineWidths[i];
-                    }
-                }
-
-                // If line is wider than typical rear bumper area (1.35m), shrink scale to fit neatly:
-                float maxAllowedW = 1.35f;
-                if (maxLineW > maxAllowedW && maxLineW > 0.0f)
-                {
-                    float shrink = maxAllowedW / maxLineW;
-                    scale3D *= shrink;
-                    lineH3D *= shrink;
-                    for (int i = 0; i < show.count; i++)
-                        lineWidths[i] *= shrink;
-                    maxLineW = maxAllowedW;
-                }
-
-                if (maxAlpha > 0.0f)
-                {
-                    // Backing plate and border:
-                    float plateW = std::clamp(maxLineW + 0.12f, 0.40f, 1.45f);
-                    float plateH = show.count * lineH3D + 0.035f;
-                    float px0 = -0.5f * plateW;
-                    float px1 = 0.5f * plateW;
-                    float py0 = bumperY - 0.5f * plateH;
-                    float py1 = bumperY + 0.5f * plateH;
-                    float pz = rearZ;
-                    float textZ = rearZ - 0.005f;
-
-                    float uw = 1.5f / (float)kAtlas, vw = 1.5f / (float)kAtlas;
-                    DWORD plateA = (DWORD)std::clamp(lroundf(maxAlpha * 220.0f), 0l, 255l) << 24;
-                    DWORD plateCol = plateA | 0x00101418;
-                    DWORD borderCol = plateA | 0x00040608;
-
-                    // Draw outer border rim (0.008m larger) then translucent dark plate
-                    emitQuad3D(px0 - 0.008f, py0 - 0.008f, px1 + 0.008f, py1 + 0.008f, pz + 0.001f,
-                               uw, vw, uw, vw, borderCol);
-                    emitQuad3D(px0, py0, px1, py1, pz, uw, vw, uw, vw, plateCol);
-
-                    auto emitChar3D = [&](wchar_t ch, float cx, float y0, DWORD c) {
-                        const Glyph& g = g_font.glyph[ch];
-                        float gw = (float)(g.uv.right - g.uv.left) * scale3D;
-                        if (gw > 0)
-                        {
-                            float u0, v0, u1, v1;
-                            GlyphUv(ch, &u0, &v0, &u1, &v1);
-                            emitQuad3D(cx, y0, cx + gw, y0 + lineH3D, textZ, u0, v0, u1, v1, c);
-                        }
-                    };
-
-                    float totalTextH = show.count * lineH3D;
-                    for (int i = 0; i < show.count; i++)
-                    {
-                        float alpha = lineAlphas[i];
-                        if (alpha <= 0.0f) continue;
-                        const Line& line = show.lines[i];
-                        float lineY0 = (bumperY + 0.5f * totalTextH) - (i + 1) * lineH3D;
-                        float startX = -0.5f * lineWidths[i];
-                        DWORD aBits = (DWORD)std::clamp(lroundf(alpha * 255.0f), 0l, 255l) << 24;
-
-                        // Outline shadow in 3D:
-                        float o = 1.5f * scale3D;
-                        DWORD shadowColor = 0xFF000000 | (aBits & 0xFF000000);
-                        const float offsets[4][2] = { { -o, 0 }, { o, 0 }, { 0, -o }, { 0, o } };
-                        for (const auto& off : offsets)
-                        {
-                            float scx = startX + off[0];
-                            float sy0 = lineY0 + off[1];
-                            if (line.wordCount > 0)
-                            {
-                                for (int wIdx = 0; wIdx < line.wordCount; wIdx++)
-                                    for (wchar_t ch : line.words[wIdx].text)
-                                    {
-                                        emitChar3D(ch, scx, sy0, shadowColor);
-                                        scx += g_font.glyph[ch].advance * scale3D;
-                                    }
-                            }
-                            else
-                            {
-                                for (wchar_t ch : line.plain)
-                                {
-                                    emitChar3D(ch, scx, sy0, shadowColor);
-                                    scx += g_font.glyph[ch].advance * scale3D;
-                                }
-                            }
-                        }
-
-                        // Colored text in 3D:
-                        float scx = startX;
-                        if (line.wordCount > 0)
-                        {
-                            for (int wIdx = 0; wIdx < line.wordCount; wIdx++)
-                            {
-                                const Word& word = line.words[wIdx];
-                                DWORD c = (now >= word.at ? bright : dim) | aBits;
-                                for (wchar_t ch : word.text)
-                                {
-                                    emitChar3D(ch, scx, lineY0, c);
-                                    scx += g_font.glyph[ch].advance * scale3D;
-                                }
-                            }
-                        }
-                        else
-                        {
-                            DWORD c = (now >= line.at ? bright : dim) | aBits;
-                            for (wchar_t ch : line.plain)
-                            {
-                                emitChar3D(ch, scx, lineY0, c);
-                                scx += g_font.glyph[ch].advance * scale3D;
-                            }
-                        }
-                    }
-
-                    if (!verts.empty())
-                        drewOnBumper = true;
-                }
-            }
+            double appearAt = i > 0 ? show.lines[i - 1].at : line.at - 4.0;
+            if (now < appearAt) alpha = 0.0f;
+            else if (now - appearAt < kFade) alpha = (float)((now - appearAt) / kFade);
+        }
+        else if (now - line.at < kFade && i == show.count - 1)
+        {
+            alpha = (float)((now - line.at) / kFade);
+        }
+        if (now > line.until)
+        {
+            double past = now - line.until;
+            alpha = past >= kFade ? 0.0f : std::min(alpha, (float)(1.0 - past / kFade));
+        }
+        lineAlphas[i] = alpha;
+        if (alpha > maxAlpha) maxAlpha = alpha;
+        if (alpha > 0.0f)
+        {
+            lineWidths[i] = TextWidth(line.plain) * scale;
+            if (lineWidths[i] > maxW) maxW = lineWidths[i];
         }
     }
+    if (maxAlpha <= 0.0f) return;
 
-    if (!drewOnBumper)
+    // Keep lyrics strictly between the character interface on the left and the speedometer on the right:
+    // in 16:9, character interface is x < 0.31*w, speedometer is x > 0.69*w -> gap width is ~0.38*w.
+    float maxAllowedW = 0.38f * w;
+    if (maxW > maxAllowedW && maxW > 0.0f)
     {
-        // 2D screen overlay at bottom of screen
-        float lineH = 0.052f * h * g_cfg.lyricsScale;
-        float cellH = g_font.lineHeight > 0 ? (float)g_font.lineHeight : (float)kFontPx;
-        float scale = lineH / cellH;  // atlas pixels into the eye's
-        float yFrac = InRace() ? g_cfg.lyricsY : 0.82f;
-        float cy = h * yFrac;
-        auto emitChar = [&](wchar_t ch, float cx, float y0, DWORD c) {
-            const Glyph& g = g_font.glyph[ch];
-            float gw = (float)(g.uv.right - g.uv.left) * scale;
-            if (gw > 0)
-            {
-                float u0, v0, u1, v1;
-                GlyphUv(ch, &u0, &v0, &u1, &v1);
-                float x0 = cx, x1 = cx + gw, y1 = y0 + lineH;
-                verts.push_back({ x0, y0, 0, 1, c, u0, v0 });
-                verts.push_back({ x1, y0, 0, 1, c, u1, v0 });
-                verts.push_back({ x0, y1, 0, 1, c, u0, v1 });
-                verts.push_back({ x1, y0, 0, 1, c, u1, v0 });
-                verts.push_back({ x1, y1, 0, 1, c, u1, v1 });
-                verts.push_back({ x0, y1, 0, 1, c, u0, v1 });
-            }
-        };
-        for (int i = show.count - 1; i >= 0; i--, cy -= lineH)
-        {
-            const Line& line = show.lines[i];
-            // Fade the line in when it appears, and fade out after its until time when it is the last shown.
-            float alpha = 1.0f;
-            if (now < line.at)
-            {
-                // Upcoming preview line: fade in from when the previous line started (or 4s before the first line).
-                double appearAt = i > 0 ? show.lines[i - 1].at : line.at - 4.0;
-                if (now < appearAt) alpha = 0.0f;
-                else if (now - appearAt < kFade) alpha = (float)((now - appearAt) / kFade);
-            }
-            else if (now - line.at < kFade && i == show.count - 1)
-            {
-                alpha = (float)((now - line.at) / kFade);
-            }
-            if (now > line.until)
-            {
-                double past = now - line.until;
-                alpha = past >= kFade ? 0.0f : std::min(alpha, (float)(1.0 - past / kFade));
-            }
-            if (alpha <= 0) continue;
-            float width = TextWidth(line.plain) * scale;
-            float cx = 0.5f * (w - width);
-            float y0 = cy - 0.5f * lineH;
-            DWORD aBits = (DWORD)std::clamp(lroundf(alpha * 255.0f), 0l, 255l) << 24;
+        float shrink = maxAllowedW / maxW;
+        scale *= shrink;
+        lineH *= shrink;
+        for (int i = 0; i < show.count; i++)
+            lineWidths[i] *= shrink;
+        maxW = maxAllowedW;
+    }
 
-            // Draw crisp 4-way black outline around letters for maximum legibility in VR:
-            float o = 1.5f * scale;
-            DWORD shadowColor = 0xFF000000 | (aBits & 0xFF000000);
-            const float offsets[4][2] = { { -o, 0 }, { o, 0 }, { 0, -o }, { 0, o } };
-            for (const auto& off : offsets)
+    float yFrac = InRace() ? g_cfg.lyricsY : 0.82f;
+    float cy = h * yFrac;
+    float totalH = show.count * lineH;
+    float topY = cy - 0.5f * totalH;
+
+    // Translucent dark backing plate & subtle border:
+    float padX = 14.0f * scale;
+    float padY = 6.0f * scale;
+    float px0 = 0.5f * (w - maxW) - padX;
+    float px1 = 0.5f * (w + maxW) + padX;
+    float py0 = topY - padY;
+    float py1 = topY + totalH + padY;
+
+    float uw = 1.5f / (float)kAtlas, vw = 1.5f / (float)kAtlas;
+    DWORD plateA = (DWORD)std::clamp(lroundf(maxAlpha * 180.0f), 0l, 255l) << 24;
+    DWORD plateCol = plateA | 0x000E1216;
+    DWORD borderCol = plateA | 0x00020406;
+
+    auto emitQuad = [&](float x0, float y0, float x1, float y1, DWORD col) {
+        verts.push_back({ x0, y0, 0, 1, col, uw, vw });
+        verts.push_back({ x1, y0, 0, 1, col, uw, vw });
+        verts.push_back({ x0, y1, 0, 1, col, uw, vw });
+        verts.push_back({ x1, y0, 0, 1, col, uw, vw });
+        verts.push_back({ x1, y1, 0, 1, col, uw, vw });
+        verts.push_back({ x0, y1, 0, 1, col, uw, vw });
+    };
+
+    emitQuad(px0 - 1.5f, py0 - 1.5f, px1 + 1.5f, py1 + 1.5f, borderCol);
+    emitQuad(px0, py0, px1, py1, plateCol);
+
+    auto emitChar = [&](wchar_t ch, float cx, float y0, DWORD c) {
+        const Glyph& g = g_font.glyph[ch];
+        float gw = (float)(g.uv.right - g.uv.left) * scale;
+        if (gw > 0)
+        {
+            float u0, v0, u1, v1;
+            GlyphUv(ch, &u0, &v0, &u1, &v1);
+            float x0 = cx, x1 = cx + gw, y1 = y0 + lineH;
+            verts.push_back({ x0, y0, 0, 1, c, u0, v0 });
+            verts.push_back({ x1, y0, 0, 1, c, u1, v0 });
+            verts.push_back({ x0, y1, 0, 1, c, u0, v1 });
+            verts.push_back({ x1, y0, 0, 1, c, u1, v0 });
+            verts.push_back({ x1, y1, 0, 1, c, u1, v1 });
+            verts.push_back({ x0, y1, 0, 1, c, u0, v1 });
+        }
+    };
+
+    for (int i = 0; i < show.count; i++)
+    {
+        float alpha = lineAlphas[i];
+        if (alpha <= 0.0f) continue;
+        const Line& line = show.lines[i];
+        float lineY0 = topY + i * lineH;
+        float startX = 0.5f * (w - lineWidths[i]);
+        DWORD aBits = (DWORD)std::clamp(lroundf(alpha * 255.0f), 0l, 255l) << 24;
+
+        // Draw crisp 4-way black outline around letters for maximum legibility in VR:
+        float o = 1.5f * scale;
+        DWORD shadowColor = 0xFF000000 | (aBits & 0xFF000000);
+        const float offsets[4][2] = { { -o, 0 }, { o, 0 }, { 0, -o }, { 0, o } };
+        for (const auto& off : offsets)
+        {
+            float scx = startX + off[0];
+            float sy0 = lineY0 + off[1];
+            if (line.wordCount > 0)
             {
-                if (line.wordCount > 0)
-                {
-                    float scx = cx + off[0];
-                    float sy0 = y0 + off[1];
-                    for (int wIdx = 0; wIdx < line.wordCount; wIdx++)
-                    {
-                        const Word& word = line.words[wIdx];
-                        for (wchar_t ch : word.text)
-                        {
-                            emitChar(ch, scx, sy0, shadowColor);
-                            scx += g_font.glyph[ch].advance * scale;
-                        }
-                    }
-                }
-                else
-                {
-                    float scx = cx + off[0];
-                    float sy0 = y0 + off[1];
-                    for (wchar_t ch : line.plain)
+                for (int wIdx = 0; wIdx < line.wordCount; wIdx++)
+                    for (wchar_t ch : line.words[wIdx].text)
                     {
                         emitChar(ch, scx, sy0, shadowColor);
                         scx += g_font.glyph[ch].advance * scale;
                     }
-                }
-            }
-
-            // The words with their own times brighten one by one; else the whole line at its time.
-            if (line.wordCount > 0)
-            {
-                for (int wIdx = 0; wIdx < line.wordCount; wIdx++)
-                {
-                    const Word& word = line.words[wIdx];
-                    DWORD c = (now >= word.at ? bright : dim) | aBits;
-                    for (wchar_t ch : word.text)
-                    {
-                        emitChar(ch, cx, y0, c);
-                        cx += g_font.glyph[ch].advance * scale;
-                    }
-                }
             }
             else
             {
-                DWORD c = (now >= line.at ? bright : dim) | aBits;
                 for (wchar_t ch : line.plain)
                 {
-                    emitChar(ch, cx, y0, c);
-                    cx += g_font.glyph[ch].advance * scale;
+                    emitChar(ch, scx, sy0, shadowColor);
+                    scx += g_font.glyph[ch].advance * scale;
                 }
             }
         }
+
+        // The words with their own times brighten one by one; else the whole line at its time.
+        float scx = startX;
+        if (line.wordCount > 0)
+        {
+            for (int wIdx = 0; wIdx < line.wordCount; wIdx++)
+            {
+                const Word& word = line.words[wIdx];
+                DWORD c = (now >= word.at ? bright : dim) | aBits;
+                for (wchar_t ch : word.text)
+                {
+                    emitChar(ch, scx, lineY0, c);
+                    scx += g_font.glyph[ch].advance * scale;
+                }
+            }
+        }
+        else
+        {
+            DWORD c = (now >= line.at ? bright : dim) | aBits;
+            for (wchar_t ch : line.plain)
+            {
+                emitChar(ch, scx, lineY0, c);
+                scx += g_font.glyph[ch].advance * scale;
+            }
+        }
     }
+
     if (verts.empty()) return;
     IDirect3DStateBlock9* saved = nullptr;
     if (FAILED(dev->CreateStateBlock(D3DSBT_ALL, &saved))) return;
@@ -1166,7 +962,10 @@ void Draw(IDirect3DDevice9* dev, float x, float y, float w, float h,
     dev->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
     dev->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
     dev->SetRenderState(D3DRS_BLENDOP, D3DBLENDOP_ADD);
-    dev->SetRenderState(D3DRS_SEPARATEALPHABLENDENABLE, FALSE);
+    dev->SetRenderState(D3DRS_SEPARATEALPHABLENDENABLE, TRUE);
+    dev->SetRenderState(D3DRS_SRCBLENDALPHA, D3DBLEND_ONE);
+    dev->SetRenderState(D3DRS_DESTBLENDALPHA, D3DBLEND_INVSRCALPHA);
+    dev->SetRenderState(D3DRS_BLENDOPALPHA, D3DBLENDOP_ADD);
     dev->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
     dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
     dev->SetRenderState(D3DRS_FILLMODE, D3DFILL_SOLID);
