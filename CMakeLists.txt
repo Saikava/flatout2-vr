@@ -45,6 +45,17 @@ target_link_options(FO2VR PRIVATE /SAFESEH:NO)
 # Keep the build stamp in the log current.
 add_custom_command(TARGET FO2VR PRE_BUILD COMMAND ${CMAKE_COMMAND} -E touch "${CMAKE_SOURCE_DIR}/src/util.cpp")
 
+# The mod's version, for its log and its windows: git's, looked up at every build (tools/version.cmake) into a header
+# that src/util.cpp includes. tools/package.ps1 reads the header too: a release is packed only from a build at its tag.
+set(FO2VR_VERSION_HEADER "${CMAKE_BINARY_DIR}/generated/fo2vr_version.h")
+add_custom_target(fo2vr_version
+  COMMAND ${CMAKE_COMMAND} "-DSOURCE_DIR=${CMAKE_SOURCE_DIR}" "-DOUT=${FO2VR_VERSION_HEADER}" -P "${CMAKE_SOURCE_DIR}/tools/version.cmake"
+  BYPRODUCTS "${FO2VR_VERSION_HEADER}"
+  COMMENT "Looking up the mod's version"
+  VERBATIM)
+add_dependencies(FO2VR fo2vr_version)
+target_include_directories(FO2VR PRIVATE "${CMAKE_BINARY_DIR}/generated")
+
 # Tells DXVK which Vulkan extensions the OpenXR runtime needs (see src/wineopenxr/wineopenxr.cpp).
 add_library(wineopenxr SHARED src/wineopenxr/wineopenxr.cpp src/wineopenxr/wineopenxr.def)
 target_compile_definitions(wineopenxr PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)

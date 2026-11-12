@@ -1,5 +1,7 @@
 # Packs a release: FlatOut2-VR-<version>.zip, laid out like the game folder.
-#   powershell -File tools\package.ps1 -Version 1.0 [-AsiLoader <winmm.dll>] [-Dxvk <dxvk_d3d9.dll>] [-Out <folder>]
+#   pwsh -File tools\package.ps1 -Version 1.0 [-AsiLoader <winmm.dll>] [-Dxvk <dxvk_d3d9.dll>] [-Out <folder>]
+# The mod tells its version in its log and its windows, and takes it from git as it is built (tools\version.cmake): the
+# release is packed only from a build made at its tag (v<version>, with nothing changed since), which says that number.
 # The ASI loader (Ultimate ASI Loader, 32-bit, as winmm.dll) and DXVK's 32-bit d3d9.dll (scripts\dxvk_d3d9.dll, which the mod
 # loads itself: see src\d3dcreate.cpp) are taken from the game folder by default (the ones this mod is tested with); the mod
 # from the last build (build.cmd).
@@ -15,6 +17,15 @@ $game = Split-Path $repo
 if (-not $AsiLoader) { $AsiLoader = Join-Path $game "winmm.dll" }
 if (-not $Dxvk) { $Dxvk = Join-Path $game "scripts\dxvk_d3d9.dll" }
 if (-not $Out) { $Out = Join-Path $repo "build\release" }
+
+# What the last build says its version is (the header it was compiled with; a build that failed after writing it left
+# an older FO2VR.asi).
+$header = Join-Path $repo "build\generated\fo2vr_version.h"
+$asi = Join-Path $repo "build\FO2VR.asi"
+$built = if ((Test-Path $header) -and ((Get-Content $header -Raw) -match 'FO2VR_VERSION "([^"]*)"')) { $Matches[1] } else { "" }
+if ($built -ne $Version) { throw "The last build says it is version '$built', not '$Version': commit, tag v$Version and run build.cmd first." }
+if ((Get-Item $asi).LastWriteTime -lt (Get-Item $header).LastWriteTime) { throw "build\FO2VR.asi is older than its version ($built): the build did not finish; run build.cmd." }
+
 $stage = Join-Path $Out "FlatOut2-VR-$Version"
 if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
 New-Item -ItemType Directory -Force "$stage\scripts\FO2VR-licenses" | Out-Null

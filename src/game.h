@@ -6,6 +6,11 @@
 
 namespace fo2 {
 
+// That FlatOut2.exe by its header: its time stamp and its entry point (the Steam release's file has the same code and
+// the same two; its image is 0x1000 larger).
+constexpr uint32_t kExeTimeStamp = 0x451D02BD;
+constexpr uint32_t kExeEntryPoint = 0x202638;
+
 // ---- race frame -------------------------------------------------------------------------
 // RenderRace (0x479200) computes the speed zoom, collects the view cameras and calls
 // RenderViews(ctx, cams, fovScale) at 0x479311. RenderViews runs every scene pass; for each
@@ -49,6 +54,9 @@ constexpr uintptr_t kPostProcess = 0x5AA390;
 // 0x5AB510 takes a rectangle {x0, y0, x1, y1, u0, v0, u1, v1, colour}, 0x5AB4C0 four ready vertices
 // {x, y, z, colour, u, v} (the rectangle's: (x0, y0), (x1, y0), (x1, y1), (x0, y1), z 1). Their shader puts them at
 // depth 0 whatever z: tested less-or-equal (the sun's glow, the lens flare) they come over everything.
+// The Steam release's fo2_zoom.dll has both slots as it loads, since its update of 10 November 2026 (HalfPixelFix in
+// its zoom_fo2.cfg, on unless set off; not while the slots hold other than the game's): its functions call the game's
+// and then move the sprite just queued, the queue's last four vertices, half a pixel left and up.
 constexpr uintptr_t kSlotSpriteRect = kDeviceD3dVtbl + 0xD8;
 constexpr uintptr_t kSpriteRect = 0x5AB510;
 constexpr uintptr_t kSlotSpriteQuad = kDeviceD3dVtbl + 0xD4;
@@ -121,6 +129,12 @@ struct FadeSprite
     bool overHud;
 };
 constexpr FadeSprite kFadeSprites[] = { { 0x477EAB, true }, { 0x45FE81, true }, { 0x4969E8, false } };
+// The race's overlay fade as the overlays call it: mov eax, [esp+8]; jmp 0x477D40. The Steam release's fo2_zoom.dll
+// puts a jump to its own there as it loads, since its update of 10 November 2026 (ViewportFadeFix in its zoom_fo2.cfg,
+// on unless set off; "fadeout animations for some AMD graphics cards"): that works out the same colour and rectangle
+// and draws them itself, straight on the Direct3D device (a state block, no shaders, DrawPrimitiveUP), not as a sprite.
+constexpr uintptr_t kRaceFadeEntry = 0x477D30;
+constexpr uint8_t kRaceFadeEntryCode[9] = { 0x8B, 0x44, 0x24, 0x08, 0xE9, 0x07, 0x00, 0x00, 0x00 };
 
 // The pause menu's question before a retry ("Are you sure you wish to restart...") is wrapped
 // (0x54E8A0, called by 0x49BB80) to a width pushed as a constant, 540 (the float immediate of a push

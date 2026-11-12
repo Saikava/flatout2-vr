@@ -5,15 +5,22 @@
 void LogInit(const std::wstring& path);
 void Log(const char* fmt, ...);
 
+// Whether the code at `site` is an E8 call of `target`.
+bool CallsTo(uintptr_t site, uintptr_t target);
 // Redirect the E8 call at `site` (which must currently call `expected`) to `hook`.
 bool PatchCall(uintptr_t site, uintptr_t expected, const void* hook);
 // Replace the pointer in a vtable slot (which must currently hold `expected`); returns the old value.
 bool PatchPointer(uintptr_t slot, uintptr_t expected, const void* hook);
 // Replace n bytes of code at `addr` (which must currently be `expected`) with `code`.
 bool PatchCode(uintptr_t addr, const void* expected, const void* code, size_t n);
+// The slot of the game's import of `function` from `dll`, looked up by name in FlatOut2.exe's import table (for a
+// game whose addresses are not known); null when it has none.
+void** FindImport(const char* dll, const char* function);
 
 // Directory of this ASI (with trailing backslash).
 const std::wstring& ModuleDir();
+// The file name of the module `address` lies in ("?" in none); the same buffer at every call.
+const char* ModuleName(uintptr_t address);
 
 struct Config
 {
@@ -105,3 +112,6 @@ double NowSeconds();
 
 // Timestamp of this build (util.cpp is always recompiled, see CMakeLists.txt).
 const char* BuildStamp();
+// The mod's version as git tells it at the build (tools/version.cmake): a release's number ("1.6.14"), or how far past
+// the last release the build is ("1.6.14-3-g1a2b3c4-dirty").
+const char* ModVersion();

@@ -467,8 +467,9 @@ void LogEyeCall(const char* what, const unsigned ret[3], const std::string& deta
 }
 
 using SpriteFn = void(__thiscall*)(void* self, const void* data);
-const auto oSpriteRect = (SpriteFn)fo2::kSpriteRect;
-const auto oSpriteQuad = (SpriteFn)fo2::kSpriteQuad;
+// The game's, or what stood in their slots before the mod's hooks (HookSprites).
+SpriteFn oSpriteRect = (SpriteFn)fo2::kSpriteRect;
+SpriteFn oSpriteQuad = (SpriteFn)fo2::kSpriteQuad;
 
 // The game darkens the whole screen with the HUD (when the car is reset, behind a dialog; see game.h):
 // in VR that would land on the HUD panel alone, a dark sheet floating in front of the player. Their
@@ -6371,13 +6372,72 @@ void OnDeviceCreated(IDirect3DDevice9* dev)
     xr::OnDevice(dev);
 }
 
+// The screen sprites' two slots hold the game's functions, or another's that call them: the Steam release's
+// fo2_zoom.dll's (see game.h, kSlotSpriteRect). The mod's hooks go before whatever is there and call it as the game's:
+// they are still called by the game's own code (they tell the sprites by where they come from), and what they move
+// (LensFlare) gets its half pixel like the rest.
+static bool HookSprites()
+{
+    const uintptr_t rect = *(const uintptr_t*)fo2::kSlotSpriteRect, quad = *(const uintptr_t*)fo2::kSlotSpriteQuad;
+    if (rect != fo2::kSpriteRect || quad != fo2::kSpriteQuad)
+        Log("sprites: the screen sprites' functions are another's (%s's) - the mod's hooks go before them",
+            ModuleName(rect != fo2::kSpriteRect ? rect : quad));
+    oSpriteRect = (SpriteFn)rect;
+    oSpriteQuad = (SpriteFn)quad;
+    return PatchPointer(fo2::kSlotSpriteRect, rect, (const void*)&SpriteRectHook) &&
+           PatchPointer(fo2::kSlotSpriteQuad, quad, (const void*)&SpriteQuadHook);
+}
+
+// The race's fade (to black and back as the car is reset) is taken where the game queues its sprite (SpriteRectHook)
+// and laid over the eyes and the HUD at Present. The Steam release's fo2_zoom.dll draws it itself instead (see game.h,
+// kRaceFadeEntry): past the sprites, into whatever the render target is - in VR the HUD's panel alone, a dark sheet
+// before the player. In VR the game's own code goes back there: the game draws through DXVK then, not the Direct3D
+// the fix is for, and with the eyes rendered the fade is the mod's.
+static void OwnRaceFade()
+{
+    const uint8_t* at = (const uint8_t*)fo2::kRaceFadeEntry;
+    uint8_t theirs[sizeof(fo2::kRaceFadeEntryCode)];
+    memcpy(theirs, at, sizeof(theirs));
+    if (memcmp(theirs, fo2::kRaceFadeEntryCode, sizeof(theirs)) == 0) return;
+    if (theirs[0] != 0xE9)
+    {
+        Log("fade: the race's fade starts with other code than expected - it may darken the HUD's panel alone");
+        return;
+    }
+    // (whose: fo2_zoom.dll's jump goes through a relay of its hook's, a jump outside any module)
+    uintptr_t to = fo2::kRaceFadeEntry + 5 + *(const int32_t*)(theirs + 1);
+    MEMORY_BASIC_INFORMATION relay;
+    if (!strcmp(ModuleName(to), "?") && VirtualQuery((const void*)to, &relay, sizeof(relay)) && relay.State == MEM_COMMIT &&
+        *(const uint8_t*)to == 0xE9)
+        to += 5 + *(const int32_t*)(to + 1);
+    const bool back = PatchCode(fo2::kRaceFadeEntry, theirs, fo2::kRaceFadeEntryCode, sizeof(theirs));
+    Log("fade: the race's fade is another's (%s's) - %s", ModuleName(to),
+        back ? "the game's own is put back: the mod lays it over the eyes and the HUD" : "the game's own could NOT be put back");
+}
+
 bool InstallRenderHooks()
 {
-    if (!PatchCall(fo2::kRenderViewsCall, fo2::kRenderViews, (const void*)&RenderViewsHook)) return false;
-    bool ok = PatchCall(fo2::kLensFlareCall, fo2::kLensFlare, (const void*)&LensFlareHook);
+    // What the mod cannot do without is looked at before anything is changed: a game it does not know stays as it was.
+    // (The Steam release's update of 10 November 2026 failed at the sprites' slots alone, with every other hook here
+    // made: the rest of the mod did not start, and the game ended as it started with "PropertyDb: Table
+    // 'GameFlow.Awards' not found!".)
+    const uintptr_t calls[][2] = { { fo2::kRenderViewsCall, fo2::kRenderViews }, { fo2::kLensFlareCall, fo2::kLensFlare },
+                                   { fo2::kSunGlowCall, fo2::kSunGlow } };
+    const uintptr_t slots[][2] = { { fo2::kSlotSetViewport, fo2::kSetViewport }, { fo2::kSlotSetCamera, fo2::kSetCamera },
+                                   { fo2::kSlotSetFrustum, fo2::kSetFrustum }, { fo2::kSlotEnginePresent, fo2::kEnginePresent } };
+    bool known = true;
+    for (const auto& c : calls)
+        if (!CallsTo(c[0], c[1])) Log("the game's code at %08X is not the call of %08X expected", (unsigned)c[0], (unsigned)c[1]), known = false;
+    for (const auto& s : slots)
+        if (*(const uintptr_t*)s[0] != s[1])
+            Log("the game's slot at %08X holds %08X, not the %08X expected", (unsigned)s[0], (unsigned)*(const uintptr_t*)s[0], (unsigned)s[1]), known = false;
+    if (!known) return false;
+
+    bool ok = PatchCall(fo2::kRenderViewsCall, fo2::kRenderViews, (const void*)&RenderViewsHook);
+    ok &= PatchCall(fo2::kLensFlareCall, fo2::kLensFlare, (const void*)&LensFlareHook);
     ok &= PatchCall(fo2::kSunGlowCall, fo2::kSunGlow, (const void*)&SunGlowHook);
-    ok &= PatchPointer(fo2::kSlotSpriteRect, fo2::kSpriteRect, (const void*)&SpriteRectHook);
-    ok &= PatchPointer(fo2::kSlotSpriteQuad, fo2::kSpriteQuad, (const void*)&SpriteQuadHook);
+    ok &= HookSprites();
+    if (g_cfg.vrEnabled) OwnRaceFade();
     if (!prof::HookParticles()) Log("profiler: particle call differs - not timed");
     if (!PatchTrailFill()) Log("particles: trail fill differs - not patched");
     if (g_cfg.vrEnabled && !PatchLodDistance(g_cfg.vrLodDistance)) Log("level of detail: code differs - distances unchanged");

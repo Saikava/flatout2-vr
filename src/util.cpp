@@ -1,5 +1,6 @@
 #include "util.h"
 
+#include "fo2vr_version.h"
 #include "game.h"
 
 #include <windows.h>
@@ -8,6 +9,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 
 Config g_cfg;
@@ -50,10 +52,15 @@ static bool WriteProtected(uintptr_t addr, const void* src, size_t n)
     return true;
 }
 
-bool PatchCall(uintptr_t site, uintptr_t expected, const void* hook)
+bool CallsTo(uintptr_t site, uintptr_t target)
 {
     const uint8_t* p = (const uint8_t*)site;
-    if (p[0] != 0xE8 || site + 5 + *(const int32_t*)(p + 1) != expected)
+    return p[0] == 0xE8 && site + 5 + *(const int32_t*)(p + 1) == target;
+}
+
+bool PatchCall(uintptr_t site, uintptr_t expected, const void* hook)
+{
+    if (!CallsTo(site, expected))
     {
         Log("PatchCall %08X: unexpected code, not patched", (unsigned)site);
         return false;
@@ -82,6 +89,44 @@ bool PatchCode(uintptr_t addr, const void* expected, const void* code, size_t n)
         return false;
     }
     return WriteProtected(addr, code, n);
+}
+
+void** FindImport(const char* dll, const char* function)
+{
+    BYTE* base = (BYTE*)GetModuleHandleW(nullptr);
+    const IMAGE_NT_HEADERS* nt = (const IMAGE_NT_HEADERS*)(base + ((const IMAGE_DOS_HEADER*)base)->e_lfanew);
+    const IMAGE_DATA_DIRECTORY& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!dir.VirtualAddress || !dir.Size) return nullptr;
+    // (the function itself, for a table without the names' list: its slots then hold the functions alone)
+    HMODULE module = GetModuleHandleA(dll);
+    const void* real = module ? (const void*)GetProcAddress(module, function) : nullptr;
+    for (const IMAGE_IMPORT_DESCRIPTOR* d = (const IMAGE_IMPORT_DESCRIPTOR*)(base + dir.VirtualAddress); d->Name && d->FirstThunk; d++)
+    {
+        if (_stricmp((const char*)base + d->Name, dll) != 0) continue;
+        IMAGE_THUNK_DATA* slots = (IMAGE_THUNK_DATA*)(base + d->FirstThunk);
+        const IMAGE_THUNK_DATA* names = d->OriginalFirstThunk ? (const IMAGE_THUNK_DATA*)(base + d->OriginalFirstThunk) : nullptr;
+        for (int i = 0; names ? names[i].u1.AddressOfData != 0 : slots[i].u1.Function != 0; i++)
+        {
+            bool found = names ? !IMAGE_SNAP_BY_ORDINAL(names[i].u1.Ordinal) &&
+                                     !strcmp(((const IMAGE_IMPORT_BY_NAME*)(base + names[i].u1.AddressOfData))->Name, function)
+                               : real && (const void*)slots[i].u1.Function == real;
+            if (found) return (void**)&slots[i].u1.Function;
+        }
+    }
+    return nullptr;
+}
+
+const char* ModuleName(uintptr_t address)
+{
+    static char name[64];
+    HMODULE m = nullptr;
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)address, &m))
+        return "?";
+    char path[MAX_PATH];
+    GetModuleFileNameA(m, path, MAX_PATH);
+    const char* b = strrchr(path, '\\');
+    strncpy(name, b ? b + 1 : path, sizeof(name) - 1);
+    return name;
 }
 
 const std::wstring& ModuleDir()
@@ -311,3 +356,4 @@ double NowSeconds()
 }
 
 const char* BuildStamp() { return __DATE__ " " __TIME__; }
+const char* ModVersion() { return FO2VR_VERSION; }

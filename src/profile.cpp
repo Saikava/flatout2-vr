@@ -96,19 +96,6 @@ DWORD WINAPI SamplerThread(void*)
     }
 }
 
-const char* ModuleName(uint32_t a)
-{
-    static char name[64];
-    HMODULE m = nullptr;
-    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)(uintptr_t)a, &m))
-        return "?";
-    char path[MAX_PATH];
-    GetModuleFileNameA(m, path, MAX_PATH);
-    const char* b = strrchr(path, '\\');
-    strncpy(name, b ? b + 1 : path, sizeof(name) - 1);
-    return name;
-}
-
 // The samples of one phase of the slow frame: the places they fell in, most frequent first.
 void LogSamples(Phase p)
 {

@@ -197,7 +197,7 @@ menus too, as there without the mod (that release's own controller support).
 
 ## Troubleshooting
 
-The log, `scripts\FO2VR.log`, usually says what went wrong.
+The log, `scripts\FO2VR.log`, usually says what went wrong; its first line has the mod's version.
 
 - **A window says "Waiting for SteamVR..." or "VR did not start".** The game waits for the VR runtime and
   goes on in VR by itself once it is ready; the window says what went wrong when it fails, with Try again,
@@ -227,8 +227,14 @@ The log, `scripts\FO2VR.log`, usually says what went wrong.
   `scripts\dxvk_d3d9.dll` now (the mod puts the old one away by itself, but only in a game that starts). The Steam release starts Direct3D as the game loads (its `fo2_zoom.dll`), and
   with DXVK in the game folder that hung the game on some PCs.
 - **The log says "the game does not run on DXVK".** `scripts\dxvk_d3d9.dll` from the archive is missing.
-- **The log says "unsupported FlatOut2.exe".** The mod needs version 1.2 of the game (the GOG or the
-  Steam release).
+- **A window says "FlatOut 2 VR does not know this version of the game"** (the log: "unsupported FlatOut2.exe").
+  The game's code is not as this version of the mod knows it, and the mod stays off rather than break the game:
+  the game was updated (Steam updates it by itself), another mod changes the same code, or it is not version 1.2
+  of the game (the GOG or the Steam release). Install the mod's
+  [latest release](https://github.com/Saikava/flatout2-vr/releases/latest); if that is the one you have, open an
+  issue with `scripts\FO2VR.log`.
+- **Steam release: the game ends as it starts with "PropertyDb: Table 'GameFlow.Awards' not found!".** The game's
+  update of 10 November 2026 with the mod's versions up to 1.6.13: install 1.6.14 or later.
 - **The HUD looks stretched.** Choose a 16:9 resolution in the game's settings.
 - **The VR controllers or the gamepad do nothing in a race.** Choose them in the game's Options > Controller
   options > Controller: the game drives with the one chosen there (the keyboard works besides).
@@ -252,7 +258,9 @@ and `wineopenxr.dll` and copies them, with the OpenXR loader, into `..\scripts\`
 meant to be checked out inside the game folder.
 
 `tools\package.ps1 -Version <n>` packs a release archive from the build, with the ASI loader
-(`winmm.dll`) and DXVK (`scripts\dxvk_d3d9.dll`) taken from the game folder.
+(`winmm.dll`) and DXVK (`scripts\dxvk_d3d9.dll`) taken from the game folder. The mod takes its version from git
+as it is built (`git describe`: `<n>` at the tag `v<n>`, something like `<n>-3-g1a2b3c4-dirty` past it), so a
+release is built at its tag; `package.ps1` takes no other build.
 
 ## License
 
